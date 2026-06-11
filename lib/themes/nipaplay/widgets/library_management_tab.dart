@@ -460,6 +460,11 @@ class _LibraryManagementTabState extends State<LibraryManagementTab> {
             selectedDirectory);
         accessCheck = dirCheck['canRead'] == true;
         debugPrint('Android目录权限检查结果: $dirCheck');
+      } else if (io.Platform.isAndroid &&
+          AndroidSafService.isSafUri(selectedDirectory)) {
+        // SAF URI 使用 SAF 专用方法检查访问权限
+        accessCheck = await AndroidSafService.canAccessTree(selectedDirectory);
+        debugPrint('Android SAF目录权限检查结果: $accessCheck');
       } else {
         // 非Android平台使用Flutter方法检查
         accessCheck =
