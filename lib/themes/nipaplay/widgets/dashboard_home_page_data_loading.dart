@@ -5,6 +5,7 @@ extension DashboardHomePageDataLoading on _DashboardHomePageState {
     bool forceRefreshRecommended = false,
     bool forceRefreshRandom = false,
     bool forceRefreshToday = false,
+    bool forceRefreshTrending = false,
   }) async {
     final stopwatch = Stopwatch()..start();
     _lastLoadTime = DateTime.now();
@@ -43,10 +44,12 @@ extension DashboardHomePageDataLoading on _DashboardHomePageState {
       final futures = <Future<void>>[
         _loadRecommendedContent(forceRefresh: shouldForceRecommended),
         _loadRecentContent(),
+        _loadQuarterlyReview(),
       ];
       futures.addAll([
         _loadTodayAnimes(forceRefresh: forceRefreshToday),
         _loadRandomRecommendations(forceRefresh: forceRefreshRandom),
+        _loadTrending(forceRefresh: forceRefreshTrending),
       ]);
       await Future.wait(futures);
     } catch (_) {
@@ -54,8 +57,10 @@ extension DashboardHomePageDataLoading on _DashboardHomePageState {
       try {
         await _loadRecommendedContent(forceRefresh: shouldForceRecommended);
         await _loadRecentContent();
+        await _loadQuarterlyReview();
         await _loadTodayAnimes(forceRefresh: forceRefreshToday);
         await _loadRandomRecommendations(forceRefresh: forceRefreshRandom);
+        await _loadTrending(forceRefresh: forceRefreshTrending);
       } catch (_) {}
     }
 
@@ -74,6 +79,7 @@ extension DashboardHomePageDataLoading on _DashboardHomePageState {
       forceRefreshRecommended: true,
       forceRefreshRandom: true,
       forceRefreshToday: true,
+      forceRefreshTrending: true,
     ));
   }
 
@@ -81,7 +87,6 @@ extension DashboardHomePageDataLoading on _DashboardHomePageState {
   void _checkPendingRefresh() {
     if (_pendingRefreshAfterLoad && mounted) {
       _pendingRefreshAfterLoad = false;
-      _pendingRefreshReason = '';
       // 使用短延迟避免连续调用，并检查播放器状态
       Future.delayed(const Duration(milliseconds: 100), () {
         if (mounted && !_isLoadingRecommended && !_isVideoPlayerActive()) {
@@ -243,19 +248,21 @@ extension DashboardHomePageDataLoading on _DashboardHomePageState {
         }
       }
 
-      // 从本地媒体库收集候选项目
+      // 从本地媒体库收集候选项目（含 WebDAV/SMB 观看记录，详情页已支持这些路径播放）
       final watchHistoryProvider =
           Provider.of<WatchHistoryProvider>(context, listen: false);
       if (watchHistoryProvider.isLoaded) {
         try {
-          // 过滤掉Jellyfin和Emby的项目，只保留本地文件
+          // 本地 + WebDAV + SMB 的观看记录；排除已清除匹配信息的记录
+          // （animeName 为空，会显示成“未知动画”）与仅由扫描/匹配生成、
+          // 没有实际播放痕迹的记录。
           final localHistory = watchHistoryProvider.history
               .where((item) =>
                   !item.filePath.startsWith('jellyfin://') &&
                   !item.filePath.startsWith('emby://') &&
-                  !MediaSourceUtils.isSmbPath(item.filePath) &&
-                  !MediaSourceUtils.isWebDavPath(item.filePath) &&
-                  !item.isDandanplayRemote)
+                  !item.isDandanplayRemote &&
+                  item.animeName.isNotEmpty &&
+                  (item.lastPosition > 0 || item.watchProgress > 0))
               .toList();
 
           // 按animeId分组，获取每个动画的最新观看记录
@@ -302,6 +309,22 @@ extension DashboardHomePageDataLoading on _DashboardHomePageState {
           await _loadPersistedLocalImageUrls(dandanAnimeIds);
         }
         allCandidates.addAll(selectedGroups);
+      }
+
+      // 从远程共享库（NipaPlay Server）收集候选项目
+      SharedRemoteLibraryProvider? sharedRemoteProvider;
+      try {
+        sharedRemoteProvider =
+            Provider.of<SharedRemoteLibraryProvider>(context, listen: false);
+      } catch (_) {}
+      if (sharedRemoteProvider != null &&
+          sharedRemoteProvider.animeSummaries.isNotEmpty) {
+        final summaries = List<SharedRemoteAnimeSummary>.from(
+            sharedRemoteProvider.animeSummaries);
+        summaries.shuffle(math.Random());
+        final selectedSummaries =
+            summaries.take(math.min(30, summaries.length)).toList();
+        allCandidates.addAll(selectedSummaries);
       }
 
       // 第二步：从所有候选中随机选择7个（去重）
@@ -513,6 +536,23 @@ extension DashboardHomePageDataLoading on _DashboardHomePageState {
               isLowRes:
                   coverUrl != null ? !_looksHighQualityUrl(coverUrl) : false,
             );
+          } else if (item is SharedRemoteAnimeSummary) {
+            final title =
+                (item.nameCn?.isNotEmpty == true) ? item.nameCn! : item.name;
+            final subtitle =
+                (item.summary?.isNotEmpty == true) ? item.summary! : '远程共享媒体';
+            final coverUrl = _normalizeRecommendationImageUrl(item.imageUrl);
+            return RecommendedItem(
+              id: 'shared:${item.animeId}',
+              title: title,
+              subtitle: subtitle,
+              backgroundImageUrl: coverUrl,
+              logoImageUrl: null,
+              source: RecommendedItemSource.sharedRemote,
+              rating: null,
+              isLowRes:
+                  coverUrl != null ? !_looksHighQualityUrl(coverUrl) : false,
+            );
           }
         } catch (_) {
           return null;
@@ -705,6 +745,10 @@ extension DashboardHomePageDataLoading on _DashboardHomePageState {
         keys.add('anime:${candidate.animeId}');
       }
       _addTitleKey(keys, candidate.title);
+    } else if (candidate is SharedRemoteAnimeSummary) {
+      keys.add('anime:${candidate.animeId}');
+      _addTitleKey(keys, candidate.nameCn);
+      _addTitleKey(keys, candidate.name);
     }
 
     if (keys.length <= 1) return keys;
@@ -921,8 +965,11 @@ extension DashboardHomePageDataLoading on _DashboardHomePageState {
 
     const int maxConcurrent = 3;
     final inflight = <Future<void>>[];
-    int processedCount = 0;
     int updatedCount = 0;
+    // 进度刷新节流：原实现按"每 5 个"触发，处理慢时可以变成每秒多次整树重建。
+    // 改为按时间节流，最多约 5 次/秒。
+    const Duration progressThrottle = Duration(milliseconds: 200);
+    DateTime lastProgressUpdate = DateTime.fromMillisecondsSinceEpoch(0);
 
     for (final item in _localAnimeItems) {
       final id = item.animeId;
@@ -991,10 +1038,8 @@ extension DashboardHomePageDataLoading on _DashboardHomePageState {
               }
             }
           }
-          processedCount++;
         } catch (_) {
           // 静默失败，避免刷屏
-          processedCount++;
         }
       }
 
@@ -1007,8 +1052,12 @@ extension DashboardHomePageDataLoading on _DashboardHomePageState {
       if (inflight.length >= maxConcurrent) {
         try {
           await Future.any(inflight);
-          // 每处理几个项目就更新一次UI，而不是等全部完成
-          if (updatedCount > 0 && processedCount % 5 == 0 && mounted) {
+          // 每处理几个项目就更新一次UI，而不是等全部完成（按时间节流）
+          final now = DateTime.now();
+          if (updatedCount > 0 &&
+              mounted &&
+              now.difference(lastProgressUpdate) >= progressThrottle) {
+            lastProgressUpdate = now;
             setState(() {});
           }
         } catch (_) {}

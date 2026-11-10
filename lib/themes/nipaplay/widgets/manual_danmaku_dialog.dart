@@ -1,22 +1,30 @@
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
-import 'package:nipaplay/services/dandanplay_service.dart';
-import 'package:nipaplay/services/web_remote_access_service.dart';
+import 'package:nipaplay/services/danmaku_matching_service.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/nipaplay_window.dart';
 import 'package:nipaplay/utils/global_hotkey_manager.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
 import 'package:nipaplay/utils/chinese_converter.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_focusable_action.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_mode_scope.dart';
 
 /// 手动弹幕匹配对话框
 ///
 /// 显示搜索动画和选择剧集的界面
 class ManualDanmakuMatchDialog extends StatefulWidget {
   final String? initialVideoTitle;
+  final bool embedded;
+  final bool searchOnOpen;
 
-  const ManualDanmakuMatchDialog({super.key, this.initialVideoTitle});
+  const ManualDanmakuMatchDialog({
+    super.key,
+    this.initialVideoTitle,
+    this.embedded = false,
+    this.searchOnOpen = false,
+  });
 
   @override
   State<ManualDanmakuMatchDialog> createState() =>
@@ -28,6 +36,10 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
   static Color get _accentColor => AppAccentColors.current;
 
   final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocusNode = FocusNode(
+    debugLabel: 'manual_danmaku_search',
+  );
+  bool _requestedInitialTelevisionFocus = false;
 
   bool _isSearching = false;
   bool _showEpisodesView = false;
@@ -60,49 +72,6 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
         selectionHandleColor: _accentColor,
       );
 
-  ButtonStyle _textButtonStyle({Color? baseColor}) {
-    final resolvedBase = baseColor ?? _textColor;
-    return ButtonStyle(
-      foregroundColor: MaterialStateProperty.resolveWith((states) {
-        if (states.contains(MaterialState.disabled)) {
-          return _mutedTextColor;
-        }
-        if (states.contains(MaterialState.hovered)) {
-          return _accentColor;
-        }
-        return resolvedBase;
-      }),
-      overlayColor: MaterialStateProperty.all(Colors.transparent),
-      splashFactory: NoSplash.splashFactory,
-      padding: MaterialStateProperty.all(
-        const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      ),
-    );
-  }
-
-  ButtonStyle _primaryButtonStyle() {
-    return ButtonStyle(
-      backgroundColor: MaterialStateProperty.resolveWith((states) {
-        if (states.contains(MaterialState.disabled)) {
-          return _accentColor.withOpacity(0.5);
-        }
-        return _accentColor;
-      }),
-      foregroundColor: MaterialStateProperty.all(Colors.white),
-      overlayColor: MaterialStateProperty.all(Colors.transparent),
-      splashFactory: NoSplash.splashFactory,
-      padding: MaterialStateProperty.all(
-        const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-      ),
-      minimumSize: MaterialStateProperty.all(const Size(96, 44)),
-      elevation: MaterialStateProperty.all(0),
-      shadowColor: MaterialStateProperty.all(Colors.transparent),
-      shape: MaterialStateProperty.all(
-        RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      ),
-    );
-  }
-
   // 实现GlobalHotkeyManagerMixin要求的方法
   @override
   String get hotkeyDisableReason => 'manual_danmaku_dialog';
@@ -116,13 +85,31 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
     }
     // 禁用全局热键
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
       disableHotkeys();
+      if (widget.searchOnOpen && _searchController.text.trim().isNotEmpty) {
+        _performSearch();
+      }
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_requestedInitialTelevisionFocus ||
+        !NipaplayLargeScreenModeScope.isActiveOf(context)) {
+      return;
+    }
+    _requestedInitialTelevisionFocus = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _searchFocusNode.requestFocus();
     });
   }
 
   @override
   void dispose() {
     _searchController.dispose();
+    _searchFocusNode.dispose();
     // 启用全局热键
     disposeHotkeys();
     super.dispose();
@@ -145,7 +132,8 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
     });
 
     try {
-      final results = await _searchAnime(keyword);
+      final results =
+          await DanmakuMatchingService.instance.searchAnime(keyword);
 
       // 检查是否需要转换为繁体中文（不使用context，避免异步间隙问题）
       final isTraditional =
@@ -179,46 +167,6 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
         _searchMessage = '搜索出错: $e';
         _currentMatches.clear();
       });
-    }
-  }
-
-  /// 搜索动画
-  Future<List<Map<String, dynamic>>> _searchAnime(String keyword) async {
-    if (keyword.trim().isEmpty) {
-      return [];
-    }
-
-    try {
-      final appSecret = await DandanplayService.getAppSecret();
-      final timestamp =
-          (DateTime.now().toUtc().millisecondsSinceEpoch / 1000).round();
-      const apiPath = '/api/v2/search/anime';
-      final baseUrl = await DandanplayService.getApiBaseUrl();
-      final url = '$baseUrl$apiPath?keyword=${Uri.encodeComponent(keyword)}';
-
-      final response = await http.get(
-        WebRemoteAccessService.proxyUri(Uri.parse(url)),
-        headers: {
-          'Accept': 'application/json',
-          'X-AppId': DandanplayService.appId,
-          'X-Signature': DandanplayService.generateSignature(
-              DandanplayService.appId, timestamp, apiPath, appSecret),
-          'X-Timestamp': '$timestamp',
-        },
-      );
-
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-
-        if (data['animes'] != null && data['animes'] is List) {
-          return List<Map<String, dynamic>>.from(data['animes']);
-        }
-      }
-
-      return [];
-    } catch (e) {
-      debugPrint('搜索动画时出错: $e');
-      rethrow;
     }
   }
 
@@ -262,78 +210,27 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
         return;
       }
 
-      debugPrint(
-          '正在加载动画剧集，animeId: $animeId, animeTitle: ${anime['animeTitle']}');
-
-      final appSecret = await DandanplayService.getAppSecret();
-      final timestamp =
-          (DateTime.now().toUtc().millisecondsSinceEpoch / 1000).round();
-      final apiPath = '/api/v2/bangumi/$animeId';
-      final baseUrl = await DandanplayService.getApiBaseUrl();
-      final url = '$baseUrl$apiPath';
-      debugPrint('API请求URL: $url');
-
-      final response = await http.get(
-        WebRemoteAccessService.proxyUri(Uri.parse(url)),
-        headers: {
-          'Accept': 'application/json',
-          'X-AppId': DandanplayService.appId,
-          'X-Signature': DandanplayService.generateSignature(
-              DandanplayService.appId, timestamp, apiPath, appSecret),
-          'X-Timestamp': '$timestamp',
-        },
-      );
-
+      final episodes =
+          await DanmakuMatchingService.instance.getAnimeEpisodes(animeId);
+      final isTraditional =
+          await ChineseConverter.isTraditionalChineseEnvironment(null);
+      if (isTraditional) {
+        for (final episode in episodes) {
+          final title = episode['episodeTitle'];
+          if (title != null) {
+            episode['episodeTitle'] =
+                ChineseConverter.convert(title.toString());
+          }
+        }
+      }
+      if (!mounted) return;
       setState(() {
         _isLoadingEpisodes = false;
+        _currentEpisodes = episodes;
+        _episodesMessage = episodes.isEmpty ? '该动画暂无剧集信息' : '';
       });
-
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-
-        // 检查API是否成功
-        if (data['success'] == true && data['bangumi'] != null) {
-          final bangumi = data['bangumi'];
-
-          if (bangumi['episodes'] != null && bangumi['episodes'] is List) {
-            final episodes =
-                List<Map<String, dynamic>>.from(bangumi['episodes']);
-
-            // 检查是否需要转换为繁体中文（不使用context，避免异步间隙问题）
-            final isTraditional =
-                await ChineseConverter.isTraditionalChineseEnvironment(null);
-            if (isTraditional) {
-              // 转换剧集标题
-              for (var episode in episodes) {
-                if (episode.containsKey('episodeTitle')) {
-                  episode['episodeTitle'] =
-                      ChineseConverter.convert(episode['episodeTitle']);
-                }
-              }
-            }
-
-            setState(() {
-              _currentEpisodes = episodes;
-              _episodesMessage = episodes.isEmpty ? '该动画暂无剧集信息' : '';
-            });
-            debugPrint('成功加载 ${episodes.length} 个剧集');
-          } else {
-            setState(() {
-              _episodesMessage = '该动画暂无剧集信息';
-            });
-          }
-        } else {
-          setState(() {
-            _episodesMessage = '获取动画信息失败: ${data['errorMessage'] ?? '未知错误'}';
-          });
-        }
-      } else {
-        setState(() {
-          _episodesMessage = '加载剧集失败: HTTP ${response.statusCode}';
-        });
-        debugPrint('API请求失败，状态码: ${response.statusCode}，响应: ${response.body}');
-      }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _isLoadingEpisodes = false;
         _episodesMessage = '加载剧集时出错: $e';
@@ -400,19 +297,6 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
 
     return Row(
       children: [
-        Container(
-          padding: const EdgeInsets.all(10),
-          decoration: BoxDecoration(
-            color: _accentColor.withOpacity(0.18),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Icon(
-            Icons.subtitles,
-            color: _accentColor,
-            size: 20,
-          ),
-        ),
-        SizedBox(width: 12),
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -444,8 +328,12 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
     return Row(
       children: [
         Expanded(
-          child: TextField(
+          child: AdaptiveMediaTextField(
             controller: _searchController,
+            focusNode: _searchFocusNode,
+            remoteInputTitle: '搜索番剧',
+            remoteInputFieldId: 'manual_danmaku_search',
+            showClearButton: true,
             cursorColor: _accentColor,
             style: TextStyle(color: _textColor),
             decoration: InputDecoration(
@@ -477,19 +365,13 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
           ),
         ),
         SizedBox(width: 12),
-        ElevatedButton(
+        AdaptiveMediaActionButton(
+          label: '搜索',
           onPressed: _isSearching ? null : _performSearch,
-          style: _primaryButtonStyle(),
-          child: _isSearching
-              ? SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                  ),
-                )
-              : const Text('搜索'),
+          desktopIcon: Icons.search,
+          phoneIcon: Icons.search,
+          emphasis: AdaptiveMediaActionEmphasis.primary,
+          compact: true,
         ),
       ],
     );
@@ -570,54 +452,65 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
     final typeDescription = match['typeDescription'] ?? '未知类型';
     final episodeCount = match['episodeCount'] ?? 0;
 
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: () => _loadAnimeEpisodes(match),
+    final content = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: _panelAltColor,
         borderRadius: BorderRadius.circular(10),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          decoration: BoxDecoration(
-            color: _panelAltColor,
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: _borderColor),
-          ),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      title,
-                      style: TextStyle(
-                        color: _textColor,
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                      ),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    SizedBox(height: 4),
-                    Text(
-                      '$typeDescription | ${episodeCount}集',
-                      style: TextStyle(
-                        color: _subTextColor,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
+        border: Border.all(color: _borderColor),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    color: _textColor,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
                 ),
-              ),
-              Icon(
-                Icons.chevron_right,
-                size: 18,
-                color: _mutedTextColor,
-              ),
-            ],
+                SizedBox(height: 4),
+                Text(
+                  '$typeDescription | ${episodeCount}集',
+                  style: TextStyle(
+                    color: _subTextColor,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
           ),
-        ),
+          Icon(
+            Icons.chevron_right,
+            size: 18,
+            color: _mutedTextColor,
+          ),
+        ],
+      ),
+    );
+
+    if (NipaplayLargeScreenModeScope.isActiveOf(context)) {
+      return NipaplayLargeScreenFocusableAction(
+        onActivate: () => _loadAnimeEpisodes(match),
+        borderRadius: BorderRadius.circular(10),
+        focusScale: 1.01,
+        child: content,
+      );
+    }
+
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => _loadAnimeEpisodes(match),
+        child: content,
       ),
     );
   }
@@ -636,47 +529,57 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
     final borderColor =
         isSelected ? _accentColor.withOpacity(0.6) : _borderColor;
 
-    return Container(
+    final content = Container(
       margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(
         color: backgroundColor,
         borderRadius: BorderRadius.circular(10),
         border: Border.all(color: borderColor),
       ),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(10),
-        onTap: () {
-          setState(() {
-            _selectedEpisode = episode;
-          });
-        },
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          child: Row(
-            children: [
-              Expanded(
-                child: Text(
-                  label,
-                  style: TextStyle(
-                    color: _textColor,
-                    fontSize: 13,
-                    fontWeight:
-                        isSelected ? FontWeight.w600 : FontWeight.normal,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                label,
+                style: TextStyle(
+                  color: _textColor,
+                  fontSize: 13,
+                  fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
                 ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
               ),
-              if (isSelected)
-                Icon(
-                  Icons.check_circle,
-                  color: _accentColor,
-                  size: 18,
-                ),
-            ],
-          ),
+            ),
+            if (isSelected)
+              Icon(
+                Icons.check_circle,
+                color: _accentColor,
+                size: 18,
+              ),
+          ],
         ),
       ),
+    );
+    void selectEpisode() {
+      setState(() {
+        _selectedEpisode = episode;
+      });
+    }
+
+    if (NipaplayLargeScreenModeScope.isActiveOf(context)) {
+      return NipaplayLargeScreenFocusableAction(
+        onActivate: selectEpisode,
+        borderRadius: BorderRadius.circular(10),
+        focusScale: 1.01,
+        child: content,
+      );
+    }
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: selectEpisode,
+      child: content,
     );
   }
 
@@ -704,10 +607,7 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
           ),
           child: _isSearching
               ? Center(
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation<Color>(_accentColor),
-                  ),
+                  child: AdaptiveMediaActivityIndicator(color: _accentColor),
                 )
               : _currentMatches.isEmpty
                   ? _buildEmptyState('暂无搜索结果')
@@ -790,10 +690,7 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
           ),
           child: _isLoadingEpisodes
               ? Center(
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation<Color>(_accentColor),
-                  ),
+                  child: AdaptiveMediaActivityIndicator(color: _accentColor),
                 )
               : _currentEpisodes.isEmpty
                   ? _buildEmptyState('暂无剧集')
@@ -844,16 +741,17 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
     return Row(
       mainAxisAlignment: MainAxisAlignment.end,
       children: [
-        TextButton(
+        AdaptiveMediaActionButton(
+          label: '返回搜索',
           onPressed: _backToAnimeSelection,
-          style: _textButtonStyle(),
-          child: const Text('返回搜索'),
+          compact: true,
         ),
         SizedBox(width: 8),
-        ElevatedButton(
+        AdaptiveMediaActionButton(
+          label: confirmText,
           onPressed: canConfirm ? _completeSelection : null,
-          style: _primaryButtonStyle(),
-          child: Text(confirmText),
+          emphasis: AdaptiveMediaActionEmphasis.primary,
+          compact: true,
         ),
       ],
     );
@@ -866,45 +764,56 @@ class _ManualDanmakuMatchDialogState extends State<ManualDanmakuMatchDialog>
         ? 900.0
         : globals.DialogSizes.getDialogWidth(screenSize.width);
     final keyboardHeight = MediaQuery.of(context).viewInsets.bottom;
+    final sheetScope = CupertinoBottomSheetScope.maybeOf(context);
+    final topPadding = widget.embedded && sheetScope != null
+        ? sheetScope.contentTopInset / 1.3 + sheetScope.contentTopSpacing + 8
+        : 16.0;
 
-    return Focus(
-      autofocus: true,
+    final isLargeScreen = NipaplayLargeScreenModeScope.isActiveOf(context);
+    final content = SingleChildScrollView(
+      padding: EdgeInsets.fromLTRB(24, topPadding, 24, 24 + keyboardHeight),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (!widget.embedded) ...[
+            _buildHeader(),
+            SizedBox(height: 16),
+          ],
+          if (!_showEpisodesView) ...[
+            _buildSearchBar(),
+            SizedBox(height: 12),
+          ],
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final isWideLayout = constraints.maxWidth >= 720;
+              return _showEpisodesView
+                  ? _buildEpisodesContent(isWideLayout, context)
+                  : _buildResultsPanel(context);
+            },
+          ),
+          if (_showEpisodesView) ...[
+            SizedBox(height: 12),
+            _buildActionButtons(),
+          ],
+        ],
+      ),
+    );
+    final body = Focus(
+      autofocus: !isLargeScreen,
       onKeyEvent: _handleKeyEvent,
       child: TextSelectionTheme(
         data: _selectionTheme,
-        child: NipaplayWindowScaffold(
-          maxWidth: dialogWidth,
-          maxHeightFactor: 0.9,
-          onClose: () => Navigator.of(context).maybePop(),
-          backgroundColor: _surfaceColor,
-          child: SingleChildScrollView(
-            padding: EdgeInsets.fromLTRB(24, 16, 24, 24 + keyboardHeight),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _buildHeader(),
-                SizedBox(height: 16),
-                if (!_showEpisodesView) ...[
-                  _buildSearchBar(),
-                  SizedBox(height: 12),
-                ],
-                LayoutBuilder(
-                  builder: (context, constraints) {
-                    final isWideLayout = constraints.maxWidth >= 720;
-                    return _showEpisodesView
-                        ? _buildEpisodesContent(isWideLayout, context)
-                        : _buildResultsPanel(context);
-                  },
-                ),
-                if (_showEpisodesView) ...[
-                  SizedBox(height: 12),
-                  _buildActionButtons(),
-                ],
-              ],
-            ),
-          ),
-        ),
+        child: content,
       ),
+    );
+    if (isLargeScreen && widget.embedded) return body;
+    return NipaplayWindowScaffold(
+      embedded: widget.embedded,
+      maxWidth: dialogWidth,
+      maxHeightFactor: 0.9,
+      onClose: () => Navigator.of(context).maybePop(),
+      backgroundColor: _surfaceColor,
+      child: body,
     );
   }
 }

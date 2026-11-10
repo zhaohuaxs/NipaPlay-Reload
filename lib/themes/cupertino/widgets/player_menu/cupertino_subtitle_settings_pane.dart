@@ -1,18 +1,24 @@
 import 'package:file_selector/file_selector.dart';
+import 'dart:io' as io;
+import 'package:flutter/material.dart' show ActionChip;
 import 'package:nipaplay/themes/cupertino/cupertino_imports.dart';
 import 'package:provider/provider.dart';
 
 import 'package:nipaplay/player_menu/player_menu_pane_controllers.dart';
+import 'package:nipaplay/themes/cupertino/cupertino_adaptive_platform_ui.dart'
+    show
+        AdaptiveButton,
+        AdaptiveButtonSize,
+        AdaptiveButtonStyle,
+        AdaptiveSegmentedControl;
 import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
-import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_pane_back_button.dart';
+import 'package:nipaplay/themes/cupertino/widgets/player_menu/adaptive_player_menu_primitives.dart';
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_player_slider.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 import 'package:nipaplay/utils/video_player_state.dart';
 
 class CupertinoSubtitleSettingsPane extends StatefulWidget {
-  const CupertinoSubtitleSettingsPane({super.key, required this.onBack});
-
-  final VoidCallback onBack;
+  const CupertinoSubtitleSettingsPane({super.key});
 
   @override
   State<CupertinoSubtitleSettingsPane> createState() =>
@@ -24,35 +30,33 @@ class _CupertinoSubtitleSettingsPaneState
   final TextEditingController _subtitleDelayController =
       TextEditingController();
   final TextEditingController _fontNameController = TextEditingController();
-  final TextEditingController _textColorController = TextEditingController();
-  final TextEditingController _borderColorController = TextEditingController();
-  final TextEditingController _shadowColorController = TextEditingController();
   final FocusNode _subtitleDelayFocus = FocusNode();
   final FocusNode _fontNameFocus = FocusNode();
-  final FocusNode _textColorFocus = FocusNode();
-  final FocusNode _borderColorFocus = FocusNode();
-  final FocusNode _shadowColorFocus = FocusNode();
   bool _subtitleDelayDirty = false;
   double? _subtitleDelayPreviewValue;
+  // 字幕位置滑块预览值：onChanged 只更新本地状态（跟手不碰内核），
+  // 松手 onChangeEnd 才提交 sub-pos，避免每帧 setProperty 卡顿。
+  double? _subtitlePositionPreviewValue;
   String? _fontImportMessage;
+  Future<List<String>>? _fontLibraryFuture;
+
+  void _refreshFontLibrary() {
+    setState(() {
+      _fontLibraryFuture = null;
+    });
+  }
 
   @override
   void dispose() {
     _subtitleDelayController.dispose();
     _fontNameController.dispose();
-    _textColorController.dispose();
-    _borderColorController.dispose();
-    _shadowColorController.dispose();
     _subtitleDelayFocus.dispose();
     _fontNameFocus.dispose();
-    _textColorFocus.dispose();
-    _borderColorFocus.dispose();
-    _shadowColorFocus.dispose();
     super.dispose();
   }
 
   String _colorToHex(Color color) {
-    final rgb = color.value & 0x00FFFFFF;
+    final rgb = color.toARGB32() & 0x00FFFFFF;
     return '#${rgb.toRadixString(16).padLeft(6, '0').toUpperCase()}';
   }
 
@@ -76,16 +80,67 @@ class _CupertinoSubtitleSettingsPaneState
   }
 
   Future<void> _pickFontFile(VideoPlayerState videoState) async {
-    final file = await openFile(
+    // 多选导入：导入后不自动套用字体名，由用户从字体库列表自由选择
+    final files = await openFiles(
       acceptedTypeGroups: [
-        const XTypeGroup(label: 'Font', extensions: ['ttf', 'otf', 'ttc']),
+        XTypeGroup(
+          label: 'Font',
+          extensions: const ['ttf', 'otf', 'ttc'],
+          uniformTypeIdentifiers: const [
+            'public.truetype-font',
+            'public.opentype-font',
+            'public.font',
+            'public.data',
+            'public.item',
+          ],
+        ),
       ],
     );
-    if (file == null) return;
-    await videoState.importSubtitleFontFile(file.path);
+    if (files.isEmpty) return;
+    var count = 0;
+    for (final f in files) {
+      await videoState.importSubtitleFontFile(f.path, applyName: false);
+      count++;
+    }
+    if (!mounted) return;
+    setState(() {
+      _fontImportMessage = '已导入 $count 个字体文件';
+    });
+    _refreshFontLibrary();
   }
 
   Future<void> _pickFontDirectory(VideoPlayerState videoState) async {
+    // iOS 上 file_selector 的 getDirectoryPath 不受支持，改为多选字体文件
+    if (io.Platform.isIOS) {
+      final files = await openFiles(
+        acceptedTypeGroups: [
+          XTypeGroup(
+            label: 'Font',
+            extensions: const ['ttf', 'otf', 'ttc'],
+            uniformTypeIdentifiers: const [
+              'public.truetype-font',
+              'public.opentype-font',
+              'public.font',
+              'public.data',
+              'public.item'
+            ],
+          ),
+        ],
+      );
+      if (files.isEmpty) return;
+      var count = 0;
+      for (final f in files) {
+        // 多选导入：不自动套用当前字体名，让用户从字体库列表自由选择
+        await videoState.importSubtitleFontFile(f.path, applyName: false);
+        count++;
+      }
+      if (!mounted) return;
+      setState(() {
+        _fontImportMessage = '已导入 $count 个字体文件';
+      });
+      _refreshFontLibrary();
+      return;
+    }
     final directory = await getDirectoryPath();
     if (directory == null) return;
     final count = await videoState.importSubtitleFontDirectory(directory);
@@ -99,6 +154,7 @@ class _CupertinoSubtitleSettingsPaneState
         _fontImportMessage = '未在目录中找到字体文件';
       });
     }
+    _refreshFontLibrary();
   }
 
   double _currentSubtitleDelayDisplayValue(VideoPlayerState videoState) {
@@ -234,6 +290,9 @@ class _CupertinoSubtitleSettingsPaneState
   @override
   Widget build(BuildContext context) {
     final controller = context.watch<SubtitleSettingsPaneController>();
+    // 监听 VideoPlayerState：点选字体/颜色后芯片与输入框立即反映最新值
+    // （此前只 watch PaneController，重开面板前看不到变化）。
+    context.watch<VideoPlayerState>();
     final videoState = controller.videoState;
     _syncSubtitleDelayController(videoState);
     _syncController(
@@ -241,283 +300,364 @@ class _CupertinoSubtitleSettingsPaneState
       focus: _fontNameFocus,
       value: videoState.subtitleFontName,
     );
-    _syncController(
-      controller: _textColorController,
-      focus: _textColorFocus,
-      value: _colorToHex(videoState.subtitleColor),
-    );
-    _syncController(
-      controller: _borderColorController,
-      focus: _borderColorFocus,
-      value: _colorToHex(videoState.subtitleBorderColor),
-    );
-    _syncController(
-      controller: _shadowColorController,
-      focus: _shadowColorFocus,
-      value: _colorToHex(videoState.subtitleShadowColor),
-    );
 
+    // 键盘弹出时把可滚动内容底部垫高一个键盘高度，否则面板底部的
+    // 延迟/字体/hex 输入框会被键盘盖住无法查看与编辑。
+    final keyboardInset = MediaQuery.viewInsetsOf(context).bottom;
     return CupertinoBottomSheetContentLayout(
       sliversBuilder: (context, topSpacing) => [
         SliverPadding(
           padding: EdgeInsets.fromLTRB(20, topSpacing, 20, 12),
           sliver: SliverToBoxAdapter(
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    '字幕设置',
-                    style: CupertinoTheme.of(context)
-                        .textTheme
-                        .navLargeTitleTextStyle
-                        .copyWith(fontSize: 24),
-                  ),
-                ),
-                CupertinoButton(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  onPressed: videoState.resetSubtitleSettings,
-                  child: const Text('回到默认'),
-                ),
-              ],
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: AdaptiveButton(
+                label: '回到默认',
+                style: AdaptiveButtonStyle.glass,
+                size: AdaptiveButtonSize.small,
+                onPressed: controller.supportsFullSubtitleStyle
+                    ? videoState.resetSubtitleSettings
+                    : controller.resetSubtitleScale,
+              ),
             ),
           ),
         ),
         SliverPadding(
-          padding: const EdgeInsets.only(bottom: 12),
+          padding: EdgeInsets.only(bottom: 12 + keyboardInset),
           sliver: SliverList(
-            delegate: SliverChildListDelegate.fixed([
-              CupertinoListSection.insetGrouped(
-                header: const Text('基础设置'),
-                children: [
-                  _buildOverrideModeTile(context, videoState),
-                  _buildSliderTile(
-                    context,
-                    title: '字幕大小',
-                    description: '${(controller.subtitleScale * 100).round()}%',
-                    value: controller.subtitleScale,
-                    min: controller.minScale,
-                    max: controller.maxScale,
-                    divisions:
-                        ((controller.maxScale - controller.minScale) / 0.05)
-                            .round(),
-                    onChanged: controller.setSubtitleScale,
-                  ),
-                  _buildSliderTile(
-                    context,
-                    title: '字幕延迟',
-                    description: _formatDelayDisplay(
-                        _currentSubtitleDelayDisplayValue(videoState)),
-                    value: _currentSubtitleDelayDisplayValue(videoState),
-                    min: videoState.subtitleDelaySliderMinSeconds,
-                    max: videoState.subtitleDelaySliderMaxSeconds,
-                    divisions: videoState.subtitleDelaySliderDivisions,
-                    onChangeStart: (value) =>
-                        _handleSubtitleDelaySliderStart(videoState, value),
-                    onChanged: _handleSubtitleDelaySliderChanged,
-                    onChangeEnd: (value) =>
-                        _handleSubtitleDelaySliderEnd(videoState, value),
-                  ),
-                  _buildSubtitleDelayInputTile(context, videoState),
-                  _buildSliderTile(
-                    context,
-                    title: '字幕位置',
-                    description:
-                        '${videoState.subtitlePosition.toStringAsFixed(0)}%',
-                    value: videoState.subtitlePosition,
-                    min: VideoPlayerState.minSubtitlePosition,
-                    max: VideoPlayerState.maxSubtitlePosition,
-                    divisions: 100,
-                    onChanged: videoState.setSubtitlePosition,
-                  ),
-                ],
-              ),
-              CupertinoListSection.insetGrouped(
-                header: const Text('对齐与边距'),
-                children: [
-                  _buildAlignXTile(context, videoState),
-                  _buildAlignYTile(context, videoState),
-                  _buildSliderTile(
-                    context,
-                    title: '水平边距',
-                    description:
-                        '${videoState.subtitleMarginX.toStringAsFixed(0)}px',
-                    value: videoState.subtitleMarginX,
-                    min: 0,
-                    max: 200,
-                    divisions: 200,
-                    onChanged: videoState.setSubtitleMarginX,
-                  ),
-                  _buildSliderTile(
-                    context,
-                    title: '垂直边距',
-                    description:
-                        '${videoState.subtitleMarginY.toStringAsFixed(0)}px',
-                    value: videoState.subtitleMarginY,
-                    min: 0,
-                    max: 200,
-                    divisions: 200,
-                    onChanged: videoState.setSubtitleMarginY,
-                  ),
-                ],
-              ),
-              CupertinoListSection.insetGrouped(
-                header: const Text('样式'),
-                children: [
-                  _buildSliderTile(
-                    context,
-                    title: '不透明度',
-                    description:
-                        '${(videoState.subtitleOpacity * 100).round()}%',
-                    value: videoState.subtitleOpacity,
-                    min: 0,
-                    max: 1,
-                    divisions: 20,
-                    onChanged: videoState.setSubtitleOpacity,
-                  ),
-                  _buildSliderTile(
-                    context,
-                    title: '描边大小',
-                    description:
-                        videoState.subtitleBorderSize.toStringAsFixed(1),
-                    value: videoState.subtitleBorderSize,
-                    min: 0,
-                    max: 10,
-                    divisions: 100,
-                    onChanged: videoState.setSubtitleBorderSize,
-                  ),
-                  _buildSliderTile(
-                    context,
-                    title: '阴影偏移',
-                    description:
-                        videoState.subtitleShadowOffset.toStringAsFixed(1),
-                    value: videoState.subtitleShadowOffset,
-                    min: 0,
-                    max: 10,
-                    divisions: 100,
-                    onChanged: videoState.setSubtitleShadowOffset,
-                  ),
-                  _buildToggleTile(
-                    context,
-                    title: '粗体',
-                    value: videoState.subtitleBold,
-                    onChanged: videoState.setSubtitleBold,
-                  ),
-                  _buildToggleTile(
-                    context,
-                    title: '斜体',
-                    value: videoState.subtitleItalic,
-                    onChanged: videoState.setSubtitleItalic,
-                  ),
-                ],
-              ),
-              CupertinoListSection.insetGrouped(
-                header: const Text('颜色'),
-                children: [
-                  _buildColorTile(
-                    context,
-                    label: '文字颜色',
-                    controller: _textColorController,
-                    focusNode: _textColorFocus,
-                    color: videoState.subtitleColor,
-                    onSubmit: (value) {
-                      final parsed = _parseHexColor(value);
-                      if (parsed != null) {
-                        videoState.setSubtitleColor(parsed);
-                      }
-                    },
-                  ),
-                  _buildColorTile(
-                    context,
-                    label: '描边颜色',
-                    controller: _borderColorController,
-                    focusNode: _borderColorFocus,
-                    color: videoState.subtitleBorderColor,
-                    onSubmit: (value) {
-                      final parsed = _parseHexColor(value);
-                      if (parsed != null) {
-                        videoState.setSubtitleBorderColor(parsed);
-                      }
-                    },
-                  ),
-                  _buildColorTile(
-                    context,
-                    label: '阴影颜色',
-                    controller: _shadowColorController,
-                    focusNode: _shadowColorFocus,
-                    color: videoState.subtitleShadowColor,
-                    onSubmit: (value) {
-                      final parsed = _parseHexColor(value);
-                      if (parsed != null) {
-                        videoState.setSubtitleShadowColor(parsed);
-                      }
-                    },
-                  ),
-                ],
-              ),
-              CupertinoListSection.insetGrouped(
-                header: const Text('字体'),
-                children: [
-                  CupertinoListTile(
-                    title: const Text('字体名称'),
-                    subtitle: CupertinoTextField(
-                      controller: _fontNameController,
-                      focusNode: _fontNameFocus,
-                      placeholder: '留空为默认',
-                      onSubmitted: videoState.setSubtitleFontName,
-                    ),
-                  ),
-                  CupertinoListTile(
-                    title: const Text('导入字体文件'),
-                    trailing: CupertinoButton(
-                      padding: EdgeInsets.zero,
-                      onPressed: () => _pickFontFile(videoState),
-                      child: const Text('选择'),
-                    ),
-                  ),
-                  CupertinoListTile(
-                    title: const Text('导入字体文件夹'),
-                    trailing: CupertinoButton(
-                      padding: EdgeInsets.zero,
-                      onPressed: () => _pickFontDirectory(videoState),
-                      child: const Text('选择'),
-                    ),
-                  ),
-                  if (_fontImportMessage != null)
-                    CupertinoListTile(
-                      title: Text(
-                        _fontImportMessage!,
-                        style: TextStyle(
-                          color: CupertinoColors.activeBlue,
-                          fontSize: 13,
-                        ),
-                      ),
-                    ),
-                  if (videoState.subtitleFontDir.isNotEmpty)
-                    CupertinoListTile(
-                      title: const Text('当前字体目录'),
-                      subtitle: Text(_getFontDirDisplayText(videoState)),
-                    ),
-                  CupertinoListTile(
-                    title: const Text('清除字体设置'),
-                    trailing: CupertinoButton(
-                      padding: EdgeInsets.zero,
-                      onPressed: () {
-                        videoState.setSubtitleFontName('');
-                        videoState.setSubtitleFontDir('');
-                      },
-                      child: const Text('清除'),
-                    ),
-                  ),
-                ],
-              ),
-            ]),
+            delegate: SliverChildListDelegate.fixed(
+              controller.supportsFullSubtitleStyle
+                  ? _buildFullSubtitleSections(
+                      context,
+                      controller,
+                      videoState,
+                    )
+                  : _buildScaleOnlySubtitleSections(context, controller),
+            ),
           ),
         ),
-        SliverToBoxAdapter(
-          child: CupertinoPaneBackButton(onPressed: widget.onBack),
-        ),
       ],
+    );
+  }
+
+  List<Widget> _buildScaleOnlySubtitleSections(
+    BuildContext context,
+    SubtitleSettingsPaneController controller,
+  ) {
+    return [
+      AdaptivePlayerMenuSection(
+        header: const Text('基础设置'),
+        children: [
+          _buildSubtitleScaleTile(context, controller),
+        ],
+      ),
+    ];
+  }
+
+  List<Widget> _buildFullSubtitleSections(
+    BuildContext context,
+    SubtitleSettingsPaneController controller,
+    VideoPlayerState videoState,
+  ) {
+    return [
+      AdaptivePlayerMenuSection(
+        header: const Text('基础设置'),
+        children: [
+          _buildOverrideModeTile(context, videoState),
+          _buildSubtitleScaleTile(context, controller),
+          _buildSliderTile(
+            context,
+            title: '字幕延迟',
+            description: _formatDelayDisplay(
+              _currentSubtitleDelayDisplayValue(videoState),
+            ),
+            value: _currentSubtitleDelayDisplayValue(videoState),
+            min: videoState.subtitleDelaySliderMinSeconds,
+            max: videoState.subtitleDelaySliderMaxSeconds,
+            divisions: videoState.subtitleDelaySliderDivisions,
+            onChangeStart: (value) =>
+                _handleSubtitleDelaySliderStart(videoState, value),
+            onChanged: _handleSubtitleDelaySliderChanged,
+            onChangeEnd: (value) =>
+                _handleSubtitleDelaySliderEnd(videoState, value),
+          ),
+          _buildSubtitleDelayInputTile(context, videoState),
+          _buildSliderTile(
+            context,
+            title: '字幕位置',
+            description:
+                '${(_subtitlePositionPreviewValue ?? videoState.subtitlePosition).toStringAsFixed(0)}%',
+            value: _subtitlePositionPreviewValue ?? videoState.subtitlePosition,
+            min: VideoPlayerState.minSubtitlePosition,
+            max: VideoPlayerState.maxSubtitlePosition,
+            divisions: 100,
+            // 拖动过程只更新本地预览值（滑块跟手、零内核调用）；
+            // 松手才提交 sub-pos——内嵌 ASS 每帧 setProperty 会全量
+            // 重排导致视频卡顿，这是此前「滑动卡顿」的根因。
+            onChangeStart: (_) {
+              setState(() {
+                _subtitlePositionPreviewValue = videoState.subtitlePosition;
+              });
+            },
+            onChanged: (value) {
+              setState(() {
+                _subtitlePositionPreviewValue = value;
+              });
+            },
+            onChangeEnd: (value) async {
+              await videoState.setSubtitlePosition(value);
+              if (!mounted) return;
+              setState(() {
+                _subtitlePositionPreviewValue = null;
+              });
+            },
+          ),
+        ],
+      ),
+      AdaptivePlayerMenuSection(
+        header: const Text('对齐与边距'),
+        children: [
+          _buildAlignXTile(context, videoState),
+          _buildAlignYTile(context, videoState),
+          _buildSliderTile(
+            context,
+            title: '水平边距',
+            description: '${videoState.subtitleMarginX.toStringAsFixed(0)}px',
+            value: videoState.subtitleMarginX,
+            min: 0,
+            max: 200,
+            divisions: 200,
+            onChanged: videoState.setSubtitleMarginX,
+          ),
+          _buildSliderTile(
+            context,
+            title: '垂直边距',
+            description: '${videoState.subtitleMarginY.toStringAsFixed(0)}px',
+            value: videoState.subtitleMarginY,
+            min: 0,
+            max: 200,
+            divisions: 200,
+            onChanged: videoState.setSubtitleMarginY,
+          ),
+        ],
+      ),
+      AdaptivePlayerMenuSection(
+        header: const Text('样式'),
+        children: [
+          _buildSliderTile(
+            context,
+            title: '不透明度',
+            description: '${(videoState.subtitleOpacity * 100).round()}%',
+            value: videoState.subtitleOpacity,
+            min: 0,
+            max: 1,
+            divisions: 20,
+            onChanged: videoState.setSubtitleOpacity,
+          ),
+          _buildSliderTile(
+            context,
+            title: '描边大小',
+            description: videoState.subtitleBorderSize.toStringAsFixed(1),
+            value: videoState.subtitleBorderSize,
+            min: 0,
+            max: 10,
+            divisions: 100,
+            onChanged: videoState.setSubtitleBorderSize,
+          ),
+          _buildSliderTile(
+            context,
+            title: '阴影偏移',
+            description: videoState.subtitleShadowOffset.toStringAsFixed(1),
+            value: videoState.subtitleShadowOffset,
+            min: 0,
+            max: 10,
+            divisions: 100,
+            onChanged: videoState.setSubtitleShadowOffset,
+          ),
+          _buildToggleTile(
+            context,
+            title: '粗体',
+            value: videoState.subtitleBold,
+            onChanged: videoState.setSubtitleBold,
+          ),
+          _buildToggleTile(
+            context,
+            title: '斜体',
+            value: videoState.subtitleItalic,
+            onChanged: videoState.setSubtitleItalic,
+          ),
+        ],
+      ),
+      AdaptivePlayerMenuSection(
+        header: const Text('颜色'),
+        children: [
+          _buildColorTile(
+            context,
+            label: '文字颜色',
+            color: videoState.subtitleColor,
+            onPicked: (parsed) => videoState.setSubtitleColor(parsed),
+          ),
+          _buildColorTile(
+            context,
+            label: '描边颜色',
+            color: videoState.subtitleBorderColor,
+            onPicked: (parsed) => videoState.setSubtitleBorderColor(parsed),
+          ),
+          _buildColorTile(
+            context,
+            label: '阴影颜色',
+            color: videoState.subtitleShadowColor,
+            onPicked: (parsed) => videoState.setSubtitleShadowColor(parsed),
+          ),
+        ],
+      ),
+      AdaptivePlayerMenuSection(
+        header: const Text('字体'),
+        children: [
+          AdaptivePlayerMenuTile(
+            title: const Text('字体名称'),
+            subtitle: AdaptivePlayerMenuTextField(
+              controller: _fontNameController,
+              focusNode: _fontNameFocus,
+              placeholder: '留空为默认',
+              onSubmitted: videoState.setSubtitleFontName,
+            ),
+          ),
+          AdaptivePlayerMenuTile(
+            title: const Text('导入字体文件'),
+            trailing: AdaptiveButton(
+              label: '选择',
+              style: AdaptiveButtonStyle.glass,
+              size: AdaptiveButtonSize.small,
+              onPressed: () => _pickFontFile(videoState),
+            ),
+          ),
+          AdaptivePlayerMenuTile(
+            title: const Text('导入字体文件夹'),
+            trailing: AdaptiveButton(
+              label: '选择',
+              style: AdaptiveButtonStyle.glass,
+              size: AdaptiveButtonSize.small,
+              onPressed: () => _pickFontDirectory(videoState),
+            ),
+          ),
+          if (_fontImportMessage != null)
+            AdaptivePlayerMenuTile(
+              title: Text(
+                _fontImportMessage!,
+                style: const TextStyle(
+                  color: CupertinoColors.activeBlue,
+                  fontSize: 13,
+                ),
+              ),
+            ),
+          if (videoState.subtitleFontDir.isNotEmpty)
+            AdaptivePlayerMenuTile(
+              title: const Text('当前字体目录'),
+              subtitle: Text(_getFontDirDisplayText(videoState)),
+            ),
+          FutureBuilder<List<String>>(
+            future: _fontLibraryFuture ??= videoState.listSubtitleFonts(),
+            builder: (context, snapshot) {
+              final fonts = snapshot.data ?? const <String>[];
+              if (fonts.isEmpty) {
+                return const SizedBox.shrink();
+              }
+              // 多选感知：高亮按逗号分隔列表判断，点击为切换（与其他
+              // 字幕面板的多选语义一致），不再是单值覆盖。
+              final selectedFonts = videoState.subtitleFontName
+                  .split(',')
+                  .map((e) => e.trim())
+                  .where((e) => e.isNotEmpty)
+                  .toSet();
+              return AdaptivePlayerMenuTile(
+                title: const Text('字体库（点击多选）'),
+                subtitle: ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 140),
+                  child: SingleChildScrollView(
+                    child: Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      children: [
+                        for (final name in fonts)
+                          ActionChip(
+                            label: Text(
+                              name,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: selectedFonts.contains(name)
+                                    ? CupertinoColors.activeBlue
+                                    : CupertinoColors.label,
+                              ),
+                            ),
+                            backgroundColor: CupertinoColors.systemGrey5,
+                            side: BorderSide(
+                              color: selectedFonts.contains(name)
+                                  ? CupertinoColors.activeBlue
+                                  : CupertinoColors.systemGrey4,
+                            ),
+                            onPressed: () {
+                              final next = selectedFonts.contains(name)
+                                  ? selectedFonts
+                                      .where((e) => e != name)
+                                      .join(',')
+                                  : [...selectedFonts, name].join(',');
+                              videoState.setSubtitleFontName(next);
+                            },
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+          AdaptivePlayerMenuTile(
+            title: const Text('清除字体设置'),
+            trailing: AdaptiveButton(
+              label: '清除',
+              style: AdaptiveButtonStyle.glass,
+              size: AdaptiveButtonSize.small,
+              onPressed: () {
+                videoState.setSubtitleFontName('');
+                videoState.setSubtitleFontDir('');
+              },
+            ),
+          ),
+          AdaptivePlayerMenuTile(
+            title: const Text('清理字体缓存'),
+            trailing: AdaptiveButton(
+              label: '清理',
+              style: AdaptiveButtonStyle.glass,
+              size: AdaptiveButtonSize.small,
+              onPressed: () async {
+                await videoState.clearSubtitleFontCache();
+                if (!mounted) return;
+                setState(() {
+                  _fontImportMessage = '已清空字体库（subtitle_fonts 目录）';
+                });
+                _refreshFontLibrary();
+              },
+            ),
+          ),
+        ],
+      ),
+    ];
+  }
+
+  Widget _buildSubtitleScaleTile(
+    BuildContext context,
+    SubtitleSettingsPaneController controller,
+  ) {
+    return _buildSliderTile(
+      context,
+      title: '字幕大小',
+      description: '${(controller.subtitleScale * 100).round()}%',
+      value: controller.subtitleScale,
+      min: controller.minScale,
+      max: controller.maxScale,
+      divisions: ((controller.maxScale - controller.minScale) / 0.05).round(),
+      onChanged: controller.setSubtitleScale,
     );
   }
 
@@ -529,19 +669,12 @@ class _CupertinoSubtitleSettingsPaneState
       SubtitleStyleOverrideMode.scale: '仅缩放',
       SubtitleStyleOverrideMode.force: '自定义样式',
     };
-    return CupertinoListTile(
-      title: const Text('样式覆盖'),
-      trailing: CupertinoSegmentedControl<SubtitleStyleOverrideMode>(
-        groupValue: videoState.subtitleOverrideMode,
-        onValueChanged: videoState.setSubtitleOverrideMode,
-        children: {
-          for (final entry in labels.entries)
-            entry.key: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-              child: Text(entry.value),
-            ),
-        },
-      ),
+    return _buildSegmentedTile<SubtitleStyleOverrideMode>(
+      context,
+      title: '样式覆盖',
+      groupValue: videoState.subtitleOverrideMode,
+      labels: labels,
+      onValueChanged: videoState.setSubtitleOverrideMode,
     );
   }
 
@@ -551,19 +684,12 @@ class _CupertinoSubtitleSettingsPaneState
       SubtitleAlignX.center: '中',
       SubtitleAlignX.right: '右',
     };
-    return CupertinoListTile(
-      title: const Text('水平对齐'),
-      trailing: CupertinoSegmentedControl<SubtitleAlignX>(
-        groupValue: videoState.subtitleAlignX,
-        onValueChanged: videoState.setSubtitleAlignX,
-        children: {
-          for (final entry in labels.entries)
-            entry.key: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-              child: Text(entry.value),
-            ),
-        },
-      ),
+    return _buildSegmentedTile<SubtitleAlignX>(
+      context,
+      title: '水平对齐',
+      groupValue: videoState.subtitleAlignX,
+      labels: labels,
+      onValueChanged: videoState.setSubtitleAlignX,
     );
   }
 
@@ -573,18 +699,45 @@ class _CupertinoSubtitleSettingsPaneState
       SubtitleAlignY.center: '中',
       SubtitleAlignY.bottom: '下',
     };
-    return CupertinoListTile(
-      title: const Text('垂直对齐'),
-      trailing: CupertinoSegmentedControl<SubtitleAlignY>(
-        groupValue: videoState.subtitleAlignY,
-        onValueChanged: videoState.setSubtitleAlignY,
-        children: {
-          for (final entry in labels.entries)
-            entry.key: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-              child: Text(entry.value),
+    return _buildSegmentedTile<SubtitleAlignY>(
+      context,
+      title: '垂直对齐',
+      groupValue: videoState.subtitleAlignY,
+      labels: labels,
+      onValueChanged: videoState.setSubtitleAlignY,
+    );
+  }
+
+  Widget _buildSegmentedTile<T extends Object>(
+    BuildContext context, {
+    required String title,
+    required T groupValue,
+    required Map<T, String> labels,
+    required ValueChanged<T> onValueChanged,
+  }) {
+    final textStyle = CupertinoTheme.of(context).textTheme.textStyle;
+    return AdaptivePlayerMenuTile(
+      padding: const EdgeInsetsDirectional.fromSTEB(20, 12, 20, 14),
+      title: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: textStyle.copyWith(fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: AdaptiveSegmentedControl(
+              labels: labels.values.toList(growable: false),
+              selectedIndex: labels.keys.toList(growable: false).indexOf(
+                    groupValue,
+                  ),
+              onValueChanged: (index) =>
+                  onValueChanged(labels.keys.elementAt(index)),
             ),
-        },
+          ),
+        ],
       ),
     );
   }
@@ -626,7 +779,7 @@ class _CupertinoSubtitleSettingsPaneState
           Row(
             children: [
               Expanded(
-                child: CupertinoTextField(
+                child: AdaptivePlayerMenuTextField(
                   controller: _subtitleDelayController,
                   focusNode: _subtitleDelayFocus,
                   placeholder: '例如 -12.5 或 8',
@@ -643,11 +796,10 @@ class _CupertinoSubtitleSettingsPaneState
                 ),
               ),
               const SizedBox(width: 10),
-              CupertinoButton(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+              AdaptiveButton(
+                label: '应用',
+                style: AdaptiveButtonStyle.glass,
                 onPressed: () => _applyCustomSubtitleDelay(videoState),
-                child: const Text('应用'),
               ),
             ],
           ),
@@ -673,7 +825,7 @@ class _CupertinoSubtitleSettingsPaneState
       fontSize: 13,
       color: CupertinoColors.secondaryLabel.resolveFrom(context),
     );
-    return CupertinoListTile(
+    return AdaptivePlayerMenuTile(
       padding: const EdgeInsetsDirectional.fromSTEB(20, 12, 20, 16),
       title: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -710,52 +862,253 @@ class _CupertinoSubtitleSettingsPaneState
     required bool value,
     required ValueChanged<bool> onChanged,
   }) {
-    return CupertinoListTile(
+    return AdaptivePlayerMenuTile(
       title: Text(title),
-      trailing: CupertinoSwitch(
+      trailing: AdaptivePlayerMenuSwitch(
         value: value,
         onChanged: onChanged,
       ),
+      onTap: () => onChanged(!value),
     );
   }
 
+  /// 颜色行：hex 文本按钮（点击弹出输入窗口）+ 色块按钮（HSV 调色板）。
+  /// 之前 trailing 内嵌 110pt 输入框，在横屏播放器右下角的面板里键盘一顶
+  /// 就被卡在画面角落；改为点击弹出独立对话框，Dialog/AppSheet 自带键盘
+  /// 避让，输入框始终显示在键盘上方。
   Widget _buildColorTile(
     BuildContext context, {
     required String label,
-    required TextEditingController controller,
-    required FocusNode focusNode,
     required Color color,
-    required ValueChanged<String> onSubmit,
+    required ValueChanged<Color> onPicked,
   }) {
-    return CupertinoListTile(
+    return AdaptivePlayerMenuTile(
       title: Text(label),
-      trailing: SizedBox(
-        width: 120,
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.end,
-          children: [
-            Container(
-              width: 16,
-              height: 16,
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          AdaptiveButton.child(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            onPressed: () {
+              _showHexInputDialog(context, label, color, onPicked);
+            },
+            child: Text(
+              _colorToHex(color),
+              key: const Key('subtitleColorValueButton'),
+              style: const TextStyle(
+                fontSize: 13,
+                color: CupertinoColors.white,
+                fontFeatures: [FontFeature.tabularFigures()],
+              ),
+            ),
+          ),
+          const SizedBox(width: 4),
+          AdaptiveButton.child(
+            padding: EdgeInsets.zero,
+            minSize: const Size(44, 44),
+            onPressed: () {
+              // 点色块打开全色调色盘（HSV），选色后应用。
+              _showColorPickerDialog(context, color, (picked) {
+                debugPrint(
+                  '[SubtitleColor] 色板选色: ${_colorToHex(picked)}',
+                );
+                onPicked(picked);
+              });
+            },
+            child: Container(
+              key: const Key('subtitleColorSwatch'),
+              width: 20,
+              height: 20,
               decoration: BoxDecoration(
                 color: color,
                 borderRadius: BorderRadius.circular(4),
                 border: Border.all(color: CupertinoColors.systemGrey),
               ),
             ),
-            const SizedBox(width: 8),
-            SizedBox(
-              width: 80,
-              child: CupertinoTextField(
-                controller: controller,
-                focusNode: focusNode,
-                placeholder: '#FFFFFF',
-                onSubmitted: onSubmit,
-              ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 单行 hex 输入弹窗：实时解析（onChanged 输入即应用，与旧内嵌框
+  /// 语义一致）。对话框自带键盘避让，不会卡在屏幕角落。
+  Future<void> _showHexInputDialog(
+    BuildContext context,
+    String label,
+    Color initial,
+    ValueChanged<Color> onPicked,
+  ) async {
+    final controller = TextEditingController(text: _colorToHex(initial));
+    await showCupertinoDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return CupertinoAlertDialog(
+          title: Text(label),
+          content: Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: AdaptivePlayerMenuTextField(
+              controller: controller,
+              autofocus: true,
+              maxLength: 7,
+              placeholder: '#FFFFFF',
+              onChanged: (value) {
+                final parsed = _parseHexColor(value);
+                if (parsed != null) {
+                  onPicked(parsed);
+                }
+              },
+              onSubmitted: (_) => Navigator.of(dialogContext).pop(),
+            ),
+          ),
+          actions: [
+            AdaptiveButton.child(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('关闭'),
             ),
           ],
+        );
+      },
+    );
+    controller.dispose();
+  }
+
+  /// 全色调色板对话框（HSV 三滑块：色相/饱和度/亮度 + 实时预览）
+  Future<void> _showColorPickerDialog(
+    BuildContext context,
+    Color initial,
+    ValueChanged<Color> onPicked,
+  ) async {
+    var hsv = HSVColor.fromColor(initial);
+    // 对话框内 hex 输入与 HSV 滑块双向同步：改滑块刷新文本框，
+    // 输入合法 hex 反过来刷新滑块与预览。
+    final hexController = TextEditingController(text: _colorToHex(initial));
+    final picked = await showCupertinoDialog<Color>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (dialogContext, setDialogState) {
+            return CupertinoAlertDialog(
+              title: const Text('选择颜色'),
+              content: SizedBox(
+                width: 300,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      width: double.infinity,
+                      height: 40,
+                      decoration: BoxDecoration(
+                        color: hsv.toColor(),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: CupertinoColors.systemGrey),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _buildHsvSliderRow(
+                      '色相',
+                      hsv.hue,
+                      0,
+                      360,
+                      (v) => setDialogState(() {
+                        hsv = hsv.withHue(v);
+                        hexController.text = _colorToHex(hsv.toColor());
+                      }),
+                    ),
+                    _buildHsvSliderRow(
+                      '饱和',
+                      hsv.saturation,
+                      0,
+                      1,
+                      (v) => setDialogState(() {
+                        hsv = hsv.withSaturation(v);
+                        hexController.text = _colorToHex(hsv.toColor());
+                      }),
+                    ),
+                    _buildHsvSliderRow(
+                      '亮度',
+                      hsv.value,
+                      0,
+                      1,
+                      (v) => setDialogState(() {
+                        hsv = hsv.withValue(v);
+                        hexController.text = _colorToHex(hsv.toColor());
+                      }),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        const SizedBox(
+                          width: 60,
+                          child: Text('十六进制', style: TextStyle(fontSize: 13)),
+                        ),
+                        Expanded(
+                          child: AdaptivePlayerMenuTextField(
+                            controller: hexController,
+                            placeholder: '#FFFFFF',
+                            onChanged: (text) {
+                              final parsed = _parseHexColor(text);
+                              if (parsed != null) {
+                                setDialogState(
+                                  () => hsv = HSVColor.fromColor(parsed),
+                                );
+                              }
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                AdaptiveButton.child(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('取消'),
+                ),
+                AdaptiveButton.child(
+                  onPressed: () {
+                    // hex 输入合法时以 hex 为准（允许只改 hex 不动滑块）；
+                    // 非法输入保持 HSV 当前值。
+                    final fromHex = _parseHexColor(hexController.text);
+                    Navigator.pop(dialogContext, fromHex ?? hsv.toColor());
+                  },
+                  child: const Text('确定'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    hexController.dispose();
+    if (picked != null) {
+      onPicked(picked);
+    }
+  }
+
+  Widget _buildHsvSliderRow(
+    String label,
+    double value,
+    double min,
+    double max,
+    ValueChanged<double> onChanged,
+  ) {
+    return Row(
+      children: [
+        SizedBox(
+            width: 36,
+            child: Text(label, style: const TextStyle(fontSize: 13))),
+        Expanded(
+          child: CupertinoSlider(
+            value: value.clamp(min, max),
+            min: min,
+            max: max,
+            onChanged: onChanged,
+          ),
         ),
-      ),
+      ],
     );
   }
 }

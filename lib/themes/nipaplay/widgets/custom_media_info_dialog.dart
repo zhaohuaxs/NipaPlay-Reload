@@ -1,10 +1,11 @@
 import 'dart:io' as io;
+import 'package:flutter/cupertino.dart' as cupertino;
 import 'package:flutter/material.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 import 'package:path/path.dart' as p;
 import 'package:nipaplay/services/webdav_service.dart';
 import 'package:nipaplay/services/smb_service.dart';
-import 'package:nipaplay/services/smb_proxy_service.dart';
+import 'package:nipaplay/utils/media_source_utils.dart';
 import 'package:nipaplay/providers/watch_history_provider.dart';
 import 'package:nipaplay/providers/appearance_settings_provider.dart';
 import 'package:nipaplay/models/watch_history_model.dart';
@@ -14,6 +15,10 @@ import 'package:provider/provider.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
 import 'package:nipaplay/themes/nipaplay/widgets/nipaplay_window.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
 
 class CustomMediaInfoDialog {
   static Color get _accentColor => AppAccentColors.current;
@@ -21,19 +26,54 @@ class CustomMediaInfoDialog {
 
   static Future<Map<String, dynamic>?> show(
       BuildContext context, String folderPath,
-      {String? initialVideoPath}) {
-    return _showStep1(context, folderPath, initialVideoPath: initialVideoPath);
+      {String? initialVideoPath,
+      List<String>? preloadedVideoPaths,
+      Future<List<String>> Function(bool recursive)? videoPathLoader}) {
+    return _showStep1(
+      context,
+      folderPath,
+      initialVideoPath: initialVideoPath,
+      preloadedVideoPaths: preloadedVideoPaths,
+      videoPathLoader: videoPathLoader,
+    );
+  }
+
+  static Future<T?> _showAdaptiveContent<T>({
+    required BuildContext context,
+    required String title,
+    required bool isPhone,
+    required bool enableAnimation,
+    required Widget child,
+  }) {
+    if (isPhone) {
+      return CupertinoBottomSheet.show<T>(
+        context: context,
+        title: title,
+        floatingTitle: true,
+        child: child,
+      );
+    }
+    return NipaplayWindow.show<T>(
+      context: context,
+      enableAnimation: enableAnimation,
+      barrierDismissible: true,
+      child: child,
+    );
   }
 
   static Future<Map<String, dynamic>?> _showStep1(
       BuildContext context, String folderPath,
       {String? initialVideoPath,
+      List<String>? preloadedVideoPaths,
+      Future<List<String>> Function(bool recursive)? videoPathLoader,
       Map<String, dynamic>? step1Data,
       VoidCallback? onBack}) async {
     final enableAnimation = Provider.of<AppearanceSettingsProvider>(
       context,
       listen: false,
     ).enablePageAnimation;
+    final isPhone =
+        AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone;
 
     final TextEditingController nameController =
         TextEditingController(text: step1Data?['name'] ?? '');
@@ -67,10 +107,11 @@ class CustomMediaInfoDialog {
         TextEditingController(text: step1Data?['coverUrl'] ?? '');
 
     final callerContext = context;
-    return NipaplayWindow.show<Map<String, dynamic>>(
+    return _showAdaptiveContent<Map<String, dynamic>>(
       context: context,
+      title: '自定义媒体信息',
+      isPhone: isPhone,
       enableAnimation: enableAnimation,
-      barrierDismissible: true,
       child: Builder(builder: (context) {
         final isDarkMode = Theme.of(context).brightness == Brightness.dark;
         final textColor = Theme.of(context).colorScheme.onSurface;
@@ -93,6 +134,7 @@ class CustomMediaInfoDialog {
         return TextSelectionTheme(
           data: selectionTheme,
           child: NipaplayWindowScaffold(
+            embedded: isPhone,
             maxWidth: MediaQuery.of(context).size.width >= 1200
                 ? 980
                 : globals.DialogSizes.getDialogWidth(
@@ -109,46 +151,34 @@ class CustomMediaInfoDialog {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // 标题
-                  Row(
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: _accentColor.withOpacity(0.18),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Icon(
-                          Icons.edit_note,
-                          color: _accentColor,
-                          size: 20,
-                        ),
-                      ),
-                      SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '自定义媒体信息',
-                              style: TextStyle(
-                                color: textColor,
-                                fontSize: 18,
-                                fontWeight: FontWeight.bold,
+                  if (!isPhone) ...[
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '自定义媒体信息',
+                                style: TextStyle(
+                                  color: textColor,
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.bold,
+                                ),
                               ),
-                            ),
-                            SizedBox(height: 4),
-                            Text(
-                              '填写媒体基本信息，包括名称、简介等',
-                              style:
-                                  TextStyle(color: subTextColor, fontSize: 13),
-                            ),
-                          ],
+                              SizedBox(height: 4),
+                              Text(
+                                '填写媒体基本信息，包括名称、简介等',
+                                style: TextStyle(
+                                    color: subTextColor, fontSize: 13),
+                              ),
+                            ],
+                          ),
                         ),
-                      ),
-                    ],
-                  ),
-                  SizedBox(height: 24),
+                      ],
+                    ),
+                    const SizedBox(height: 24),
+                  ],
                   // 步骤指示器
                   Row(
                     children: [
@@ -228,7 +258,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: nameController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -250,8 +280,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                             ),
@@ -273,7 +302,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: nameCnController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -295,8 +324,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                             ),
@@ -318,7 +346,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: coverUrlController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -340,8 +368,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                             ),
@@ -363,7 +390,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: summaryController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -385,8 +412,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                               maxLines: 3,
@@ -409,7 +435,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: airDateController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -431,8 +457,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                             ),
@@ -454,7 +479,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: airWeekdayController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -476,8 +501,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                             ),
@@ -499,7 +523,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: ratingController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -521,8 +545,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                             ),
@@ -544,7 +567,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: tagsController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -566,8 +589,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                             ),
@@ -589,7 +611,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: metadataController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -611,8 +633,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                             ),
@@ -634,7 +655,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: platformController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -656,8 +677,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                             ),
@@ -679,7 +699,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: totalEpisodesController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -701,8 +721,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                             ),
@@ -724,7 +743,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: typeDescriptionController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -746,8 +765,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                             ),
@@ -769,7 +787,7 @@ class CustomMediaInfoDialog {
                               ),
                             ),
                             SizedBox(height: 8),
-                            TextField(
+                            AdaptiveMediaTextField(
                               controller: bangumiUrlController,
                               style: TextStyle(color: textColor),
                               decoration: InputDecoration(
@@ -791,8 +809,7 @@ class CustomMediaInfoDialog {
                                 ),
                                 focusedBorder: OutlineInputBorder(
                                   borderRadius: BorderRadius.circular(10),
-                                  borderSide:
-                                      BorderSide(color: _accentColor),
+                                  borderSide: BorderSide(color: _accentColor),
                                 ),
                               ),
                             ),
@@ -813,44 +830,12 @@ class CustomMediaInfoDialog {
                           overflow: TextOverflow.ellipsis,
                         ),
                       ),
-                      ElevatedButton(
+                      AdaptiveMediaActionButton(
                         onPressed: () => Navigator.of(context).pop(),
-                        style: ButtonStyle(
-                          backgroundColor:
-                              MaterialStateProperty.all(Colors.transparent),
-                          foregroundColor: MaterialStateProperty.all(
-                              Theme.of(context).colorScheme.onSurface),
-                          overlayColor:
-                              MaterialStateProperty.all(Colors.transparent),
-                          splashFactory: NoSplash.splashFactory,
-                          padding: MaterialStateProperty.all(
-                            const EdgeInsets.symmetric(
-                                horizontal: 20, vertical: 12),
-                          ),
-                          minimumSize:
-                              MaterialStateProperty.all(const Size(96, 44)),
-                          elevation: MaterialStateProperty.all(0),
-                          shadowColor:
-                              MaterialStateProperty.all(Colors.transparent),
-                          shape: MaterialStateProperty.all(
-                            RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(10),
-                              side: BorderSide(
-                                  color: Theme.of(context)
-                                      .colorScheme
-                                      .onSurface
-                                      .withOpacity(
-                                          Theme.of(context).brightness ==
-                                                  Brightness.dark
-                                              ? 0.12
-                                              : 0.2)),
-                            ),
-                          ),
-                        ),
-                        child: const Text('取消'),
+                        label: '取消',
                       ),
                       SizedBox(width: 12),
-                      ElevatedButton(
+                      AdaptiveMediaActionButton(
                         onPressed: () {
                           // 验证必填字段
                           if (nameController.text.isEmpty) {
@@ -897,41 +882,22 @@ class CustomMediaInfoDialog {
                           Navigator.of(context).pop();
                           _Step2Dialog.show(callerContext, step1Data,
                               initialVideoPath: initialVideoPath,
+                              preloadedVideoPaths: preloadedVideoPaths,
+                              videoPathLoader: videoPathLoader,
                               onBack: onBack ??
                                   () {
                                     _showStep1(callerContext, folderPath,
                                         initialVideoPath: initialVideoPath,
+                                        preloadedVideoPaths:
+                                            preloadedVideoPaths,
+                                        videoPathLoader: videoPathLoader,
                                         step1Data: step1Data);
                                   });
                         },
-                        style: ButtonStyle(
-                          backgroundColor:
-                              MaterialStateProperty.resolveWith((states) {
-                            if (states.contains(MaterialState.disabled)) {
-                              return _accentColor.withOpacity(0.5);
-                            }
-                            return _accentColor;
-                          }),
-                          foregroundColor:
-                              MaterialStateProperty.all(Colors.white),
-                          overlayColor:
-                              MaterialStateProperty.all(Colors.transparent),
-                          splashFactory: NoSplash.splashFactory,
-                          padding: MaterialStateProperty.all(
-                            const EdgeInsets.symmetric(
-                                horizontal: 20, vertical: 12),
-                          ),
-                          minimumSize:
-                              MaterialStateProperty.all(const Size(96, 44)),
-                          elevation: MaterialStateProperty.all(0),
-                          shadowColor:
-                              MaterialStateProperty.all(Colors.transparent),
-                          shape: MaterialStateProperty.all(
-                            RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(10)),
-                          ),
-                        ),
-                        child: const Text('下一步'),
+                        label: '下一步',
+                        desktopIcon: Icons.arrow_forward_rounded,
+                        phoneIcon: cupertino.CupertinoIcons.forward,
+                        emphasis: AdaptiveMediaActionEmphasis.primary,
                       ),
                     ],
                   ),
@@ -1109,25 +1075,42 @@ class CustomMediaInfoDialog {
 class _Step2Dialog extends StatefulWidget {
   final Map<String, dynamic> step1Data;
   final String? initialVideoPath;
+  final List<String>? preloadedVideoPaths;
+  final Future<List<String>> Function(bool recursive)? videoPathLoader;
   final ValueNotifier<List<_VideoFileItem>> videoFilesNotifier =
       ValueNotifier([]);
 
-  _Step2Dialog({required this.step1Data, this.initialVideoPath});
+  _Step2Dialog({
+    required this.step1Data,
+    this.initialVideoPath,
+    this.preloadedVideoPaths,
+    this.videoPathLoader,
+  });
 
   static Future<Map<String, dynamic>?> show(
       BuildContext context, Map<String, dynamic> step1Data,
-      {String? initialVideoPath, VoidCallback? onBack}) async {
-    final _Step2Dialog dialog =
-        _Step2Dialog(step1Data: step1Data, initialVideoPath: initialVideoPath);
+      {String? initialVideoPath,
+      List<String>? preloadedVideoPaths,
+      Future<List<String>> Function(bool recursive)? videoPathLoader,
+      VoidCallback? onBack}) async {
+    final _Step2Dialog dialog = _Step2Dialog(
+      step1Data: step1Data,
+      initialVideoPath: initialVideoPath,
+      preloadedVideoPaths: preloadedVideoPaths,
+      videoPathLoader: videoPathLoader,
+    );
     final enableAnimation = Provider.of<AppearanceSettingsProvider>(
       context,
       listen: false,
     ).enablePageAnimation;
+    final isPhone =
+        AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone;
 
-    final result = await NipaplayWindow.show<dynamic>(
+    final result = await CustomMediaInfoDialog._showAdaptiveContent<dynamic>(
       context: context,
+      title: '自定义媒体信息',
+      isPhone: isPhone,
       enableAnimation: enableAnimation,
-      barrierDismissible: true,
       child: Builder(builder: (context) {
         final isDarkMode = Theme.of(context).brightness == Brightness.dark;
         final textColor = Theme.of(context).colorScheme.onSurface;
@@ -1136,6 +1119,7 @@ class _Step2Dialog extends StatefulWidget {
             isDarkMode ? const Color(0xFF1E1E1E) : const Color(0xFFF2F2F2);
 
         return NipaplayWindowScaffold(
+          embedded: isPhone,
           maxWidth: MediaQuery.of(context).size.width >= 1200
               ? 980
               : globals.DialogSizes.getDialogWidth(
@@ -1152,46 +1136,34 @@ class _Step2Dialog extends StatefulWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // 标题
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: CustomMediaInfoDialog._accentColor
-                            .withOpacity(0.18),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Icon(
-                        Icons.playlist_add_check,
-                        color: CustomMediaInfoDialog._accentColor,
-                        size: 20,
-                      ),
-                    ),
-                    SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            '自定义媒体信息',
-                            style: TextStyle(
-                              color: textColor,
-                              fontSize: 18,
-                              fontWeight: FontWeight.bold,
+                if (!isPhone) ...[
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '自定义媒体信息',
+                              style: TextStyle(
+                                color: textColor,
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                              ),
                             ),
-                          ),
-                          SizedBox(height: 4),
-                          Text(
-                            '设置剧集信息，包括文件名和剧集名称',
-                            style: TextStyle(color: subTextColor, fontSize: 13),
-                          ),
-                        ],
+                            SizedBox(height: 4),
+                            Text(
+                              '设置剧集信息，包括文件名和剧集名称',
+                              style:
+                                  TextStyle(color: subTextColor, fontSize: 13),
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
-                  ],
-                ),
-                SizedBox(height: 24),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
+                ],
                 // 内容
                 SizedBox(
                   height: 400,
@@ -1209,46 +1181,17 @@ class _Step2Dialog extends StatefulWidget {
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
-                    ElevatedButton(
+                    AdaptiveMediaActionButton(
                       onPressed: () {
                         Navigator.of(context).pop();
                         onBack?.call();
                       },
-                      style: ButtonStyle(
-                        backgroundColor:
-                            MaterialStateProperty.all(Colors.transparent),
-                        foregroundColor: MaterialStateProperty.all(
-                            Theme.of(context).colorScheme.onSurface),
-                        overlayColor:
-                            MaterialStateProperty.all(Colors.transparent),
-                        splashFactory: NoSplash.splashFactory,
-                        padding: MaterialStateProperty.all(
-                          const EdgeInsets.symmetric(
-                              horizontal: 20, vertical: 12),
-                        ),
-                        minimumSize:
-                            MaterialStateProperty.all(const Size(96, 44)),
-                        elevation: MaterialStateProperty.all(0),
-                        shadowColor:
-                            MaterialStateProperty.all(Colors.transparent),
-                        shape: MaterialStateProperty.all(
-                          RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(10),
-                            side: BorderSide(
-                                color: Theme.of(context)
-                                    .colorScheme
-                                    .onSurface
-                                    .withOpacity(Theme.of(context).brightness ==
-                                            Brightness.dark
-                                        ? 0.12
-                                        : 0.2)),
-                          ),
-                        ),
-                      ),
-                      child: const Text('上一步'),
+                      label: '上一步',
+                      desktopIcon: Icons.arrow_back_rounded,
+                      phoneIcon: cupertino.CupertinoIcons.back,
                     ),
                     SizedBox(width: 12),
-                    ElevatedButton(
+                    AdaptiveMediaActionButton(
                       onPressed: () async {
                         // 构建完整的返回数据
                         final Map<String, dynamic> result = {
@@ -1274,35 +1217,10 @@ class _Step2Dialog extends StatefulWidget {
 
                         Navigator.of(context).pop(result);
                       },
-                      style: ButtonStyle(
-                        backgroundColor:
-                            MaterialStateProperty.resolveWith((states) {
-                          if (states.contains(MaterialState.disabled)) {
-                            return CustomMediaInfoDialog._accentColor
-                                .withOpacity(0.5);
-                          }
-                          return CustomMediaInfoDialog._accentColor;
-                        }),
-                        foregroundColor:
-                            MaterialStateProperty.all(Colors.white),
-                        overlayColor:
-                            MaterialStateProperty.all(Colors.transparent),
-                        splashFactory: NoSplash.splashFactory,
-                        padding: MaterialStateProperty.all(
-                          const EdgeInsets.symmetric(
-                              horizontal: 20, vertical: 12),
-                        ),
-                        minimumSize:
-                            MaterialStateProperty.all(const Size(96, 44)),
-                        elevation: MaterialStateProperty.all(0),
-                        shadowColor:
-                            MaterialStateProperty.all(Colors.transparent),
-                        shape: MaterialStateProperty.all(
-                          RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(10)),
-                        ),
-                      ),
-                      child: const Text('确定'),
+                      label: '确定',
+                      desktopIcon: Icons.check_rounded,
+                      phoneIcon: cupertino.CupertinoIcons.check_mark,
+                      emphasis: AdaptiveMediaActionEmphasis.primary,
                     ),
                   ],
                 ),
@@ -1399,7 +1317,7 @@ class _Step2DialogState extends State<_Step2Dialog> {
               ],
             ),
             SizedBox(height: 8),
-            TextField(
+            AdaptiveMediaTextField(
               controller: item.titleController,
               style: TextStyle(color: textColor),
               decoration: InputDecoration(
@@ -1423,8 +1341,8 @@ class _Step2DialogState extends State<_Step2Dialog> {
                 ),
                 focusedBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(8),
-                  borderSide: BorderSide(
-                      color: CustomMediaInfoDialog._accentColor),
+                  borderSide:
+                      BorderSide(color: CustomMediaInfoDialog._accentColor),
                 ),
               ),
             ),
@@ -1543,10 +1461,10 @@ class _Step2DialogState extends State<_Step2Dialog> {
                 CustomMediaInfoDialog._extractEpisodeNumber(fileName);
             final sortKey =
                 CustomMediaInfoDialog._generateSortKey(episodeNumber);
-            final fileUrl =
-                WebDAVService.instance.getFileUrl(connection, file.path);
+            final filePath =
+                MediaSourceUtils.buildWebDavPath(connection.id, file.path);
             videoFiles.add(_VideoFileItem(
-              path: fileUrl,
+              path: filePath,
               displayName: fileName,
               episodeNumber: episodeNumber,
               sortKey: sortKey,
@@ -1582,10 +1500,10 @@ class _Step2DialogState extends State<_Step2Dialog> {
                 CustomMediaInfoDialog._extractEpisodeNumber(fileName);
             final sortKey =
                 CustomMediaInfoDialog._generateSortKey(episodeNumber);
-            final fileUrl =
-                SMBProxyService.instance.buildStreamUrl(connection, file.path);
+            final filePath =
+                MediaSourceUtils.buildSmbPath(connection.id, file.path);
             videoFiles.add(_VideoFileItem(
-              path: fileUrl,
+              path: filePath,
               displayName: fileName,
               episodeNumber: episodeNumber,
               sortKey: sortKey,
@@ -1622,6 +1540,37 @@ class _Step2DialogState extends State<_Step2Dialog> {
     final folderPath = widget.step1Data['folderPath'] as String;
 
     try {
+      final loadedVideoPaths = widget.videoPathLoader != null
+          ? await widget.videoPathLoader!(scanSubfolders)
+          : widget.preloadedVideoPaths;
+      if (loadedVideoPaths != null) {
+        for (final filePath in loadedVideoPaths) {
+          final uri = Uri.tryParse(filePath);
+          final fileName = uri != null && uri.scheme.isNotEmpty
+              ? p.basename(uri.path)
+              : p.basename(filePath);
+          final extension = p.extension(fileName).toLowerCase();
+          if (!videoExtensions.contains(extension)) continue;
+          final episodeNumber =
+              CustomMediaInfoDialog._extractEpisodeNumber(fileName);
+          videoFiles.add(_VideoFileItem(
+            path: filePath,
+            displayName: fileName,
+            episodeNumber: episodeNumber,
+            sortKey: CustomMediaInfoDialog._generateSortKey(episodeNumber),
+          ));
+        }
+        videoFiles.sort((a, b) {
+          if (a.sortKey != null && b.sortKey != null) {
+            return a.sortKey!.compareTo(b.sortKey!);
+          }
+          if (a.sortKey != null) return -1;
+          if (b.sortKey != null) return 1;
+          return a.displayName.compareTo(b.displayName);
+        });
+        return;
+      }
+
       // 如果提供了initialVideoPath，只处理这个视频文件
       if (widget.initialVideoPath != null) {
         final filePath = widget.initialVideoPath!;
@@ -1663,21 +1612,14 @@ class _Step2DialogState extends State<_Step2Dialog> {
       else {
         // 检查是否是WebDAV路径
         if (folderPath.startsWith('webdav://')) {
-          // 解析WebDAV路径：webdav://connectionName/path
-          final pathWithoutScheme = folderPath.substring(9);
-          final firstSlashIndex = pathWithoutScheme.indexOf('/');
-          if (firstSlashIndex != -1) {
-            final connectionName =
-                pathWithoutScheme.substring(0, firstSlashIndex);
-            final path = pathWithoutScheme.substring(firstSlashIndex);
-
-            // 获取WebDAV连接
-            final connection = WebDAVService.instance.connections.firstWhere(
-              (c) => c.name == connectionName,
-            );
-
+          final resolved = WebDAVService.instance.resolveMediaPath(folderPath);
+          if (resolved != null) {
             // 递归扫描文件夹
-            await _scanWebDAVFolder(connection, path, videoExtensions);
+            await _scanWebDAVFolder(
+              resolved.connection,
+              resolved.relativePath,
+              videoExtensions,
+            );
           }
         }
         // 检查是否是SMB路径
@@ -1691,12 +1633,13 @@ class _Step2DialogState extends State<_Step2Dialog> {
             final path = pathWithoutScheme.substring(firstSlashIndex);
 
             // 获取SMB连接
-            final connection = SMBService.instance.connections.firstWhere(
-              (c) => c.name == connectionName,
-            );
+            final connection =
+                SMBService.instance.getConnectionByIdOrName(connectionName);
 
             // 递归扫描文件夹
-            await _scanSMBFolder(connection, path, videoExtensions);
+            if (connection != null) {
+              await _scanSMBFolder(connection, path, videoExtensions);
+            }
           }
         }
         // 本地路径
@@ -1824,17 +1767,14 @@ class _Step2DialogState extends State<_Step2Dialog> {
             // 扫描选项
             Row(
               children: [
-                Checkbox(
+                AdaptiveMediaCheckbox(
                   value: scanSubfolders,
                   onChanged: (value) async {
                     setState(() {
-                      scanSubfolders = value ?? false;
+                      scanSubfolders = value;
                     });
                     await scanVideoFiles();
                   },
-                  checkColor: Colors.white,
-                  activeColor: CustomMediaInfoDialog._accentColor,
-                  side: BorderSide(color: _borderColor, width: 1),
                 ),
                 Text(
                   '扫描子文件夹',
@@ -1852,10 +1792,8 @@ class _Step2DialogState extends State<_Step2Dialog> {
                 child: Center(
                   child: Padding(
                     padding: EdgeInsets.all(40.0),
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      valueColor: AlwaysStoppedAnimation<Color>(
-                          CustomMediaInfoDialog._accentColor),
+                    child: AdaptiveMediaActivityIndicator(
+                      color: CustomMediaInfoDialog._accentColor,
                     ),
                   ),
                 ),

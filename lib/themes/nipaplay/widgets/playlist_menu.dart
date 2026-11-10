@@ -3,8 +3,10 @@ import 'package:path/path.dart' as p;
 import 'package:nipaplay/utils/video_player_state.dart';
 import 'package:provider/provider.dart';
 import 'base_settings_menu.dart';
+import 'player_menu_theme.dart';
 import 'dart:io';
 import 'package:nipaplay/services/jellyfin_service.dart';
+import 'package:nipaplay/services/media_server_playlist_loader.dart';
 import 'package:nipaplay/services/emby_service.dart';
 import 'package:nipaplay/services/jellyfin_episode_mapping_service.dart';
 import 'package:nipaplay/services/emby_episode_mapping_service.dart';
@@ -14,13 +16,16 @@ import 'package:nipaplay/models/emby_model.dart';
 import 'package:nipaplay/models/playable_item.dart';
 import 'package:nipaplay/models/watch_history_model.dart';
 import 'package:nipaplay/models/shared_remote_library.dart';
-import 'package:nipaplay/services/external_player_service.dart';
+import 'package:nipaplay/services/playback_service.dart';
+import 'package:nipaplay/services/episode_file_selection_service.dart';
 import 'package:nipaplay/services/smb_proxy_service.dart';
 import 'package:nipaplay/services/smb_service.dart';
 import 'package:nipaplay/services/webdav_service.dart';
 import 'package:nipaplay/providers/shared_remote_library_provider.dart';
+import 'package:nipaplay/providers/settings_provider.dart';
 import 'package:nipaplay/utils/message_helper.dart';
 import 'package:nipaplay/utils/media_source_utils.dart';
+import 'package:nipaplay/utils/media_identity_resolver.dart';
 import 'package:nipaplay/utils/shared_remote_history_helper.dart';
 import 'package:nipaplay/utils/webdav_file_sorter.dart';
 
@@ -158,7 +163,7 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
               .toList();
 
           // 按文件名自然排序，避免 1、15、2 这类字典序播放顺序。
-          videoFiles.sort((a, b) => WebDAVFileSorter.naturalCompare(
+          videoFiles.sort((a, b) => WebDAVFileSorter.playlistCompare(
                 p.basename(a.path),
                 p.basename(b.path),
               ));
@@ -196,13 +201,7 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
   }
 
   bool _isSmbProxyStreamUrl(String path) {
-    final uri = Uri.tryParse(path);
-    if (uri == null) {
-      return false;
-    }
-    return uri.path == '/smb/stream' &&
-        (uri.queryParameters['conn']?.trim().isNotEmpty ?? false) &&
-        (uri.queryParameters['path']?.trim().isNotEmpty ?? false);
+    return MediaSourceUtils.parseSmbMediaPath(path) != null;
   }
 
   int _effectivePort(Uri uri) {
@@ -284,7 +283,7 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
   }
 
   SMBConnection? _findSmbConnectionByNameOrHost(String connName) {
-    final direct = SMBService.instance.getConnection(connName);
+    final direct = SMBService.instance.getConnectionByIdOrName(connName);
     if (direct != null) {
       return direct;
     }
@@ -294,6 +293,12 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
         return true;
       }
       if ('${connection.host}:${connection.port}' == connName) {
+        return true;
+      }
+      if (connection.wanHost == connName) {
+        return true;
+      }
+      if ('${connection.wanHost}:${connection.wanPort}' == connName) {
         return true;
       }
       return false;
@@ -335,7 +340,7 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
           .toList();
 
       playableEntries
-          .sort((a, b) => WebDAVFileSorter.naturalCompare(a.name, b.name));
+          .sort((a, b) => WebDAVFileSorter.playlistCompare(a.name, b.name));
 
       _fileSystemEpisodes = playableEntries.map((entry) {
         final streamUrl =
@@ -405,7 +410,7 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
           if (aEpisodeId != bEpisodeId) {
             return aEpisodeId.compareTo(bEpisodeId);
           }
-          return WebDAVFileSorter.naturalCompare(a.title, b.title);
+          return WebDAVFileSorter.playlistCompare(a.title, b.title);
         });
 
       final animeName = (_currentAnimeTitle?.trim().isNotEmpty ?? false)
@@ -454,36 +459,14 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
   Future<void> _loadWebDavEpisodes(String currentPath) async {
     try {
       await WebDAVService.instance.initialize();
-      final resolved = WebDAVService.instance.resolveFileUrl(currentPath);
+      final resolved = WebDAVService.instance.resolveMediaPath(currentPath);
       if (resolved == null) {
         throw Exception('无法识别WebDAV连接');
       }
 
-      final connectionUri = Uri.parse(resolved.connection.url);
-      final basePath = connectionUri.path.isEmpty ? '/' : connectionUri.path;
-      final normalizedBasePath =
-          basePath.endsWith('/') ? basePath : '$basePath/';
-      final filePath = resolved.relativePath.startsWith('/')
-          ? resolved.relativePath
-          : '/${resolved.relativePath}';
-
-      String parentDir;
-      if (filePath.length > normalizedBasePath.length &&
-          filePath.startsWith(normalizedBasePath)) {
-        parentDir = filePath.substring(normalizedBasePath.length);
-        final lastSlashIndex = parentDir.lastIndexOf('/');
-        if (lastSlashIndex > 0) {
-          parentDir = parentDir.substring(0, lastSlashIndex);
-        } else if (lastSlashIndex == 0) {
-          parentDir = '/';
-        } else {
-          parentDir = '/';
-        }
-      } else {
-        parentDir = p.posix.dirname(resolved.relativePath);
-      }
-
-      parentDir = _normalizeRemoteDirectoryPath(parentDir);
+      final parentDir = _normalizeRemoteDirectoryPath(
+        p.posix.dirname(resolved.relativePath),
+      );
 
       final entries = await WebDAVService.instance.listDirectory(
         resolved.connection,
@@ -494,16 +477,16 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
               !entry.isDirectory &&
               WebDAVService.instance.isVideoFile(entry.name))
           .toList()
-        ..sort((a, b) => WebDAVFileSorter.naturalCompare(a.name, b.name));
+        ..sort((a, b) => WebDAVFileSorter.playlistCompare(a.name, b.name));
 
       _fileSystemEpisodes = videoEntries.map((entry) {
-        final fileUrl = WebDAVService.instance.getFileUrl(
-          resolved.connection,
+        final filePath = MediaSourceUtils.buildWebDavPath(
+          resolved.connection.id,
           entry.path,
         );
-        _remoteDisplayNameCache[fileUrl] =
+        _remoteDisplayNameCache[filePath] =
             p.basenameWithoutExtension(entry.name);
-        return fileUrl;
+        return filePath;
       }).toList();
 
       _hasFileSystemData = _fileSystemEpisodes.isNotEmpty;
@@ -525,15 +508,12 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
 
   Future<void> _loadSmbEpisodes(String currentPath) async {
     try {
-      final uri = Uri.parse(currentPath);
-      final connName = uri.queryParameters['conn']?.trim();
-      final smbPath = uri.queryParameters['path']?.trim();
-      if (connName == null ||
-          connName.isEmpty ||
-          smbPath == null ||
-          smbPath.isEmpty) {
+      final parsed = MediaSourceUtils.parseSmbMediaPath(currentPath);
+      if (parsed == null) {
         throw Exception('SMB地址缺少必要参数');
       }
+      final connName = parsed.connectionName;
+      final smbPath = parsed.relativePath;
 
       await SMBService.instance.initialize();
       await SMBProxyService.instance.initialize();
@@ -551,13 +531,14 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
           .where((entry) =>
               !entry.isDirectory && SMBService.instance.isVideoFile(entry.name))
           .toList()
-        ..sort((a, b) => WebDAVFileSorter.naturalCompare(a.name, b.name));
+        ..sort((a, b) => WebDAVFileSorter.playlistCompare(a.name, b.name));
 
       _fileSystemEpisodes = videoEntries.map((entry) {
-        final url =
-            SMBProxyService.instance.buildStreamUrl(connection, entry.path);
-        _remoteDisplayNameCache[url] = p.basenameWithoutExtension(entry.name);
-        return url;
+        final filePath =
+            MediaSourceUtils.buildSmbPath(connection.id, entry.path);
+        _remoteDisplayNameCache[filePath] =
+            p.basenameWithoutExtension(entry.name);
+        return filePath;
       }).toList();
 
       _hasFileSystemData = _fileSystemEpisodes.isNotEmpty;
@@ -590,8 +571,12 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
       }
 
       // 获取该季的所有剧集
-      final episodes = await JellyfinService.instance
-          .getSeasonEpisodes(episodeInfo.seriesId!, episodeInfo.seasonId!);
+      final episodes = await loadMediaServerPlaylist(
+        currentItem: episodeInfo,
+        seriesId: episodeInfo.seriesId,
+        seasonId: episodeInfo.seasonId,
+        loadSeason: JellyfinService.instance.getSeasonEpisodes,
+      );
 
       if (episodes.isEmpty) {
         throw Exception('该季没有找到剧集');
@@ -643,8 +628,12 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
       }
 
       // 获取该季的所有剧集
-      final episodes = await EmbyService.instance
-          .getSeasonEpisodes(episodeInfo.seriesId!, episodeInfo.seasonId!);
+      final episodes = await loadMediaServerPlaylist(
+        currentItem: episodeInfo,
+        seriesId: episodeInfo.seriesId,
+        seasonId: episodeInfo.seasonId,
+        loadSeason: EmbyService.instance.getSeasonEpisodes,
+      );
 
       if (episodes.isEmpty) {
         throw Exception('该季没有找到剧集');
@@ -693,6 +682,27 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
       debugPrint('[播放列表] 开始播放剧集: $filePath');
 
       final videoState = Provider.of<VideoPlayerState>(context, listen: false);
+      final selected = await EpisodeFileSelectionService.select(
+        context,
+        PlayableItem(
+          mediaLibraryScope:
+              videoState.playbackDetailContext?.mediaLibraryScope,
+          videoPath: filePath,
+          historyItem: _remoteHistoryCache[filePath],
+          detailContext: videoState.playbackDetailContext,
+        ),
+      );
+      if (selected == null || !mounted) return;
+      if (!MediaIdentityResolver.samePath(selected.videoPath, filePath)) {
+        if (await PlaybackService().play(selected, episodeFileSelectionHandled: true)) {
+          if (mounted) widget.onClose();
+        }
+        return;
+      }
+      var selectionHandled = selected.historyItem?.animeId != null &&
+          selected.historyItem?.episodeId != null;
+      final skipDanmakuMatching =
+          context.read<SettingsProvider>().skipDanmakuMatching;
 
       if (mounted) {
         // 检查是否为Jellyfin URL
@@ -705,13 +715,6 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
           if (episodeInfo == null) {
             throw Exception('无法获取Jellyfin剧集信息');
           }
-
-          // 获取播放会话
-          final playbackSession =
-              await JellyfinService.instance.createPlaybackSession(
-            itemId: episodeId,
-          );
-          debugPrint('[播放列表] 获取Jellyfin播放会话: ${playbackSession.streamUrl}');
 
           // 尝试获取弹幕映射
           int? animeId;
@@ -734,10 +737,44 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
 
           // 创建带有弹幕信息的历史项
           final historyItem = await _createJellyfinHistoryItem(
-              episodeInfo, animeId, episodeIdForDanmaku);
+            episodeInfo,
+            animeId,
+            episodeIdForDanmaku,
+            skipDanmakuMatching: skipDanmakuMatching,
+          );
+
+          if (!selectionHandled) {
+            final mappedSelection = await EpisodeFileSelectionService.select(
+              context,
+              PlayableItem(
+                  videoPath: filePath,
+                  historyItem: historyItem,
+                  mediaLibraryScope:
+                      videoState.playbackDetailContext?.mediaLibraryScope),
+            );
+            if (mappedSelection == null || !mounted) return;
+            if (!MediaIdentityResolver.samePath(
+                mappedSelection.videoPath, filePath)) {
+              if (await PlaybackService().play(mappedSelection,
+                  episodeFileSelectionHandled: true)) {
+                if (mounted) widget.onClose();
+              }
+              return;
+            }
+            selectionHandled = historyItem.animeId != null &&
+                historyItem.episodeId != null;
+          }
+
+          final playbackSession =
+              await JellyfinService.instance.createPlaybackSession(
+            itemId: episodeId,
+          );
 
           final playableItem = PlayableItem(
+            mediaLibraryScope:
+                videoState.playbackDetailContext?.mediaLibraryScope,
             videoPath: filePath,
+            mediaKey: MediaIdentityResolver.forPath(filePath),
             title: historyItem.animeName,
             subtitle: historyItem.episodeTitle,
             animeId: historyItem.animeId,
@@ -748,8 +785,9 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
           if (!mounted) {
             return;
           }
-          if (await ExternalPlayerService.tryHandlePlayback(
-              context, playableItem)) {
+          if (await PlaybackService()
+              .tryPlayExternally(context, playableItem,
+                    episodeFileSelectionHandled: selectionHandled)) {
             if (mounted) {
               widget.onClose();
             }
@@ -759,8 +797,13 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
           // 按照剧集导航的方式，使用Jellyfin协议URL作为标识符，HTTP URL作为实际播放源
           await videoState.initializePlayer(
             filePath, // 使用Jellyfin协议URL作为标识符
+            mediaKey: MediaIdentityResolver.forPath(filePath),
             historyItem: historyItem,
             playbackSession: playbackSession,
+            mediaLibraryScope:
+                videoState.playbackDetailContext?.mediaLibraryScope,
+            playbackDetailContext: videoState.playbackDetailContext,
+            episodeFileSelectionHandled: selectionHandled,
           );
           debugPrint('[播放列表] Jellyfin剧集播放完成');
         } else if (filePath.startsWith('emby://')) {
@@ -774,13 +817,6 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
           if (episodeInfo == null) {
             throw Exception('无法获取Emby剧集信息');
           }
-
-          // 获取播放会话
-          final playbackSession =
-              await EmbyService.instance.createPlaybackSession(
-            itemId: episodeId,
-          );
-          debugPrint('[播放列表] 获取Emby播放会话: ${playbackSession.streamUrl}');
 
           // 尝试获取弹幕映射
           int? animeId;
@@ -803,10 +839,44 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
 
           // 创建带有弹幕信息的历史项
           final historyItem = await _createEmbyHistoryItem(
-              episodeInfo, animeId, episodeIdForDanmaku);
+            episodeInfo,
+            animeId,
+            episodeIdForDanmaku,
+            skipDanmakuMatching: skipDanmakuMatching,
+          );
+
+          if (!selectionHandled) {
+            final mappedSelection = await EpisodeFileSelectionService.select(
+              context,
+              PlayableItem(
+                  videoPath: filePath,
+                  historyItem: historyItem,
+                  mediaLibraryScope:
+                      videoState.playbackDetailContext?.mediaLibraryScope),
+            );
+            if (mappedSelection == null || !mounted) return;
+            if (!MediaIdentityResolver.samePath(
+                mappedSelection.videoPath, filePath)) {
+              if (await PlaybackService().play(mappedSelection,
+                  episodeFileSelectionHandled: true)) {
+                if (mounted) widget.onClose();
+              }
+              return;
+            }
+            selectionHandled = historyItem.animeId != null &&
+                historyItem.episodeId != null;
+          }
+
+          final playbackSession =
+              await EmbyService.instance.createPlaybackSession(
+            itemId: episodeId,
+          );
 
           final playableItem = PlayableItem(
+            mediaLibraryScope:
+                videoState.playbackDetailContext?.mediaLibraryScope,
             videoPath: filePath,
+            mediaKey: MediaIdentityResolver.forPath(filePath),
             title: historyItem.animeName,
             subtitle: historyItem.episodeTitle,
             animeId: historyItem.animeId,
@@ -817,8 +887,9 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
           if (!mounted) {
             return;
           }
-          if (await ExternalPlayerService.tryHandlePlayback(
-              context, playableItem)) {
+          if (await PlaybackService()
+              .tryPlayExternally(context, playableItem,
+                    episodeFileSelectionHandled: selectionHandled)) {
             if (mounted) {
               widget.onClose();
             }
@@ -828,36 +899,58 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
           // 按照剧集导航的方式，使用Emby协议URL作为标识符，HTTP URL作为实际播放源
           await videoState.initializePlayer(
             filePath, // 使用Emby协议URL作为标识符
+            mediaKey: MediaIdentityResolver.forPath(filePath),
             historyItem: historyItem,
             playbackSession: playbackSession,
+            mediaLibraryScope:
+                videoState.playbackDetailContext?.mediaLibraryScope,
+            playbackDetailContext: videoState.playbackDetailContext,
+            episodeFileSelectionHandled: selectionHandled,
           );
           debugPrint('[播放列表] Emby剧集播放完成');
         } else {
           final uri = Uri.tryParse(filePath);
           final isHttpStream =
               uri != null && (uri.scheme == 'http' || uri.scheme == 'https');
+          final isStableRemotePath =
+              MediaSourceUtils.isNewWebDavPath(filePath) ||
+                  MediaSourceUtils.isNewSmbPath(filePath);
           final cachedHistory = _remoteHistoryCache[filePath];
 
-          if (isHttpStream) {
+          if (isHttpStream || isStableRemotePath) {
             // 共享/WebDAV/SMB 等网络流媒体
+            final pathSegments = uri?.pathSegments ?? const <String>[];
             final lastSegment =
-                uri.pathSegments.isNotEmpty ? uri.pathSegments.last : filePath;
+                pathSegments.isNotEmpty ? pathSegments.last : filePath;
             final fallbackTitle = _remoteDisplayNameCache[filePath] ??
-                p.basenameWithoutExtension(Uri.decodeComponent(lastSegment));
+                p.basenameWithoutExtension(_safeDecode(lastSegment));
+            // WebDAV 需要时走本地认证代理；SMB/HTTP 仍按原来的统一解析。
+            final actualPlayUrl = MediaSourceUtils.isNewWebDavPath(filePath)
+                ? await MediaSourceUtils.resolveWebDavPathToUrlInitialized(
+                    filePath)
+                : MediaSourceUtils.resolveRemotePathToUrl(filePath);
+            if (actualPlayUrl == null || actualPlayUrl.isEmpty) {
+              throw Exception('无法解析远程媒体路径: $filePath');
+            }
             final playableItem = PlayableItem(
+              mediaLibraryScope:
+                  videoState.playbackDetailContext?.mediaLibraryScope,
               videoPath: filePath,
+              mediaKey: MediaIdentityResolver.forPath(filePath),
               title: cachedHistory?.animeName ?? fallbackTitle,
               subtitle: cachedHistory?.episodeTitle,
               animeId: cachedHistory?.animeId,
               episodeId: cachedHistory?.episodeId,
               historyItem: cachedHistory,
-              actualPlayUrl: filePath,
+              actualPlayUrl: actualPlayUrl,
+              detailContext: videoState.playbackDetailContext,
             );
             if (!mounted) {
               return;
             }
-            if (await ExternalPlayerService.tryHandlePlayback(
-                context, playableItem)) {
+            if (await PlaybackService()
+                .tryPlayExternally(context, playableItem,
+                    episodeFileSelectionHandled: selectionHandled)) {
               if (mounted) {
                 widget.onClose();
               }
@@ -866,8 +959,13 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
 
             await videoState.initializePlayer(
               filePath,
+              mediaKey: MediaIdentityResolver.forPath(filePath),
               historyItem: cachedHistory,
-              actualPlayUrl: filePath,
+              actualPlayUrl: actualPlayUrl,
+              mediaLibraryScope:
+                  videoState.playbackDetailContext?.mediaLibraryScope,
+              playbackDetailContext: videoState.playbackDetailContext,
+              episodeFileSelectionHandled: selectionHandled,
             );
             debugPrint('[播放列表] 远程流媒体播放完成');
           } else {
@@ -877,19 +975,32 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
               throw Exception('文件不存在: $filePath');
             }
 
-            final playableItem = PlayableItem(videoPath: filePath);
+            final playableItem = PlayableItem(
+              mediaLibraryScope:
+                  videoState.playbackDetailContext?.mediaLibraryScope,
+              videoPath: filePath,
+              mediaKey: MediaIdentityResolver.forPath(filePath),
+            );
             if (!mounted) {
               return;
             }
-            if (await ExternalPlayerService.tryHandlePlayback(
-                context, playableItem)) {
+            if (await PlaybackService()
+                .tryPlayExternally(context, playableItem,
+                    episodeFileSelectionHandled: selectionHandled)) {
               if (mounted) {
                 widget.onClose();
               }
               return;
             }
 
-            await videoState.initializePlayer(filePath);
+            await videoState.initializePlayer(
+              filePath,
+              mediaKey: MediaIdentityResolver.forPath(filePath),
+              mediaLibraryScope:
+                  videoState.playbackDetailContext?.mediaLibraryScope,
+              playbackDetailContext: videoState.playbackDetailContext,
+              episodeFileSelectionHandled: selectionHandled,
+            );
             debugPrint('[播放列表] 文件路径播放完成');
           }
         }
@@ -959,11 +1070,18 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
 
     final uri = Uri.tryParse(filePath);
     if (uri != null && uri.pathSegments.isNotEmpty) {
-      return p
-          .basenameWithoutExtension(Uri.decodeComponent(uri.pathSegments.last));
+      return p.basenameWithoutExtension(_safeDecode(uri.pathSegments.last));
     }
 
     return p.basenameWithoutExtension(filePath);
+  }
+
+  String _safeDecode(String value) {
+    try {
+      return Uri.decodeComponent(value);
+    } catch (_) {
+      return value;
+    }
   }
 
   bool _isSameSharedManagementStream(String a, String b) {
@@ -981,22 +1099,6 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
         _effectivePort(aUri) == _effectivePort(bUri);
   }
 
-  bool _isSameSmbStream(String a, String b) {
-    if (!_isSmbProxyStreamUrl(a) || !_isSmbProxyStreamUrl(b)) {
-      return false;
-    }
-    final aUri = Uri.tryParse(a);
-    final bUri = Uri.tryParse(b);
-    if (aUri == null || bUri == null) {
-      return false;
-    }
-    final aConn = aUri.queryParameters['conn']?.trim();
-    final bConn = bUri.queryParameters['conn']?.trim();
-    final aPath = _normalizeSmbPath(aUri.queryParameters['path'] ?? '');
-    final bPath = _normalizeSmbPath(bUri.queryParameters['path'] ?? '');
-    return aConn == bConn && aPath == bPath;
-  }
-
   bool _isCurrentEpisode(String filePath) {
     final currentPath = _currentFilePath;
     if (currentPath == null) {
@@ -1005,18 +1107,23 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
     if (filePath == currentPath) {
       return true;
     }
-    if (_isSameSmbStream(filePath, currentPath)) {
-      return true;
-    }
     if (_isSameSharedManagementStream(filePath, currentPath)) {
       return true;
     }
-    return false;
+    return MediaIdentityResolver.samePath(filePath, currentPath);
   }
 
   /// 创建Jellyfin历史项，包含完整的弹幕映射预测和API获取的准确信息
   Future<WatchHistoryItem> _createJellyfinHistoryItem(
-      JellyfinEpisodeInfo episode, int? animeId, int? episodeId) async {
+    JellyfinEpisodeInfo episode,
+    int? animeId,
+    int? episodeId, {
+    bool skipDanmakuMatching = false,
+  }) async {
+    if (skipDanmakuMatching) {
+      return episode.toWatchHistoryItem();
+    }
+
     try {
       int? finalAnimeId = animeId;
       int? finalEpisodeId = episodeId;
@@ -1137,7 +1244,15 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
 
   /// 创建Emby历史项，包含完整的弹幕映射预测和API获取的准确信息
   Future<WatchHistoryItem> _createEmbyHistoryItem(
-      EmbyEpisodeInfo episode, int? animeId, int? episodeId) async {
+    EmbyEpisodeInfo episode,
+    int? animeId,
+    int? episodeId, {
+    bool skipDanmakuMatching = false,
+  }) async {
+    if (skipDanmakuMatching) {
+      return episode.toWatchHistoryItem();
+    }
+
     try {
       int? finalAnimeId = animeId;
       int? finalEpisodeId = episodeId;
@@ -1260,6 +1375,7 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
 
   @override
   Widget build(BuildContext context) {
+    final menuColors = PlayerMenuTheme.colorsOf(context);
     return BaseSettingsMenu(
       title: '播放列表',
       onClose: widget.onClose,
@@ -1276,7 +1392,7 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
                 _currentAnimeTitle!,
                 locale: const Locale("zh-Hans", "zh"),
                 style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.9),
+                  color: menuColors.foreground,
                   fontSize: 14,
                   fontWeight: FontWeight.w500,
                 ),
@@ -1294,17 +1410,18 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
   }
 
   Widget _buildContent() {
+    final menuColors = PlayerMenuTheme.colorsOf(context);
     if (_isLoading) {
-      return const Center(
+      return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            CircularProgressIndicator(color: Colors.white),
-            SizedBox(height: 16),
+            CircularProgressIndicator(color: menuColors.accent),
+            const SizedBox(height: 16),
             Text(
               '加载播放列表中...',
               locale: Locale("zh-Hans", "zh"),
-              style: TextStyle(color: Colors.white),
+              style: TextStyle(color: menuColors.secondaryForeground),
             ),
           ],
         ),
@@ -1324,7 +1441,7 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
             const SizedBox(height: 16),
             Text(
               _error!,
-              style: const TextStyle(color: Colors.white),
+              style: TextStyle(color: menuColors.foreground),
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 16),
@@ -1340,20 +1457,20 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
     }
 
     if (!_hasFileSystemData || _fileSystemEpisodes.isEmpty) {
-      return const Center(
+      return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Icon(
               Icons.folder_open,
-              color: Colors.white,
+              color: menuColors.secondaryForeground,
               size: 48,
             ),
-            SizedBox(height: 16),
+            const SizedBox(height: 16),
             Text(
               '目录中没有找到视频文件',
               locale: Locale("zh-Hans", "zh"),
-              style: TextStyle(color: Colors.white),
+              style: TextStyle(color: menuColors.secondaryForeground),
             ),
           ],
         ),
@@ -1377,11 +1494,13 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
                 decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(8),
                   color: isCurrentEpisode
-                      ? Colors.white.withValues(alpha: 0.2)
+                      ? menuColors.selectedBackground
                       : Colors.transparent,
                   border: isCurrentEpisode
                       ? Border.all(
-                          color: Colors.white.withValues(alpha: 0.5), width: 1)
+                          color: menuColors.selectedBorder,
+                          width: 1,
+                        )
                       : null,
                 ),
                 child: Material(
@@ -1396,8 +1515,8 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
                       locale: const Locale("zh-Hans", "zh"),
                       style: TextStyle(
                         color: isCurrentEpisode
-                            ? Colors.white
-                            : Colors.white.withValues(alpha: 0.87),
+                            ? menuColors.selectedForeground
+                            : menuColors.foreground,
                         fontSize: 14,
                         fontWeight: isCurrentEpisode
                             ? FontWeight.bold
@@ -1407,9 +1526,9 @@ class _PlaylistMenuState extends State<PlaylistMenu> {
                       overflow: TextOverflow.ellipsis,
                     ),
                     trailing: isCurrentEpisode
-                        ? const Icon(
+                        ? Icon(
                             Icons.play_arrow,
-                            color: Colors.white,
+                            color: menuColors.selectedForeground,
                             size: 20,
                           )
                         : null,

@@ -4,6 +4,7 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show debugPrint, kDebugMode, listEquals, kIsWeb, kReleaseMode;
+import 'package:nipaplay/constants/danmaku/mode.dart';
 import 'package:nipaplay/danmaku_abstraction/danmaku_content_item.dart';
 import 'package:nipaplay/danmaku_abstraction/positioned_danmaku_item.dart';
 import 'package:nipaplay/danmaku_next/danmaku_next_log.dart';
@@ -58,8 +59,9 @@ class NipaPlayNextEngine {
   bool _layoutDirty = true;
   int _layoutVersion = 0;
 
-  /// layout 结果缓存：vsync 帧以 60-240Hz 调 layout()，
-  /// 但 playbackTimeMs 通常仅以 8-30Hz 更新，
+  /// layout 结果缓存：vsync 帧以显示刷新率（60-240Hz，设备相关）调 layout()，
+  /// playbackTimeMs 由 _uiUpdateTicker（vsync 同步）每帧插值更新（同显示刷新率），
+  /// player.position（8-30Hz）仅低频校准锚点，非 playbackTimeMs 的更新频率。
   /// 相同时间（±1ms）直接返回缓存，避免冗余 FFI/Dart 计算。
   double _lastLayoutTime = -1e9;
 
@@ -1002,10 +1004,12 @@ class NipaPlayNextEngine {
   DanmakuItemType _parseType(dynamic raw) {
     if (raw is DanmakuItemType) return raw;
     if (raw is num) {
-      final code = raw.toInt();
-      if (code == 5) return DanmakuItemType.top;
-      if (code == 4) return DanmakuItemType.bottom;
-      return DanmakuItemType.scroll;
+      switch (DanmakuMode.fromCode(raw.toInt()))
+      {
+      case DanmakuMode.top    : return DanmakuItemType.top;
+      case DanmakuMode.bottom : return DanmakuItemType.bottom;
+      default                 : return DanmakuItemType.scroll;
+      }
     }
 
     final value = raw?.toString().toLowerCase() ?? 'scroll';

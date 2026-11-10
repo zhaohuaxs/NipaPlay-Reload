@@ -8,11 +8,17 @@ import 'package:flutter/material.dart';
 import 'package:http/io_client.dart';
 import 'package:kmbal_ionicons/kmbal_ionicons.dart';
 
-import 'package:nipaplay/models/shared_remote_library.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
 import 'package:nipaplay/providers/shared_remote_library_provider.dart';
 import 'package:nipaplay/services/nipaplay_lan_discovery.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_dialog.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_mode_scope.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_page_scaffold.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_view_container.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
 
 class SharedRemoteLanScanDialog {
@@ -20,39 +26,43 @@ class SharedRemoteLanScanDialog {
     BuildContext context, {
     required SharedRemoteLibraryProvider provider,
   }) {
-    final colorScheme = Theme.of(context).colorScheme;
-    final textColor = colorScheme.onSurface.withOpacity(0.7);
-    final mutedTextColor = colorScheme.onSurface.withOpacity(0.5);
-    final accentColor = AppAccentColors.current;
+    final surface = AppDisplaySurfaceScope.of(context);
+    if (NipaplayLargeScreenModeScope.isActiveOf(context)) {
+      return NipaplayLargeScreenViewContainer.show<bool>(
+        context: context,
+        title: '扫描局域网',
+        subtitle: '使用方向键选择设备，按确认键连接',
+        maxWidth: 1180,
+        maxHeightFactor: 0.86,
+        autofocusClose: false,
+        builder: (_) => _SharedRemoteLanScanDialogContent(
+          provider: provider,
+        ),
+      );
+    }
+
+    if (surface == AppDisplaySurface.phone) {
+      return CupertinoBottomSheet.show<bool>(
+        context: context,
+        title: '扫描局域网',
+        heightRatio: 0.68,
+        child: _SharedRemoteLanScanDialogContent(provider: provider),
+      );
+    }
+
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final backgroundColor =
         isDark ? const Color(0xFF1E1E1E) : const Color(0xFFF2F2F2);
-    final ButtonStyle plainButtonStyle = ButtonStyle(
-      foregroundColor: MaterialStateProperty.resolveWith((states) {
-        if (states.contains(MaterialState.disabled)) {
-          return mutedTextColor;
-        }
-        if (states.contains(MaterialState.hovered)) {
-          return accentColor;
-        }
-        return textColor;
-      }),
-      overlayColor: MaterialStateProperty.all(Colors.transparent),
-      splashFactory: NoSplash.splashFactory,
-      padding: MaterialStateProperty.all(
-        const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-      ),
-    );
     return BlurDialog.show<bool>(
       context: context,
       title: '扫描局域网',
       contentWidget: _SharedRemoteLanScanDialogContent(provider: provider),
       backgroundColor: backgroundColor,
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(false),
-          style: plainButtonStyle,
-          child: const Text('关闭'),
+      actionsBuilder: (dialogContext) => [
+        AdaptiveMediaActionButton(
+          label: '关闭',
+          onPressed: () => Navigator.of(dialogContext).pop(false),
+          compact: true,
         ),
       ],
     );
@@ -363,97 +373,48 @@ class _SharedRemoteLanScanDialogContentState
     _cancelScan(updateState: true);
     setState(() {
       _isAdding = true;
+      _errorMessage = null;
     });
 
     try {
-      final normalized = _normalizeBaseUrl(host.baseUrl);
-      SharedRemoteHost? existing;
-      for (final current in widget.provider.hosts) {
-        if (_normalizeBaseUrl(current.baseUrl) == normalized) {
-          existing = current;
-          break;
-        }
-      }
-
-      if (existing != null) {
-        await widget.provider.setActiveHost(existing.id);
-      } else {
-        final displayName = (host.hostname?.trim().isNotEmpty ?? false)
+      await widget.provider.connectOrActivateHost(
+        displayName: (host.hostname?.trim().isNotEmpty ?? false)
             ? host.hostname!.trim()
-            : normalized;
-        await widget.provider
-            .addHost(displayName: displayName, baseUrl: normalized);
-      }
+            : host.baseUrl,
+        baseUrl: host.baseUrl,
+      );
 
       if (!mounted) return;
       BlurSnackBar.show(context, '已连接到共享客户端');
       Navigator.of(context).pop(true);
     } catch (e) {
       if (!mounted) return;
-      BlurSnackBar.show(context, '添加失败：$e');
+      final message = '连接失败：$e';
+      BlurSnackBar.show(context, message);
       setState(() {
+        _errorMessage = message;
         _isAdding = false;
       });
     }
   }
 
-  String _normalizeBaseUrl(String url) {
-    var normalized = url.trim();
-    if (!normalized.startsWith('http://') &&
-        !normalized.startsWith('https://')) {
-      normalized = 'http://$normalized';
-    }
-    if (normalized.endsWith('/')) {
-      normalized = normalized.substring(0, normalized.length - 1);
-    }
-    try {
-      final uri = Uri.parse(normalized);
-      final host = uri.host;
-      final isLocalHost = host == 'localhost' || host == '127.0.0.1';
-      final isLocal =
-          isLocalHost || _isPrivateIpv4(host) || host.endsWith('.local');
-      if (!uri.hasPort && uri.scheme == 'http' && isLocal) {
-        normalized = uri.replace(port: 1180).toString();
-      }
-    } catch (_) {
-      // ignore
-    }
-    if (normalized.endsWith('/')) {
-      normalized = normalized.substring(0, normalized.length - 1);
-    }
-    return normalized;
-  }
-
   @override
   Widget build(BuildContext context) {
     const defaultPort = 1180;
+    final isTelevision = NipaplayLargeScreenModeScope.isActiveOf(context);
     final accentColor = AppAccentColors.current;
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final textColor = Theme.of(context).colorScheme.onSurface;
-    final subTextColor = textColor.withOpacity(0.7);
-    final mutedTextColor = textColor.withOpacity(0.5);
-    final borderColor = textColor.withOpacity(isDark ? 0.12 : 0.18);
+    final subTextColor = textColor.withValues(alpha: 0.7);
+    final mutedTextColor = textColor.withValues(alpha: 0.5);
+    final borderColor = textColor.withValues(alpha: isDark ? 0.12 : 0.18);
     final itemColor =
         isDark ? const Color(0xFF2B2B2B) : const Color(0xFFF7F7F7);
-    final ButtonStyle actionButtonStyle = ButtonStyle(
-      foregroundColor: MaterialStateProperty.resolveWith((states) {
-        if (states.contains(MaterialState.disabled)) {
-          return mutedTextColor;
-        }
-        if (states.contains(MaterialState.hovered)) {
-          return accentColor;
-        }
-        return accentColor;
-      }),
-      overlayColor: MaterialStateProperty.all(Colors.transparent),
-      splashFactory: NoSplash.splashFactory,
-      padding: MaterialStateProperty.all(
-        const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-      ),
-    );
-    final height = (MediaQuery.of(context).size.height * 0.55)
-        .clamp(320.0, 520.0)
-        .toDouble();
+    final height = isTelevision
+        ? double.infinity
+        : (MediaQuery.of(context).size.height * 0.55)
+            .clamp(320.0, 520.0)
+            .toDouble();
     final prefixLabel = _prefixes.isEmpty ? '自动获取网段' : _prefixes.join('、');
     final statusText = _errorMessage ??
         (_isScanning
@@ -462,152 +423,223 @@ class _SharedRemoteLanScanDialogContentState
                 : '正在扫描：$prefixLabel（默认端口 $defaultPort）  $_scanned/$_total  已发现 ${_foundHosts.length} 台')
             : '扫描完成：$prefixLabel  共找到 ${_foundHosts.length} 台');
 
-    return SizedBox(
-      height: height,
-      width: double.infinity,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            '将自动发现局域网中已开启“远程访问”的 NipaPlay（无需手动输入端口）。若未发现设备，会回退扫描默认端口 1180（旧版本兼容）。',
-            style: TextStyle(
-              color: subTextColor,
-              fontSize: 13,
-              height: 1.35,
-            ),
+    final content = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          '将自动发现局域网中已开启“远程访问”的 NipaPlay（无需手动输入端口）。若未发现设备，会回退扫描默认端口 1180（旧版本兼容）。',
+          style: TextStyle(
+            color: subTextColor,
+            fontSize: isTelevision ? 16 : 13,
+            height: 1.35,
           ),
-          SizedBox(height: 12),
-          Row(
-            children: [
-              const Spacer(),
-              SizedBox(
-                width: 120,
-                child: TextButton.icon(
-                  icon: Icon(Ionicons.refresh_outline, size: 18),
-                  label: Text(_isScanning ? '停止' : '重新扫描'),
-                  onPressed: _isScanning
-                      ? () => _cancelScan(updateState: true)
-                      : _startScan,
-                  style: actionButtonStyle,
-                ),
-              ),
-            ],
-          ),
-          SizedBox(height: 10),
-          Row(
-            children: [
-              Icon(
-                _isScanning
-                    ? Ionicons.radio_outline
-                    : Ionicons.checkmark_circle_outline,
-                color: _isScanning ? subTextColor : mutedTextColor,
-                size: 16,
-              ),
-              SizedBox(width: 6),
-              Expanded(
-                child: Text(
-                  statusText,
-                  style: TextStyle(
-                    color: _errorMessage != null
-                        ? Colors.orangeAccent
-                        : subTextColor,
-                    fontSize: 12,
-                  ),
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-              if (_isScanning)
-                SizedBox(
-                  width: 14,
-                  height: 14,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation<Color>(accentColor),
-                  ),
-                ),
-            ],
-          ),
-          SizedBox(height: 12),
-          Expanded(
-            child: _foundHosts.isEmpty
-                ? Center(
-                    child: Text(
-                      _isScanning ? '暂未发现设备…' : '未发现任何设备',
-                      style: TextStyle(color: mutedTextColor),
+        ),
+        SizedBox(height: isTelevision ? 18 : 12),
+        Row(
+          children: [
+            const Spacer(),
+            SizedBox(
+              width: isTelevision ? 210 : 120,
+              child: isTelevision
+                  ? NipaplayLargeScreenActionButton(
+                      key: const ValueKey<String>(
+                        'television-lan-scan-action',
+                      ),
+                      icon: _isScanning
+                          ? Ionicons.stop_circle_outline
+                          : Ionicons.refresh_outline,
+                      label: _isScanning ? '停止扫描' : '重新扫描',
+                      autofocus: true,
+                      onPressed: _isScanning
+                          ? () => _cancelScan(updateState: true)
+                          : _startScan,
+                    )
+                  : AdaptiveMediaActionButton(
+                      label: _isScanning ? '停止' : '重新扫描',
+                      desktopIcon: Ionicons.refresh_outline,
+                      phoneIcon: Ionicons.refresh_outline,
+                      onPressed: _isScanning
+                          ? () => _cancelScan(updateState: true)
+                          : _startScan,
+                      compact: true,
                     ),
-                  )
-                : ListView.separated(
-                    itemCount: _foundHosts.length,
-                    separatorBuilder: (_, __) => SizedBox(height: 10),
-                    itemBuilder: (context, index) {
-                      final host = _foundHosts[index];
-                      final title = (host.hostname?.trim().isNotEmpty ?? false)
-                          ? host.hostname!.trim()
-                          : host.ip;
-                      return Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(14),
-                          border: Border.all(color: borderColor),
-                          color: itemColor,
-                        ),
-                        child: Row(
-                          children: [
-                            Icon(Ionicons.desktop_outline,
-                                color: subTextColor, size: 18),
-                            SizedBox(width: 10),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    title,
-                                    style: TextStyle(
-                                      color: textColor,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                  SizedBox(height: 2),
-                                  Text(
-                                    host.baseUrl,
-                                    style: TextStyle(
-                                      color: subTextColor,
-                                      fontSize: 12,
-                                    ),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ],
+            ),
+          ],
+        ),
+        SizedBox(height: isTelevision ? 16 : 10),
+        Row(
+          children: [
+            Icon(
+              _isScanning
+                  ? Ionicons.radio_outline
+                  : Ionicons.checkmark_circle_outline,
+              color: _isScanning ? subTextColor : mutedTextColor,
+              size: isTelevision ? 20 : 16,
+            ),
+            SizedBox(width: isTelevision ? 10 : 6),
+            Expanded(
+              child: Text(
+                statusText,
+                style: TextStyle(
+                  color: _errorMessage != null
+                      ? Colors.orangeAccent
+                      : subTextColor,
+                  fontSize: isTelevision ? 15 : 12,
+                  fontWeight:
+                      isTelevision ? FontWeight.w600 : FontWeight.normal,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (_isScanning)
+              AdaptiveMediaActivityIndicator(
+                color: accentColor,
+                size: isTelevision ? 20 : 14,
+              ),
+          ],
+        ),
+        SizedBox(height: isTelevision ? 18 : 12),
+        Expanded(
+          child: _foundHosts.isEmpty
+              ? Center(
+                  child: isTelevision
+                      ? NipaplayLargeScreenPanel(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 44,
+                            vertical: 34,
+                          ),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                _isScanning
+                                    ? Ionicons.radio_outline
+                                    : Ionicons.cloud_offline_outline,
+                                color: mutedTextColor,
+                                size: 38,
                               ),
+                              const SizedBox(height: 14),
+                              Text(
+                                _isScanning ? '正在寻找局域网设备…' : '未发现任何设备',
+                                style: TextStyle(
+                                  color: mutedTextColor,
+                                  fontSize: 19,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      : Text(
+                          _isScanning ? '暂未发现设备…' : '未发现任何设备',
+                          style: TextStyle(color: mutedTextColor),
+                        ),
+                )
+              : ListView.separated(
+                  key: ValueKey<String>(
+                    isTelevision
+                        ? 'television-lan-scan-results'
+                        : 'lan-scan-results',
+                  ),
+                  primary: isTelevision,
+                  padding: EdgeInsets.only(
+                    bottom: isTelevision ? 18 : 0,
+                  ),
+                  itemCount: _foundHosts.length,
+                  separatorBuilder: (_, __) =>
+                      SizedBox(height: isTelevision ? 14 : 10),
+                  itemBuilder: (context, index) {
+                    final host = _foundHosts[index];
+                    final title = (host.hostname?.trim().isNotEmpty ?? false)
+                        ? host.hostname!.trim()
+                        : host.ip;
+                    final card = Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        borderRadius:
+                            BorderRadius.circular(isTelevision ? 10 : 14),
+                        border: Border.all(color: borderColor),
+                        color: itemColor,
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Ionicons.desktop_outline,
+                            color: subTextColor,
+                            size: isTelevision ? 30 : 18,
+                          ),
+                          SizedBox(width: isTelevision ? 18 : 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  title,
+                                  style: TextStyle(
+                                    color: textColor,
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: isTelevision ? 19 : null,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                SizedBox(height: isTelevision ? 5 : 2),
+                                Text(
+                                  host.baseUrl,
+                                  style: TextStyle(
+                                    color: subTextColor,
+                                    fontSize: isTelevision ? 14 : 12,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ],
                             ),
-                            SizedBox(width: 10),
-                            TextButton(
+                          ),
+                          SizedBox(width: isTelevision ? 18 : 10),
+                          if (isTelevision)
+                            NipaplayLargeScreenActionButton(
+                              key: ValueKey<String>(
+                                'television-lan-add-${host.baseUrl}',
+                              ),
+                              icon: Ionicons.add_outline,
+                              label: _isAdding ? '添加中' : '添加',
                               onPressed: _isAdding
                                   ? null
                                   : () => _addDiscoveredHost(host),
-                              style: actionButtonStyle,
-                              child: _isAdding
-                                  ? SizedBox(
-                                      width: 14,
-                                      height: 14,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                        valueColor:
-                                            AlwaysStoppedAnimation<Color>(
-                                          accentColor,
-                                        ),
-                                      ),
-                                    )
-                                  : const Text('添加'),
+                              compact: true,
+                            )
+                          else
+                            AdaptiveMediaActionButton(
+                              label: '添加',
+                              onPressed: _isAdding
+                                  ? null
+                                  : () => _addDiscoveredHost(host),
+                              compact: true,
                             ),
-                          ],
-                        ),
-                      );
-                    },
-                  ),
-          ),
-        ],
+                        ],
+                      ),
+                    );
+                    return card;
+                  },
+                ),
+        ),
+      ],
+    );
+
+    return SizedBox(
+      key: ValueKey<String>(
+        isTelevision ? 'television-lan-scan-page' : 'lan-scan-page',
       ),
+      height: height,
+      width: double.infinity,
+      child: isTelevision
+          ? Padding(
+              padding: const EdgeInsets.fromLTRB(28, 22, 28, 24),
+              child: FocusTraversalGroup(
+                policy: ReadingOrderTraversalPolicy(),
+                child: content,
+              ),
+            )
+          : content,
     );
   }
 }

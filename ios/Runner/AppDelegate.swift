@@ -1,207 +1,458 @@
 import Flutter
 import UIKit
 import AVKit
+import CryptoKit
 import Photos
 
 @main
-@objc class AppDelegate: FlutterAppDelegate {
-  override func application(
-    _ application: UIApplication,
-    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
-  ) -> Bool {
-    GeneratedPluginRegistrant.register(with: self)
+@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
+  private var fileAssociationChannel: FlutterMethodChannel?
+  private var pendingOpenFiles: [String] = []
+  private var pendingOpenErrors: [String] = []
+  private var lastOpenedFileURL: URL?
+  private var lastOpenedFileDate: Date?
+  private let fileImportQueue = DispatchQueue(
+    label: "com.aimessoft.nipaplay.file-import",
+    qos: .userInitiated
+  )
 
-    if let registrar = self.registrar(forPlugin: "AirPlayRoutePicker") {
-      let factory = AirPlayRoutePickerFactory(messenger: registrar.messenger())
-      registrar.register(factory, withId: "nipaplay/airplay_route_picker")
-    }
+  /// The window scene the app runs in. The engine and its channels are created
+  /// before the scene has a window, so channels look the scene up per call.
+  private static var windowScene: UIWindowScene? {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    return scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+  }
 
-    if let controller = window?.rootViewController as? FlutterViewController {
-      let deviceProfileChannel = FlutterMethodChannel(
-        name: "nipaplay/device_profile",
-        binaryMessenger: controller.binaryMessenger
-      )
+  /// The Flutter view controller in that scene, for presenting system sheets.
+  private static var flutterViewController: FlutterViewController? {
+    windowScene?.windows.lazy.compactMap { $0.rootViewController as? FlutterViewController }.first
+  }
 
-      deviceProfileChannel.setMethodCallHandler { call, result in
-        guard call.method == "getStartupDeviceProfile" else {
-          result(FlutterMethodNotImplemented)
-          return
-        }
+  func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
+    GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
 
-        let bounds = UIScreen.main.bounds
-        result([
-          "isIPad": UIDevice.current.userInterfaceIdiom == .pad,
-          "screenWidthDp": Double(bounds.width),
-          "screenHeightDp": Double(bounds.height),
-          "smallestScreenWidthDp": Double(min(bounds.width, bounds.height)),
-        ])
+    let registrar = engineBridge.applicationRegistrar
+    let messenger = registrar.messenger()
+
+    registrar.register(
+      AirPlayRoutePickerFactory(messenger: messenger),
+      withId: "nipaplay/airplay_route_picker"
+    )
+
+    let deviceProfileChannel = FlutterMethodChannel(
+      name: "nipaplay/device_profile",
+      binaryMessenger: messenger
+    )
+
+    deviceProfileChannel.setMethodCallHandler { call, result in
+      guard call.method == "getStartupDeviceProfile" else {
+        result(FlutterMethodNotImplemented)
+        return
       }
 
-      let channel = FlutterMethodChannel(
-        name: "nipaplay/system_share",
-        binaryMessenger: controller.binaryMessenger
-      )
+      let bounds = (Self.windowScene?.screen ?? UIScreen.main).bounds
+      result([
+        "isIPad": UIDevice.current.userInterfaceIdiom == .pad,
+        "screenWidthDp": Double(bounds.width),
+        "screenHeightDp": Double(bounds.height),
+        "smallestScreenWidthDp": Double(min(bounds.width, bounds.height)),
+      ])
+    }
 
-      channel.setMethodCallHandler { [weak controller] call, result in
-        guard call.method == "share" else {
-          result(FlutterMethodNotImplemented)
-          return
-        }
+    let windowTraitsChannel = FlutterMethodChannel(
+      name: "nipaplay/window_traits",
+      binaryMessenger: messenger
+    )
 
-        guard let args = call.arguments as? [String: Any] else {
+    windowTraitsChannel.setMethodCallHandler { call, result in
+      guard call.method == "getWindowTraits" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      result(Self.flutterViewController.map { Self.windowTraits(for: $0.view) })
+    }
+
+    let fileChannel = FlutterMethodChannel(
+      name: "file_association_channel",
+      binaryMessenger: messenger
+    )
+    fileAssociationChannel = fileChannel
+    fileChannel.setMethodCallHandler { [weak self] call, result in
+      guard let self = self else {
+        result(nil)
+        return
+      }
+      switch call.method {
+      case "getOpenFileUri":
+        result(self.pendingOpenFiles.isEmpty ? nil : self.pendingOpenFiles.removeFirst())
+      case "getOpenFileError":
+        result(self.pendingOpenErrors.isEmpty ? nil : self.pendingOpenErrors.removeFirst())
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+
+    let shareChannel = FlutterMethodChannel(
+      name: "nipaplay/system_share",
+      binaryMessenger: messenger
+    )
+
+    shareChannel.setMethodCallHandler { call, result in
+      if call.method == "exportFile" {
+        guard
+          let args = call.arguments as? [String: Any],
+          let filePath = args["filePath"] as? String,
+          !filePath.isEmpty
+        else {
           result(
             FlutterError(
               code: "INVALID_ARGUMENTS",
-              message: "Arguments are required",
+              message: "A file path is required",
               details: nil
             )
           )
           return
         }
 
-        let text = args["text"] as? String
-        let urlString = args["url"] as? String
-        let filePath = args["filePath"] as? String
-
-        var items: [Any] = []
-        if let filePath = filePath, !filePath.isEmpty {
-          items.append(URL(fileURLWithPath: filePath))
-        }
-        if let urlString = urlString, let url = URL(string: urlString) {
-          items.append(url)
-        }
-        if let text = text, !text.isEmpty {
-          items.append(text)
-        }
-
-        if items.isEmpty {
+        guard FileManager.default.fileExists(atPath: filePath) else {
           result(
             FlutterError(
-              code: "NO_ITEMS",
-              message: "Nothing to share",
-              details: nil
+              code: "FILE_NOT_FOUND",
+              message: "The file to export does not exist",
+              details: filePath
             )
           )
           return
         }
 
         DispatchQueue.main.async {
-          let activity = UIActivityViewController(activityItems: items, applicationActivities: nil)
-          if let popover = activity.popoverPresentationController, let view = controller?.view {
-            popover.sourceView = view
-            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
-            popover.permittedArrowDirections = []
+          guard let controller = Self.flutterViewController else {
+            result(
+              FlutterError(
+                code: "NO_CONTROLLER",
+                message: "No view controller is available",
+                details: nil
+              )
+            )
+            return
           }
-          controller?.present(activity, animated: true)
-          result(true)
+
+          let picker = UIDocumentPickerViewController(
+            forExporting: [URL(fileURLWithPath: filePath)],
+            asCopy: true
+          )
+          controller.present(picker, animated: true) {
+            result(true)
+          }
+        }
+        return
+      }
+
+      guard call.method == "share" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+
+      guard let args = call.arguments as? [String: Any] else {
+        result(
+          FlutterError(
+            code: "INVALID_ARGUMENTS",
+            message: "Arguments are required",
+            details: nil
+          )
+        )
+        return
+      }
+
+      let text = args["text"] as? String
+      let urlString = args["url"] as? String
+      let filePath = args["filePath"] as? String
+
+      var items: [Any] = []
+      if let filePath = filePath, !filePath.isEmpty {
+        guard FileManager.default.fileExists(atPath: filePath) else {
+          result(
+            FlutterError(
+              code: "FILE_NOT_FOUND",
+              message: "The file to share does not exist",
+              details: filePath
+            )
+          )
+          return
+        }
+        items.append(URL(fileURLWithPath: filePath))
+      }
+      if let urlString = urlString, let url = URL(string: urlString) {
+        items.append(url)
+      }
+      if let text = text, !text.isEmpty {
+        items.append(text)
+      }
+
+      if items.isEmpty {
+        result(
+          FlutterError(
+            code: "NO_ITEMS",
+            message: "Nothing to share",
+            details: nil
+          )
+        )
+        return
+      }
+
+      DispatchQueue.main.async {
+        guard let controller = Self.flutterViewController else {
+          result(
+            FlutterError(
+              code: "NO_CONTROLLER",
+              message: "No view controller is available",
+              details: nil
+            )
+          )
+          return
+        }
+        let activity = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        if let popover = activity.popoverPresentationController, let view = controller.view {
+          popover.sourceView = view
+          popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+          popover.permittedArrowDirections = []
+        }
+        controller.present(activity, animated: true)
+        result(true)
+      }
+    }
+
+    let photoChannel = FlutterMethodChannel(
+      name: "nipaplay/photo_library",
+      binaryMessenger: messenger
+    )
+
+    photoChannel.setMethodCallHandler { call, result in
+      guard call.method == "saveImage" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+
+      guard
+        let args = call.arguments as? [String: Any],
+        let typedData = args["bytes"] as? FlutterStandardTypedData
+      else {
+        result(
+          FlutterError(
+            code: "INVALID_ARGUMENTS",
+            message: "Image bytes are required",
+            details: nil
+          )
+        )
+        return
+      }
+
+      let data = typedData.data
+      guard let image = UIImage(data: data) else {
+        result(
+          FlutterError(
+            code: "INVALID_IMAGE",
+            message: "Unable to decode image bytes",
+            details: nil
+          )
+        )
+        return
+      }
+
+      let saveBlock = {
+        PHPhotoLibrary.shared().performChanges({
+          PHAssetChangeRequest.creationRequestForAsset(from: image)
+        }) { success, error in
+          DispatchQueue.main.async {
+            if success {
+              result(true)
+            } else {
+              result(
+                FlutterError(
+                  code: "SAVE_FAILED",
+                  message: error?.localizedDescription ?? "Failed to save image",
+                  details: nil
+                )
+              )
+            }
+          }
         }
       }
 
-      let photoChannel = FlutterMethodChannel(
-        name: "nipaplay/photo_library",
-        binaryMessenger: controller.binaryMessenger
-      )
+      let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+      if status == .authorized {
+        saveBlock()
+        return
+      }
 
-      photoChannel.setMethodCallHandler { call, result in
-        guard call.method == "saveImage" else {
-          result(FlutterMethodNotImplemented)
-          return
-        }
-
-        guard
-          let args = call.arguments as? [String: Any],
-          let typedData = args["bytes"] as? FlutterStandardTypedData
-        else {
-          result(
-            FlutterError(
-              code: "INVALID_ARGUMENTS",
-              message: "Image bytes are required",
-              details: nil
-            )
-          )
-          return
-        }
-
-        let data = typedData.data
-        guard let image = UIImage(data: data) else {
-          result(
-            FlutterError(
-              code: "INVALID_IMAGE",
-              message: "Unable to decode image bytes",
-              details: nil
-            )
-          )
-          return
-        }
-
-        let saveBlock = {
-          PHPhotoLibrary.shared().performChanges({
-            PHAssetChangeRequest.creationRequestForAsset(from: image)
-          }) { success, error in
-            DispatchQueue.main.async {
-              if success {
-                result(true)
-              } else {
-                result(
-                  FlutterError(
-                    code: "SAVE_FAILED",
-                    message: error?.localizedDescription ?? "Failed to save image",
-                    details: nil
-                  )
-                )
-              }
-            }
-          }
-        }
-
-        if #available(iOS 14, *) {
-          let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
-          if status == .authorized {
+      PHPhotoLibrary.requestAuthorization(for: .addOnly) { newStatus in
+        DispatchQueue.main.async {
+          if newStatus == .authorized {
             saveBlock()
-            return
-          }
-
-          PHPhotoLibrary.requestAuthorization(for: .addOnly) { newStatus in
-            DispatchQueue.main.async {
-              if newStatus == .authorized {
-                saveBlock()
-              } else {
-                result(
-                  FlutterError(
-                    code: "PERMISSION_DENIED",
-                    message: "Photo library permission denied",
-                    details: nil
-                  )
-                )
-              }
-            }
-          }
-        } else {
-          let status = PHPhotoLibrary.authorizationStatus()
-          if status == .authorized {
-            saveBlock()
-            return
-          }
-
-          PHPhotoLibrary.requestAuthorization { newStatus in
-            DispatchQueue.main.async {
-              if newStatus == .authorized {
-                saveBlock()
-              } else {
-                result(
-                  FlutterError(
-                    code: "PERMISSION_DENIED",
-                    message: "Photo library permission denied",
-                    details: nil
-                  )
-                )
-              }
-            }
+          } else {
+            result(
+              FlutterError(
+                code: "PERMISSION_DENIED",
+                message: "Photo library permission denied",
+                details: nil
+              )
+            )
           }
         }
       }
     }
+  }
 
-    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  /// Reports where iPhone Duo places toolbars and tab bars
+  /// (`UITraitCollection.verticalBarEdge`), the occluded areas custom bars must
+  /// avoid (`UIView.reservedRegions`), both iOS 27.1, and the horizontal size
+  /// class. The iOS 27.1 APIs are read dynamically so the project still builds
+  /// with SDKs that predate them.
+  static func windowTraits(for view: UIView) -> [String: Any] {
+    let traits = view.traitCollection
+    var edge = 0
+    if traits.responds(to: NSSelectorFromString("verticalBarEdge")) {
+      edge = (traits.value(forKey: "verticalBarEdge") as? NSNumber)?.intValue ?? 0
+    }
+    return [
+      "verticalBarEdge": edge,
+      "isRightToLeft": traits.layoutDirection == .rightToLeft,
+      "occlusions": occlusionRegionFrames(in: view).map {
+        [Double($0.minX), Double($0.minY), Double($0.width), Double($0.height)]
+      },
+      "horizontalSizeClass": traits.horizontalSizeClass.rawValue,
+    ]
+  }
+
+  /// Active occlusion regions, such as the outer camera and the status bar
+  /// column, in the view's coordinate space.
+  private static func occlusionRegionFrames(in view: UIView) -> [CGRect] {
+    let kindSelector = NSSelectorFromString("occlusionRegionKind")
+    let regionsSelector = NSSelectorFromString("reservedRegionsOfKind:")
+    guard
+      let kindClass = NSClassFromString("UIViewReservedRegionKind") as AnyObject?,
+      kindClass.responds(to: kindSelector),
+      view.responds(to: regionsSelector),
+      let kind = kindClass.perform(kindSelector)?.takeUnretainedValue(),
+      let regions = view.perform(regionsSelector, with: kind)?
+        .takeUnretainedValue() as? [NSObject]
+    else {
+      return []
+    }
+    return regions.compactMap { region in
+      guard (region.value(forKey: "active") as? Bool) == true else { return nil }
+      return (region.value(forKey: "frame") as? NSValue)?.cgRectValue
+    }
+  }
+
+  func receiveFileURL(_ url: URL) {
+    let videoExtensions: Set<String> = [
+      "mp4", "mkv", "avi", "mov", "webm", "wmv", "m4v", "3gp", "flv", "ts", "m2ts"
+    ]
+    guard videoExtensions.contains(url.pathExtension.lowercased()) else { return }
+
+    // Ignore the same URL delivered twice in quick succession.
+    let now = Date()
+    if lastOpenedFileURL == url,
+       let previous = lastOpenedFileDate,
+       now.timeIntervalSince(previous) < 2 {
+      return
+    }
+    lastOpenedFileURL = url
+    lastOpenedFileDate = now
+
+    fileImportQueue.async { [weak self] in
+      do {
+        let filePath = try Self.prepareOpenedFile(url)
+        DispatchQueue.main.async {
+          self?.pendingOpenFiles.append(filePath)
+          self?.fileAssociationChannel?.invokeMethod("onOpenFileUri", arguments: nil)
+        }
+      } catch {
+        NSLog("[FileAssociation] Failed to open %@: %@", url.lastPathComponent, String(describing: error))
+        DispatchQueue.main.async {
+          self?.pendingOpenErrors.append("无法打开文件：\(url.lastPathComponent)（\(error.localizedDescription)）")
+          self?.fileAssociationChannel?.invokeMethod("onOpenFileError", arguments: nil)
+        }
+      }
+    }
+  }
+
+  private static func prepareOpenedFile(_ url: URL) throws -> String {
+    let fileManager = FileManager.default
+    let source = url.resolvingSymlinksInPath().standardizedFileURL
+    let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+      .resolvingSymlinksInPath().standardizedFileURL
+    let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+      .resolvingSymlinksInPath().standardizedFileURL
+
+    // Files may hand back a document already inside NipaPlay's container.
+    if source.path.hasPrefix(documents.path + "/") ||
+       source.path.hasPrefix(appSupport.path + "/") {
+      guard fileManager.fileExists(atPath: source.path) else {
+        throw CocoaError(.fileNoSuchFile)
+      }
+      return source.path
+    }
+
+    // External providers need security-scoped access while the file is read.
+    // Keep a local copy because playback and watch history outlive this callback.
+    let hasScope = url.startAccessingSecurityScopedResource()
+    defer { if hasScope { url.stopAccessingSecurityScopedResource() } }
+
+    var coordinationError: NSError?
+    var importError: Error?
+    var importedPath: String?
+    let coordinator = NSFileCoordinator(filePresenter: nil)
+    coordinator.coordinate(readingItemAt: url, options: [], error: &coordinationError) { readURL in
+      do {
+        let hash = SHA256.hash(data: Data(source.absoluteString.utf8))
+          .map { String(format: "%02x", $0) }.joined()
+        var destinationDirectory = appSupport
+          .appendingPathComponent("Opened Files", isDirectory: true)
+          .appendingPathComponent(hash, isDirectory: true)
+        try fileManager.createDirectory(
+          at: destinationDirectory,
+          withIntermediateDirectories: true
+        )
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        try destinationDirectory.setResourceValues(resourceValues)
+
+        let destination = destinationDirectory.appendingPathComponent(source.lastPathComponent)
+        let sourceAttributes = try fileManager.attributesOfItem(atPath: readURL.path)
+        let existingAttributes = try? fileManager.attributesOfItem(atPath: destination.path)
+        let sourceSize = sourceAttributes[.size] as? NSNumber
+        let sourceDate = sourceAttributes[.modificationDate] as? Date
+        let existingSize = existingAttributes?[.size] as? NSNumber
+        let existingDate = existingAttributes?[.modificationDate] as? Date
+        if sourceSize != nil && sourceSize == existingSize &&
+           sourceDate != nil && sourceDate == existingDate {
+          importedPath = destination.path
+          return
+        }
+
+        let temporary = destinationDirectory.appendingPathComponent(UUID().uuidString + ".tmp")
+        defer { try? fileManager.removeItem(at: temporary) }
+        try fileManager.copyItem(at: readURL, to: temporary)
+        if fileManager.fileExists(atPath: destination.path) {
+          _ = try fileManager.replaceItemAt(destination, withItemAt: temporary)
+        } else {
+          try fileManager.moveItem(at: temporary, to: destination)
+        }
+        if let sourceDate = sourceDate {
+          try fileManager.setAttributes([.modificationDate: sourceDate], ofItemAtPath: destination.path)
+        }
+        importedPath = destination.path
+      } catch {
+        importError = error
+      }
+    }
+
+    if let error = importError ?? coordinationError { throw error }
+    guard let importedPath = importedPath else {
+      throw CocoaError(.fileReadUnknown)
+    }
+    return importedPath
   }
 }

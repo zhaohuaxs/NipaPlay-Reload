@@ -5,8 +5,8 @@ import './player_data_models.dart';
 import 'dart:async';
 
 class MdkPlayerAdapter implements AbstractPlayer {
-  MdkPlayerAdapter();
-  
+  MdkPlayerAdapter({String? httpProxy});
+
   @override
   double get volume => 1.0;
   @override
@@ -75,7 +75,7 @@ class MdkPlayerAdapter implements AbstractPlayer {
 
   @override
   void setDecoders(PlayerMediaType type, List<String> decoders) {}
-  
+
   @override
   List<String> getDecoders(PlayerMediaType type) => [];
 
@@ -86,16 +86,28 @@ class MdkPlayerAdapter implements AbstractPlayer {
   void setProperty(String key, String value) {}
 
   @override
+  void setUserAgent(String ua) {}
+
+  @override
   Future<void> setVideoSurfaceSize({int? width, int? height}) async {}
 
   @override
+  Future<void> setChapter(int index) async {}
+
+  @override
   Future<void> playDirectly() async {}
-  
+
   @override
   Future<void> pauseDirectly() async {}
 
   @override
   void setPlaybackRate(double rate) {}
+
+  @override
+  void stepForward() {}
+
+  @override
+  void stepBackward() {}
 
   // 详细播放技术信息（不支持MDK的平台返回空）
   Map<String, dynamic> getDetailedMediaInfo() => const <String, dynamic>{};

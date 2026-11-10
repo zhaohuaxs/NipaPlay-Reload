@@ -33,18 +33,29 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
 
   /// 使用新的标题更新历史记录
   Future<void> _updateHistoryWithNewTitles() async {
-    if (_currentVideoPath == null) return;
+    final targetVideoPath = _currentVideoPath;
+    if (targetVideoPath == null) return;
+    final targetGeneration = _playbackGeneration;
+    final targetAnimeTitle = _animeTitle;
+    final targetEpisodeTitle = _episodeTitle;
+    final targetEpisodeId = _episodeId;
+    final targetAnimeId = _animeId;
+    bool canContinue() =>
+        !_isDisposed &&
+        _currentVideoPath == targetVideoPath &&
+        _playbackGeneration == targetGeneration;
 
     // 只有当两个标题都有值时才更新
-    if (_animeTitle == null || _animeTitle!.isEmpty) return;
+    if (targetAnimeTitle == null || targetAnimeTitle.isEmpty) return;
 
     try {
       debugPrint(
-          '[VideoPlayerState] 使用新标题更新历史记录: $_animeTitle - $_episodeTitle');
+          '[VideoPlayerState] 使用新标题更新历史记录: $targetAnimeTitle - $targetEpisodeTitle');
 
       // 获取现有历史记录
       final existingHistory = await WatchHistoryDatabase.instance
-          .getHistoryByFilePath(_currentVideoPath!);
+          .getHistoryByFilePath(targetVideoPath);
+      if (!canContinue()) return;
       if (existingHistory == null) {
         debugPrint('[VideoPlayerState] 未找到现有历史记录，跳过更新');
         return;
@@ -53,10 +64,10 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
       // 创建更新后的历史记录
       final updatedHistory = WatchHistoryItem(
         filePath: existingHistory.filePath,
-        animeName: _animeTitle!,
-        episodeTitle: _episodeTitle ?? existingHistory.episodeTitle,
-        episodeId: _episodeId ?? existingHistory.episodeId,
-        animeId: _animeId ?? existingHistory.animeId,
+        animeName: targetAnimeTitle,
+        episodeTitle: targetEpisodeTitle ?? existingHistory.episodeTitle,
+        episodeId: targetEpisodeId ?? existingHistory.episodeId,
+        animeId: targetAnimeId ?? existingHistory.animeId,
         watchProgress: existingHistory.watchProgress,
         lastPosition: existingHistory.lastPosition,
         duration: existingHistory.duration,
@@ -66,8 +77,10 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
       );
 
       // 保存更新后的记录
+      if (!canContinue()) return;
       await WatchHistoryDatabase.instance
           .insertOrUpdateWatchHistory(updatedHistory);
+      if (!canContinue()) return;
 
       debugPrint(
           '[VideoPlayerState] 成功更新历史记录: ${updatedHistory.animeName} - ${updatedHistory.episodeTitle}');
@@ -79,13 +92,24 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
     }
   }
 
-  Future<void> _recognizeVideo(String videoPath) async {
-    if (videoPath.isEmpty) return;
+  Future<void> _recognizeVideo(
+    String videoPath, {
+    String? probePath,
+  }) async {
+    if (videoPath.isEmpty || _isDisposed || _currentVideoPath != videoPath) {
+      return;
+    }
+    final targetGeneration = _playbackGeneration;
+    bool canContinue() =>
+        !_isDisposed &&
+        _currentVideoPath == videoPath &&
+        _playbackGeneration == targetGeneration;
 
     // 每次识别新视频时重置自动弹幕偏移
     _setAutoDanmakuOffset(0.0);
 
     try {
+      if (!canContinue()) return;
       // 对于自定义媒体（animeId为负数），禁用自动匹配弹幕和手动匹配弹幕
       if (_animeId != null && _animeId! < 0) {
         _danmakuList = [];
@@ -96,19 +120,16 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
         return;
       }
 
-      final prefs = await SharedPreferences.getInstance();
-      final autoMatchEnabled =
-          prefs.getBool(SettingsKeys.autoMatchDanmakuOnPlay) ?? true;
-      if (!autoMatchEnabled) {
-        _danmakuList = [];
-        _danmakuListVersion++;
-        _danmakuTracks.clear();
-        _danmakuTrackEnabled.clear();
-        final handled =
-            await _tryManualMatchDanmaku(videoPath, initialFileName: null);
-        if (!handled) {
-          _setStatus(PlayerStatus.recognizing, message: '已关闭自动匹配弹幕，跳过弹幕');
-        }
+      final canMatch = await DanmakuMatchingService.instance.canAccess();
+      if (!canContinue()) return;
+      debugPrint(
+        '[弹幕自动匹配] 远程服务访问检查: canAccess=$canMatch, '
+        'loggedIn=${DandanplayService.isLoggedIn}',
+      );
+      if (!canMatch) {
+        debugPrint('[弹幕自动匹配] 官方服务缺少有效登录凭据，请求未发出');
+        _addStatusMessage('未登录弹弹play，已跳过在线弹幕匹配');
+        unawaited(_promptDandanplayLogin());
         return;
       }
 
@@ -116,12 +137,27 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
 
       // 使用超时处理网络请求
       try {
-        //debugPrint('尝试获取视频信息...');
-        final videoInfo = await DandanplayService.getVideoInfo(videoPath)
-            .timeout(const Duration(seconds: 15), onTimeout: () {
+        final recognitionTimeout = danmakuVideoInfoTimeout(
+          videoPath,
+          probePath: probePath,
+        );
+        debugPrint(
+          '[弹幕自动匹配] 正在读取文件元数据并查询匹配信息: '
+          'timeout=${recognitionTimeout.inSeconds}s',
+        );
+        final videoInfo = await DanmakuMatchingService.instance
+            .getVideoInfo(videoPath, probePath: probePath)
+            .timeout(recognitionTimeout, onTimeout: () {
           //debugPrint('获取视频信息超时');
-          throw TimeoutException('连接服务器超时');
+          throw TimeoutException(
+            '视频识别超时 (${recognitionTimeout.inSeconds}s)',
+          );
         });
+        if (!canContinue()) return;
+        debugPrint(
+          '[弹幕自动匹配] 查询完成: isMatched=${videoInfo['isMatched']}, '
+          'matches=${videoInfo['matches'] is List ? (videoInfo['matches'] as List).length : 'invalid'}',
+        );
 
         if (videoInfo['isMatched'] == true) {
           //debugPrint('视频匹配成功，开始加载弹幕...');
@@ -129,6 +165,7 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
 
           // 更新观看记录的动画和集数信息
           await _updateWatchHistoryWithVideoInfo(videoPath, videoInfo);
+          if (!canContinue()) return;
 
           if (videoInfo['matches'] != null && videoInfo['matches'].isNotEmpty) {
             final match = videoInfo['matches'][0];
@@ -140,6 +177,7 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
               } else if (shiftValue is String) {
                 autoOffset = double.tryParse(shiftValue) ?? 0.0;
               }
+              if (!canContinue()) return;
               _setAutoDanmakuOffset(autoOffset);
               try {
                 //debugPrint('尝试加载弹幕...');
@@ -155,6 +193,7 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
                 //debugPrint('检查弹幕缓存...');
                 final cachedDanmakuRaw =
                     await DanmakuCacheManager.getDanmakuFromCache(episodeId);
+                if (!canContinue()) return;
                 if (cachedDanmakuRaw != null) {
                   //debugPrint('从缓存加载弹幕...');
                   _setStatus(PlayerStatus.recognizing, message: '正在从缓存解析弹幕...');
@@ -163,10 +202,13 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
                   _isInFinalLoadingPhase = true;
                   _notifyListeners();
 
-                  _danmakuList = await compute(
-                    parseDanmakuListInBackground,
+                  final parsedDanmaku =
+                      await DanmakuParser.parseDanmakuListOptimized(
                     cachedDanmakuRaw as List<dynamic>?,
+                    (data) => compute(parseDanmakuListInBackground, data),
                   );
+                  if (!canContinue()) return;
+                  _danmakuList = parsedDanmaku;
                   _danmakuListVersion++;
 
                   // Sort the list immediately after parsing
@@ -202,6 +244,7 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
                   //debugPrint('加载弹幕超时');
                   throw TimeoutException('加载弹幕超时');
                 });
+                if (!canContinue()) return;
 
                 // 设置最终加载阶段标志，减少动画性能消耗
                 _isInFinalLoadingPhase = true;
@@ -211,10 +254,13 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
                 if (danmakuData['comments'] != null &&
                     danmakuData['comments'] is List) {
                   // Use compute for parsing network danmaku, using the imported function
-                  _danmakuList = await compute(
-                    parseDanmakuListInBackground,
+                  final parsedDanmaku =
+                      await DanmakuParser.parseDanmakuListOptimized(
                     danmakuData['comments'] as List<dynamic>?,
+                    (data) => compute(parseDanmakuListInBackground, data),
                   );
+                  if (!canContinue()) return;
+                  _danmakuList = parsedDanmaku;
                   _danmakuListVersion++;
 
                   // Sort the list immediately after parsing
@@ -249,6 +295,7 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
                 // 如果是GPU模式，预构建字符集
                 await _prebuildGPUDanmakuCharsetIfNeeded();
               } catch (e) {
+                if (!canContinue()) return;
                 //debugPrint('弹幕加载/解析错误: $e\n$s');
                 _danmakuList = [];
                 _danmakuListVersion++;
@@ -267,15 +314,24 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
               videoPath,
               initialFileName: videoInfo['fileName']?.toString(),
             );
+            if (!canContinue()) return;
             if (handled) {
               return;
             }
 
             _setStatus(PlayerStatus.recognizing, message: '未匹配到视频信息，跳过弹幕');
           }
+        } else {
+          debugPrint('[弹幕自动匹配] 哈希和文件名兜底均未找到匹配，跳过网络弹幕');
         }
+      } on DandanplayLoginRequired {
+        if (!canContinue()) return;
+        debugPrint('[弹幕自动匹配] 请求前鉴权失败，请求未发出');
+        _addStatusMessage('未登录弹弹play，已跳过在线弹幕匹配');
+        unawaited(_promptDandanplayLogin());
       } catch (e) {
-        //debugPrint('视频识别网络错误: $e\n$s');
+        if (!canContinue()) return;
+        debugPrint('[弹幕自动匹配] 视频识别或网络请求失败: $e');
         _danmakuList = [];
         _danmakuListVersion++;
         _danmakuTracks.clear();
@@ -283,8 +339,39 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
         _setStatus(PlayerStatus.recognizing, message: '无法连接服务器，跳过加载弹幕');
       }
     } catch (e) {
+      if (!canContinue()) return;
       //debugPrint('识别视频或加载弹幕时发生严重错误: $e\n$s');
       rethrow;
+    }
+  }
+
+  /// Do not block video initialization or stack matching/download prompts.
+  Future<void> _promptDandanplayLogin() async {
+    final generation = _playbackGeneration;
+    final videoPath = _currentVideoPath;
+    bool canShow() =>
+        !_isDisposed &&
+        videoPath != null &&
+        _currentVideoPath == videoPath &&
+        _playbackGeneration == generation &&
+        _dandanplayLoginPromptGeneration != generation;
+    if (!canShow()) return;
+
+    // Playback may be changing the widget tree when matching is skipped.
+    await WidgetsBinding.instance.endOfFrame;
+    if (!canShow()) return;
+    if (await DanmakuMatchingService.instance.canAccess()) return;
+    if (!canShow()) return;
+    final context = _context?.mounted == true
+        ? _context
+        : globals.navigatorKey.currentState?.overlay?.context;
+    if (context == null || !context.mounted) return;
+    _dandanplayLoginPromptGeneration = generation;
+    try {
+      await DandanplayLoginNotice.showIfNeeded(context);
+    } catch (e) {
+      // A presentation failure must never prevent video playback.
+      debugPrint('[弹幕访问] 无法显示登录提示: $e');
     }
   }
 
@@ -309,6 +396,11 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
         _currentVideoPath != videoPath) {
       return false;
     }
+    final targetGeneration = _playbackGeneration;
+    bool canContinue() =>
+        !_isDisposed &&
+        _currentVideoPath == videoPath &&
+        _playbackGeneration == targetGeneration;
 
     final initialKeyword = _buildManualMatchInitialKeyword(
       videoPath,
@@ -321,7 +413,7 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
         initialVideoTitle: initialKeyword,
       );
 
-      if (result != null && !_isDisposed && _currentVideoPath == videoPath) {
+      if (result != null && canContinue()) {
         final episodeIdStr = result['episodeId']?.toString() ?? '';
         final animeIdStr = result['animeId']?.toString() ?? '';
 
@@ -356,13 +448,15 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
             videoPath,
             manualVideoInfo,
           );
+          if (!canContinue()) return false;
 
           _setStatus(PlayerStatus.recognizing, message: '正在加载弹幕...');
           await loadDanmaku(episodeIdStr, animeIdStr);
-          return true;
+          return canContinue();
         }
       }
     } catch (e) {
+      if (!canContinue()) return false;
       debugPrint('自动弹出手动匹配弹幕对话框失败: $e');
     }
 
@@ -372,6 +466,13 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
   // 根据视频识别信息更新观看记录
   Future<void> _updateWatchHistoryWithVideoInfo(
       String path, Map<String, dynamic> videoInfo) async {
+    if (_isDisposed || _currentVideoPath != path) return;
+    final targetGeneration = _playbackGeneration;
+    bool canContinue() =>
+        !_isDisposed &&
+        _currentVideoPath == path &&
+        _playbackGeneration == targetGeneration;
+
     try {
       //debugPrint('更新观看记录开始，视频路径: $path');
       // 获取现有记录
@@ -384,6 +485,7 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
         existingHistory =
             await WatchHistoryDatabase.instance.getHistoryByFilePath(path);
       }
+      if (!canContinue()) return;
 
       if (existingHistory == null) {
         debugPrint('[VideoPlayerState] 未找到现有观看记录，将创建基础记录后写入识别结果');
@@ -448,6 +550,7 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
           '识别到动画：$resolvedAnimeName，集数：${episodeTitle ?? '未知集数'}，animeId: $animeId, episodeId: $episodeId');
 
       // 更新当前动画标题和集数标题
+      if (!canContinue()) return;
       _animeTitle = resolvedAnimeName;
       _episodeTitle = episodeTitle;
 
@@ -483,6 +586,7 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
           '准备保存更新后的观看记录，动画名: ${updatedHistory.animeName}, 集数: ${updatedHistory.episodeTitle}');
 
       // 保存更新后的记录
+      if (!canContinue()) return;
       if (watchHistoryProvider != null) {
         await watchHistoryProvider.addOrUpdateHistory(updatedHistory);
       } else {
@@ -490,7 +594,9 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
             .insertOrUpdateWatchHistory(updatedHistory);
       }
 
-      debugPrint('成功更新观看记录');
+      if (canContinue()) {
+        debugPrint('成功更新观看记录');
+      }
     } catch (e) {
       debugPrint('更新观看记录时出错: $e');
       // 错误不应阻止视频播放
@@ -505,6 +611,7 @@ extension VideoPlayerStateMetadata on VideoPlayerState {
     }
     if (filePath.startsWith('http://') ||
         filePath.startsWith('https://') ||
+        MediaSourceUtils.isContentUri(filePath) ||
         filePath.startsWith('jellyfin://') ||
         filePath.startsWith('emby://')) {
       return md5.convert(utf8.encode(filePath)).toString();

@@ -10,14 +10,18 @@ import 'package:nipaplay/utils/settings_storage.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_dialog.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/hover_scale_text_button.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/keyboard_activatable.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/bounce_hover_scale.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_dropdown.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/fluent_settings_switch.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/glass_bottom_sheet.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/tvos_remote_text_input_scope.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_focusable_action.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_mode_scope.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_view_container.dart';
 import 'package:kmbal_ionicons/kmbal_ionicons.dart';
 import 'package:provider/provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
-import 'package:nipaplay/providers/appearance_settings_provider.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
 import 'package:nipaplay/utils/app_accent_color.dart';
 
@@ -40,11 +44,14 @@ class _DebugLogViewerPageState extends State<DebugLogViewerPage>
   bool _showTimestamp = true;
   bool _autoScroll = false;
   bool _isMoreOptionsHovered = false;
+  bool _isMoreOptionsFocused = false;
   String _selectedLevel = '全部';
   String _selectedTag = '全部';
   String _searchQuery = '';
   List<String> _availableTags = ['全部'];
   final List<String> _logLevels = ['全部', 'DEBUG', 'INFO', 'WARN', 'ERROR'];
+
+  bool get _isLargeScreen => NipaplayLargeScreenModeScope.isActiveOf(context);
 
   @override
   void initState() {
@@ -319,15 +326,15 @@ class _DebugLogViewerPageState extends State<DebugLogViewerPage>
       context: context,
       title: '确认清空',
       content: '确定要清空所有日志吗？此操作无法撤销。',
-      actions: [
+      actionsBuilder: (dialogContext) => [
         HoverScaleTextButton(
-          onPressed: () => Navigator.pop(context),
+          onPressed: () => Navigator.pop(dialogContext),
           child: Text('取消',
               style: TextStyle(color: colorScheme.onSurface.withOpacity(0.7))),
         ),
         HoverScaleTextButton(
           onPressed: () {
-            Navigator.pop(context);
+            Navigator.pop(dialogContext);
             DebugLogService().clearLogs();
             BlurSnackBar.show(context, '日志已清空');
           },
@@ -406,9 +413,9 @@ class _DebugLogViewerPageState extends State<DebugLogViewerPage>
       context: context,
       title: '日志统计',
       content: contentBuffer.toString(),
-      actions: [
+      actionsBuilder: (dialogContext) => [
         HoverScaleTextButton(
-          onPressed: () => Navigator.pop(context),
+          onPressed: () => Navigator.pop(dialogContext),
           child: Text('关闭', style: TextStyle(color: colorScheme.onSurface)),
         ),
       ],
@@ -417,133 +424,149 @@ class _DebugLogViewerPageState extends State<DebugLogViewerPage>
 
   // 显示更多选项对话框
   void _showMoreOptions(BuildContext context) {
+    if (_isLargeScreen) {
+      NipaplayLargeScreenViewContainer.show<void>(
+        context: context,
+        title: '终端输出选项',
+        subtitle: '选择日志显示、导出与清理操作',
+        maxWidth: 760,
+        maxHeightFactor: 0.82,
+        autofocusClose: false,
+        builder: (_) => SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: _buildMoreOptionsContent(context),
+        ),
+      );
+      return;
+    }
     GlassBottomSheet.show(
       context: context,
       title: '终端输出选项',
       height: MediaQuery.of(context).size.height * 0.6,
       child: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            // 显示时间戳开关
-            _buildOptionItem(
-              icon: Icons.access_time,
-              title: '显示时间戳',
-              isSwitch: true,
-              switchValue: _showTimestamp,
-              onSwitchChanged: (value) {
-                setState(() {
-                  _showTimestamp = value;
-                });
-                SettingsStorage.saveBool('debug_log_show_timestamp', value);
-                Navigator.pop(context);
-              },
-            ),
-
-            SizedBox(height: 12),
-
-            // 自动滚动开关
-            _buildOptionItem(
-              icon: Icons.auto_awesome,
-              title: '自动滚动',
-              isSwitch: true,
-              switchValue: _autoScroll,
-              onSwitchChanged: (value) {
-                setState(() {
-                  _autoScroll = value;
-                });
-                SettingsStorage.saveBool('debug_log_auto_scroll', value);
-                Navigator.pop(context);
-              },
-            ),
-
-            SizedBox(height: 20),
-
-            // 分隔线
-            Divider(
-                color:
-                    Theme.of(context).colorScheme.onSurface.withOpacity(0.3)),
-
-            SizedBox(height: 12),
-
-            // 统计信息
-            _buildOptionItem(
-              icon: Icons.bar_chart,
-              title: '统计信息',
-              onTap: () {
-                Navigator.pop(context);
-                _showLogStatistics();
-              },
-            ),
-
-            SizedBox(height: 12),
-
-            // 导出全部
-            _buildOptionItem(
-              icon: Icons.copy_all,
-              title: Platform.isWindows || Platform.isMacOS || Platform.isLinux
-                  ? '导出到文件'
-                  : '导出全部',
-              onTap: () {
-                Navigator.pop(context);
-                if (Platform.isWindows ||
-                    Platform.isMacOS ||
-                    Platform.isLinux) {
-                  _exportLogsToFile();
-                } else {
-                  _exportLogs();
-                }
-              },
-            ),
-
-            // PC端额外显示复制到剪贴板选项
-            if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) ...[
-              SizedBox(height: 12),
-              _buildOptionItem(
-                icon: Icons.content_copy,
-                title: '复制到剪贴板',
-                onTap: () {
-                  Navigator.pop(context);
-                  _exportLogs();
-                },
-              ),
-            ],
-
-            SizedBox(height: 12),
-
-            // 分享二维码选项
-            _buildOptionItem(
-              icon: Icons.qr_code,
-              title: '分享二维码',
-              onTap: () {
-                Navigator.pop(context);
-                Future.microtask(() {
-                  if (mounted) {
-                    _showQRCode();
-                  }
-                });
-              },
-            ),
-
-            SizedBox(height: 12),
-
-            // 清空日志
-            _buildOptionItem(
-              icon: Icons.clear_all,
-              title: '清空日志',
-              iconColor: Colors.red,
-              textColor: Colors.red,
-              onTap: () {
-                Navigator.pop(context);
-                _clearLogs();
-              },
-            ),
-
-            // 添加底部边距，确保最后一项可以完全显示
-            SizedBox(height: 16),
-          ],
-        ),
+        child: _buildMoreOptionsContent(context),
       ),
+    );
+  }
+
+  Widget _buildMoreOptionsContent(BuildContext context) {
+    return Column(
+      children: [
+        // 显示时间戳开关
+        _buildOptionItem(
+          icon: Icons.access_time,
+          title: '显示时间戳',
+          isSwitch: true,
+          switchValue: _showTimestamp,
+          onSwitchChanged: (value) {
+            setState(() {
+              _showTimestamp = value;
+            });
+            SettingsStorage.saveBool('debug_log_show_timestamp', value);
+            Navigator.pop(context);
+          },
+        ),
+
+        SizedBox(height: 12),
+
+        // 自动滚动开关
+        _buildOptionItem(
+          icon: Icons.auto_awesome,
+          title: '自动滚动',
+          isSwitch: true,
+          switchValue: _autoScroll,
+          onSwitchChanged: (value) {
+            setState(() {
+              _autoScroll = value;
+            });
+            SettingsStorage.saveBool('debug_log_auto_scroll', value);
+            Navigator.pop(context);
+          },
+        ),
+
+        SizedBox(height: 20),
+
+        // 分隔线
+        Divider(
+            color: Theme.of(context).colorScheme.onSurface.withOpacity(0.3)),
+
+        SizedBox(height: 12),
+
+        // 统计信息
+        _buildOptionItem(
+          icon: Icons.bar_chart,
+          title: '统计信息',
+          onTap: () {
+            Navigator.pop(context);
+            _showLogStatistics();
+          },
+        ),
+
+        SizedBox(height: 12),
+
+        // 导出全部
+        _buildOptionItem(
+          icon: Icons.copy_all,
+          title: Platform.isWindows || Platform.isMacOS || Platform.isLinux
+              ? '导出到文件'
+              : '导出全部',
+          onTap: () {
+            Navigator.pop(context);
+            if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
+              _exportLogsToFile();
+            } else {
+              _exportLogs();
+            }
+          },
+        ),
+
+        // PC端额外显示复制到剪贴板选项
+        if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) ...[
+          SizedBox(height: 12),
+          _buildOptionItem(
+            icon: Icons.content_copy,
+            title: '复制到剪贴板',
+            onTap: () {
+              Navigator.pop(context);
+              _exportLogs();
+            },
+          ),
+        ],
+
+        SizedBox(height: 12),
+
+        // 分享二维码选项
+        _buildOptionItem(
+          icon: Icons.qr_code,
+          title: '分享二维码',
+          onTap: () {
+            Navigator.pop(context);
+            Future.microtask(() {
+              if (mounted) {
+                _showQRCode();
+              }
+            });
+          },
+        ),
+
+        SizedBox(height: 12),
+
+        // 清空日志
+        _buildOptionItem(
+          icon: Icons.clear_all,
+          title: '清空日志',
+          iconColor: Colors.red,
+          textColor: Colors.red,
+          onTap: () {
+            Navigator.pop(context);
+            _clearLogs();
+          },
+        ),
+
+        // 添加底部边距，确保最后一项可以完全显示
+        SizedBox(height: 16),
+      ],
     );
   }
 
@@ -558,50 +581,56 @@ class _DebugLogViewerPageState extends State<DebugLogViewerPage>
     VoidCallback? onTap,
   }) {
     final colorScheme = Theme.of(context).colorScheme;
-    return Container(
-      decoration: BoxDecoration(),
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          onTap: isSwitch ? null : onTap,
-          splashColor: Colors.transparent,
-          highlightColor: Colors.transparent,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            child: Row(
-              children: [
+    final item = Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: isSwitch ? null : onTap,
+        splashColor: Colors.transparent,
+        highlightColor: Colors.transparent,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Row(
+            children: [
+              Icon(
+                icon,
+                color: iconColor ?? colorScheme.onSurface.withOpacity(0.7),
+                size: 20,
+              ),
+              SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  title,
+                  style: TextStyle(
+                    color: textColor ?? colorScheme.onSurface,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+              if (isSwitch)
+                FluentSettingsSwitch(
+                  value: switchValue ?? false,
+                  onChanged: onSwitchChanged,
+                )
+              else
                 Icon(
-                  icon,
-                  color: iconColor ?? colorScheme.onSurface.withOpacity(0.7),
+                  Icons.chevron_right,
+                  color: colorScheme.onSurface.withOpacity(0.54),
                   size: 20,
                 ),
-                SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    title,
-                    style: TextStyle(
-                      color: textColor ?? colorScheme.onSurface,
-                      fontSize: 16,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ),
-                if (isSwitch)
-                  FluentSettingsSwitch(
-                    value: switchValue ?? false,
-                    onChanged: onSwitchChanged,
-                  )
-                else
-                  Icon(
-                    Icons.chevron_right,
-                    color: colorScheme.onSurface.withOpacity(0.54),
-                    size: 20,
-                  ),
-              ],
-            ),
+            ],
           ),
         ),
       ),
+    );
+    if (!_isLargeScreen) return item;
+    return NipaplayLargeScreenFocusableAction(
+      onActivate: isSwitch
+          ? () => onSwitchChanged?.call(!(switchValue ?? false))
+          : onTap,
+      borderRadius: BorderRadius.circular(10),
+      focusScale: 1,
+      child: ExcludeFocus(child: item),
     );
   }
 
@@ -683,23 +712,26 @@ class _DebugLogViewerPageState extends State<DebugLogViewerPage>
             child: Column(
               children: [
                 // 搜索框
-                TextField(
-                  controller: _searchController,
-                  cursorColor: AppAccentColors.current,
-                  style: TextStyle(color: colorScheme.onSurface),
-                  decoration: InputDecoration(
-                    hintText: '搜索日志内容...',
-                    hintStyle: TextStyle(
-                        color: colorScheme.onSurface.withOpacity(0.54)),
-                    prefixIcon: Icon(Icons.search,
-                        color: colorScheme.onSurface.withOpacity(0.54)),
-                    border: OutlineInputBorder(
-                      borderSide: BorderSide(
-                          color: colorScheme.onSurface.withOpacity(0.3)),
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderSide:
-                          BorderSide(color: AppAccentColors.current, width: 2),
+                TvOSRemoteTextInputControl(
+                  title: '搜索日志内容',
+                  child: TextField(
+                    controller: _searchController,
+                    cursorColor: AppAccentColors.current,
+                    style: TextStyle(color: colorScheme.onSurface),
+                    decoration: InputDecoration(
+                      hintText: '搜索日志内容...',
+                      hintStyle: TextStyle(
+                          color: colorScheme.onSurface.withOpacity(0.54)),
+                      prefixIcon: Icon(Icons.search,
+                          color: colorScheme.onSurface.withOpacity(0.54)),
+                      border: OutlineInputBorder(
+                        borderSide: BorderSide(
+                            color: colorScheme.onSurface.withOpacity(0.3)),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderSide: BorderSide(
+                            color: AppAccentColors.current, width: 2),
+                      ),
                     ),
                   ),
                 ),
@@ -784,22 +816,29 @@ class _DebugLogViewerPageState extends State<DebugLogViewerPage>
                     SizedBox(width: 16),
 
                     // 选项按钮
-                    MouseRegion(
-                      onEnter: (_) =>
-                          setState(() => _isMoreOptionsHovered = true),
-                      onExit: (_) =>
-                          setState(() => _isMoreOptionsHovered = false),
-                      cursor: SystemMouseCursors.click,
-                      child: GestureDetector(
-                        onTap: () => _showMoreOptions(context),
-                        child: BounceHoverScale(
-                          isHovered: _isMoreOptionsHovered,
-                          isPressed: false,
-                          child: Icon(
-                            Ionicons.ellipsis_vertical,
-                            color: _isMoreOptionsHovered
-                                ? AppAccentColors.current
-                                : colorScheme.onSurface,
+                    KeyboardActivatable(
+                      onActivate: () => _showMoreOptions(context),
+                      onFocusChange: (focused) =>
+                          setState(() => _isMoreOptionsFocused = focused),
+                      child: MouseRegion(
+                        onEnter: (_) =>
+                            setState(() => _isMoreOptionsHovered = true),
+                        onExit: (_) =>
+                            setState(() => _isMoreOptionsHovered = false),
+                        cursor: SystemMouseCursors.click,
+                        child: GestureDetector(
+                          onTap: () => _showMoreOptions(context),
+                          child: BounceHoverScale(
+                            isHovered:
+                                _isMoreOptionsHovered || _isMoreOptionsFocused,
+                            isPressed: false,
+                            child: Icon(
+                              Ionicons.ellipsis_vertical,
+                              color: (_isMoreOptionsHovered ||
+                                      _isMoreOptionsFocused)
+                                  ? AppAccentColors.current
+                                  : colorScheme.onSurface,
+                            ),
                           ),
                         ),
                       ),
@@ -876,6 +915,30 @@ class _DebugLogViewerPageState extends State<DebugLogViewerPage>
                         itemCount: filteredLogs.length,
                         itemBuilder: (context, index) {
                           final entry = filteredLogs[index];
+                          final entryContent = Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 16, vertical: 8),
+                            decoration: BoxDecoration(
+                              border: Border(
+                                bottom: BorderSide(
+                                  color: colorScheme.onSurface.withOpacity(0.1),
+                                  width: 0.5,
+                                ),
+                              ),
+                            ),
+                            child: _buildLogEntryContent(entry),
+                          );
+                          if (_isLargeScreen) {
+                            return Padding(
+                              padding: const EdgeInsets.fromLTRB(8, 2, 8, 2),
+                              child: NipaplayLargeScreenFocusableAction(
+                                onActivate: () => _copyLogEntry(entry),
+                                borderRadius: BorderRadius.circular(8),
+                                focusScale: 1,
+                                child: entryContent,
+                              ),
+                            );
+                          }
 
                           return InkWell(
                             onTap: () => _copyLogEntry(entry),
@@ -890,16 +953,16 @@ class _DebugLogViewerPageState extends State<DebugLogViewerPage>
                                 context: context,
                                 title: '日志详细信息',
                                 content: detailsContent,
-                                actions: [
+                                actionsBuilder: (dialogContext) => [
                                   HoverScaleTextButton(
-                                    onPressed: () => Navigator.pop(context),
+                                    onPressed: () => Navigator.pop(dialogContext),
                                     child: Text('关闭',
                                         style: TextStyle(
                                             color: colorScheme.onSurface)),
                                   ),
                                   HoverScaleTextButton(
                                     onPressed: () {
-                                      Navigator.pop(context);
+                                      Navigator.pop(dialogContext);
                                       _copyLogEntry(entry);
                                     },
                                     child: Text('复制',
@@ -909,20 +972,7 @@ class _DebugLogViewerPageState extends State<DebugLogViewerPage>
                                 ],
                               );
                             },
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 16, vertical: 8),
-                              decoration: BoxDecoration(
-                                border: Border(
-                                  bottom: BorderSide(
-                                    color:
-                                        colorScheme.onSurface.withOpacity(0.1),
-                                    width: 0.5,
-                                  ),
-                                ),
-                              ),
-                              child: _buildLogEntryContent(entry),
-                            ),
+                            child: entryContent,
                           );
                         },
                       );

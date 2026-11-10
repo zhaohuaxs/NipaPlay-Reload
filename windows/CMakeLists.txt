@@ -29,8 +29,9 @@ set(CMAKE_SHARED_LINKER_FLAGS_PROFILE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE}")
 set(CMAKE_C_FLAGS_PROFILE "${CMAKE_C_FLAGS_RELEASE}")
 set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 
-# Use Unicode for all projects.
-add_definitions(-DUNICODE -D_UNICODE)
+# Use Unicode and keep the Windows SDK from shadowing std::min/std::max in
+# plugin sources, including Erika's system media controls bridge.
+add_definitions(-DUNICODE -D_UNICODE -DNOMINMAX)
 
 # Suppress deprecated experimental/coroutine warning in newer MSVC
 add_definitions(-D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
@@ -82,6 +83,15 @@ add_subdirectory("runner")
 # them to the application.
 include(flutter/generated_plugins.cmake)
 
+# universal_gamepad（git 依赖）源码含 UTF-8 无 BOM 字符（em-dash 等），
+# 代码页 936 下 MSVC 触发 C4819，且被 /WX 升级为错误；为其追加 /utf-8。
+if(MSVC AND TARGET universal_gamepad_plugin)
+  target_compile_options(universal_gamepad_plugin PRIVATE /utf-8)
+endif()
+
+if(TARGET media_kit_libs_windows_video_LIBMPV_EXTRACT)
+  add_dependencies(${BINARY_NAME} media_kit_libs_windows_video_LIBMPV_EXTRACT)
+endif()
 
 # === Installation ===
 # Support files are copied into place next to the executable, so that it can
@@ -113,10 +123,13 @@ if(PLUGIN_BUNDLED_LIBRARIES)
 endif()
 
 # Copy the native assets provided by the build.dart from all packages.
+# 本项目没有任何包提供 hook/build.dart，Flutter 也就不会创建该目录；
+# 加 OPTIONAL 避免 install 因源目录不存在而中断整个构建。
 set(NATIVE_ASSETS_DIR "${PROJECT_BUILD_DIR}native_assets/windows/")
 install(DIRECTORY "${NATIVE_ASSETS_DIR}"
    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
-   COMPONENT Runtime)
+   COMPONENT Runtime
+   OPTIONAL)
 
 # Fully re-copy the assets directory on each build to avoid having stale files
 # from a previous install.

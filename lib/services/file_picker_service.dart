@@ -1,5 +1,4 @@
 import 'package:file_selector/file_selector.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:crypto/crypto.dart';
 
@@ -9,6 +8,9 @@ import 'package:flutter/services.dart';
 import 'package:universal_html/html.dart' as web_html;
 import 'android_saf_service.dart';
 import 'security_bookmark_service.dart';
+import 'harmony_local_media_service.dart';
+import 'package:nipaplay/utils/platform_identity.dart' as platformIdentity;
+import 'package:nipaplay/utils/mpv_utils.dart';
 import 'package:nipaplay/utils/storage_service.dart';
 import 'dart:io' as io;
 
@@ -17,7 +19,8 @@ class FilePickerService {
   static final FilePickerService _instance = FilePickerService._internal();
   static final Map<String, String> _webObjectUrls = <String, String>{};
   static final Map<String, String> _webMimeTypes = <String, String>{};
-  static final Map<String, _WebFileInfo> _webFileInfo = <String, _WebFileInfo>{};
+  static final Map<String, _WebFileInfo> _webFileInfo =
+      <String, _WebFileInfo>{};
   static const int _webHashMaxBytes = 16 * 1024 * 1024;
 
   factory FilePickerService() {
@@ -339,16 +342,20 @@ class FilePickerService {
 
   Future<String?> _pickVideoFileWeb() async {
     try {
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.video,
-        withData: true,
+      final XFile? file = await openFile(
+        acceptedTypeGroups: const [
+          XTypeGroup(
+            label: '视频文件',
+            extensions: ['mp4', 'mkv', 'avi', 'wmv', 'mov', 'webm'],
+            mimeTypes: ['video/*'],
+          ),
+        ],
       );
-      if (result == null || result.files.isEmpty) {
+      if (file == null) {
         return null;
       }
-      final file = result.files.single;
-      final bytes = file.bytes;
-      if (bytes == null || bytes.isEmpty) {
+      final bytes = await file.readAsBytes();
+      if (bytes.isEmpty) {
         return null;
       }
       final hashBytes = bytes.length > _webHashMaxBytes
@@ -358,8 +365,8 @@ class FilePickerService {
       _registerWebFileInfo(file.name, fileHash, bytes.length);
 
       final resolvedMimeType = resolveWebMimeType(fileName: file.name);
-      final blob =
-          web_html.Blob([bytes], resolvedMimeType ?? 'application/octet-stream');
+      final blob = web_html.Blob(
+          [bytes], resolvedMimeType ?? 'application/octet-stream');
       final url = web_html.Url.createObjectUrlFromBlob(blob);
       _registerWebObjectUrl(file.name, url, mimeType: resolvedMimeType);
       return file.name;
@@ -461,6 +468,7 @@ class FilePickerService {
           }
         ],
         'confirmButtonText': '选择视频文件',
+        'preserveContentUri': true,
       });
 
       if (result == null || result.isEmpty) {
@@ -508,7 +516,7 @@ class FilePickerService {
       // 定义字幕文件类型组
       XTypeGroup subtitleGroup = XTypeGroup(
         label: '字幕文件',
-        extensions: const ['srt', 'ass', 'ssa', 'sub', 'sup'],
+        extensions: const ['srt', 'ass', 'ssa', 'sub', 'sup', 'idx'],
         uniformTypeIdentifiers: io.Platform.isIOS
             ? [
                 'public.text',
@@ -570,6 +578,13 @@ class FilePickerService {
     try {
       initialDirectory ??= await _getLastDirectory(_lastExternalPlayerDirKey);
 
+      // Homebrew formula 不会创建 mpv.app。首次选择时直接打开已检测到的 mpv
+      // 所在目录，避免用户必须手动输入隐藏的 /opt 路径。
+      if (io.Platform.isMacOS && initialDirectory == null) {
+        final detected = await detectInstalledMpv();
+        if (detected != null) initialDirectory = p.dirname(detected);
+      }
+
       if (io.Platform.isMacOS && initialDirectory != null) {
         final resolvedPath =
             await SecurityBookmarkService.resolveBookmark(initialDirectory);
@@ -580,15 +595,18 @@ class FilePickerService {
 
       XTypeGroup? typeGroup;
       if (io.Platform.isWindows) {
-        typeGroup = XTypeGroup(
+        typeGroup = const XTypeGroup(
           label: '播放器程序',
-          extensions: const ['exe', 'lnk'],
+          extensions: ['exe', 'lnk'],
         );
       } else if (io.Platform.isMacOS) {
         typeGroup = const XTypeGroup(
-          label: '应用程序',
+          label: '播放器应用或可执行文件',
           extensions: ['app'],
-          uniformTypeIdentifiers: ['com.apple.application-bundle'],
+          uniformTypeIdentifiers: [
+            'com.apple.application-bundle',
+            'public.unix-executable',
+          ],
         );
       }
 
@@ -619,6 +637,21 @@ class FilePickerService {
     }
   }
 
+  /// Android SAF tree URI -> 文件系统路径。仅转换 primary（内部存储），
+  /// 因为 app 有 MANAGE_EXTERNAL_STORAGE 可直接访问 /storage/emulated/0/。
+  /// SD/OTG 的 tree URI 无法可靠转路径，保留 content:// 走 SAF 分支。
+  /// 这样普通存储恢复 io.File/io.Directory 兼容（浏览/播放/扫描全走原路径），
+  /// 只有 SD/OTG 才走 PR#599 的 SAF content:// 路径。
+  String _safTreeUriToPath(String treeUri) {
+    final path = AndroidSafService.tryConvertToFilePath(treeUri);
+    if (path == treeUri) return treeUri; // 未转换（SD/OTG 或非 tree URI）
+    // primary 转换后验证可访问（MANAGE_EXTERNAL_STORAGE），不可访问则保留 content://
+    if (io.Directory(path).existsSync()) {
+      return path;
+    }
+    return treeUri;
+  }
+
   // 选择文件夹
   Future<String?> pickDirectory({String? initialDirectory}) async {
     try {
@@ -630,8 +663,10 @@ class FilePickerService {
         if (selectedDirectory == null) {
           return null;
         }
-        await _saveLastDirectory(selectedDirectory, _lastDirKey);
-        return _normalizePath(selectedDirectory);
+        // primary tree URI 转文件路径（io.File 兼容），SD/OTG 保留 content://
+        final resolved = _safTreeUriToPath(selectedDirectory);
+        await _saveLastDirectory(resolved, _lastDirKey);
+        return _normalizePath(resolved);
       }
 
       // macOS上尝试恢复之前的书签访问
@@ -714,6 +749,9 @@ class FilePickerService {
 
   // 获取文件的有效路径(处理iOS路径问题)
   Future<String?> getValidFilePath(String originalPath) async {
+    if (platformIdentity.isHarmonyOS && originalPath.startsWith('/')) {
+      await HarmonyLocalMediaService.ensureDirectoryAccess(p.dirname(originalPath));
+    }
     // macOS沙盒下首先尝试恢复书签访问
     if (io.Platform.isMacOS) {
       final resolvedPath =
@@ -769,7 +807,7 @@ class FilePickerService {
         'acceptedTypeGroups': [
           {
             'label': '字幕文件',
-            'extensions': ['srt', 'ass', 'ssa', 'sub'],
+            'extensions': ['srt', 'ass', 'ssa', 'sub', 'sup', 'idx'],
           }
         ],
         'confirmButtonText': '选择字幕文件',

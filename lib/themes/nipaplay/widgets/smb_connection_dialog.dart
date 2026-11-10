@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:nipaplay/services/smb_service.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_dialog.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/tvos_remote_text_input_scope.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
 
 class SMBConnectionDialog {
@@ -45,6 +46,8 @@ class _SMBConnectionFormState extends State<_SMBConnectionForm> {
   final _nameController = TextEditingController();
   final _hostController = TextEditingController();
   final _portController = TextEditingController();
+  final _wanHostController = TextEditingController();
+  final _wanPortController = TextEditingController();
   final _domainController = TextEditingController();
   final _usernameController = TextEditingController();
   final _passwordController = TextEditingController();
@@ -78,6 +81,15 @@ class _SMBConnectionFormState extends State<_SMBConnectionForm> {
         }
         return resolvedBase;
       }),
+      backgroundColor: WidgetStateProperty.resolveWith((states) =>
+          states.contains(WidgetState.focused)
+              ? _accentColor.withValues(alpha: 0.18)
+              : Colors.transparent),
+      side: WidgetStateProperty.resolveWith((states) => BorderSide(
+          color: states.contains(WidgetState.focused)
+              ? _accentColor
+              : Colors.transparent,
+          width: 2)),
       overlayColor: MaterialStateProperty.all(Colors.transparent),
       splashFactory: NoSplash.splashFactory,
       padding: MaterialStateProperty.all(
@@ -94,11 +106,14 @@ class _SMBConnectionFormState extends State<_SMBConnectionForm> {
       _nameController.text = connection.name;
       _hostController.text = connection.host;
       _portController.text = connection.port.toString();
+      _wanHostController.text = connection.wanHost;
+      _wanPortController.text = connection.wanPort.toString();
       _domainController.text = connection.domain;
       _usernameController.text = connection.username;
       _passwordController.text = connection.password;
     } else {
       _portController.text = '445';
+      _wanPortController.text = '445';
     }
   }
 
@@ -107,6 +122,8 @@ class _SMBConnectionFormState extends State<_SMBConnectionForm> {
     _nameController.dispose();
     _hostController.dispose();
     _portController.dispose();
+    _wanHostController.dispose();
+    _wanPortController.dispose();
     _domainController.dispose();
     _usernameController.dispose();
     _passwordController.dispose();
@@ -117,122 +134,177 @@ class _SMBConnectionFormState extends State<_SMBConnectionForm> {
   Widget build(BuildContext context) {
     return TextSelectionTheme(
       data: _selectionTheme,
-      child: Form(
-        key: _formKey,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              'SMB服务器支持Samba/CIFS共享，可在局域网中直接浏览视频文件。\n'
-              '建议优先使用IP地址并确保设备在同一网络内。',
-              style: TextStyle(
-                color: _subTextColor,
-                fontSize: 13,
+      child: TvOSRemoteTextInputGroup(
+        title: widget.editConnection == null ? '添加 SMB 服务器' : '编辑 SMB 服务器',
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'SMB服务器支持Samba/CIFS共享，可在局域网中直接浏览视频文件。\n'
+                '建议优先使用IP地址并确保设备在同一网络内。',
+                style: TextStyle(
+                  color: _subTextColor,
+                  fontSize: 13,
+                ),
+                textAlign: TextAlign.center,
               ),
-              textAlign: TextAlign.center,
-            ),
-            SizedBox(height: 20),
-            _buildTextField(
-              controller: _nameController,
-              label: '连接名称（可选）',
-              hint: '留空则使用主机名',
-            ),
-            SizedBox(height: 14),
-            _buildTextField(
-              controller: _hostController,
-              label: '主机/IP 地址',
-              hint: '例如：192.168.1.10 或 nas.local（IPv6: [fe80::1]）',
-              validator: (value) {
-                if (value == null || value.trim().isEmpty) {
-                  return '请输入主机或IP地址';
-                }
-                if (value.contains('://')) {
-                  return '无需包含协议，请直接输入主机或IP';
-                }
-                return null;
-              },
-            ),
-            SizedBox(height: 14),
-            _buildTextField(
-              controller: _portController,
-              label: '端口',
-              hint: '默认 445',
-              keyboardType: TextInputType.number,
-              validator: (value) {
-                final trimmed = value?.trim() ?? '';
-                if (trimmed.isEmpty) {
+              SizedBox(height: 20),
+              _buildTextField(
+                controller: _nameController,
+                fieldId: 'name',
+                label: '连接名称（可选）',
+                hint: '留空则使用主机名',
+              ),
+              SizedBox(height: 14),
+              _buildTextField(
+                controller: _hostController,
+                fieldId: 'host',
+                label: '内网主机/IP 地址',
+                hint: '例如：192.168.1.10 或 nas.local（IPv6: [fe80::1]）',
+                validator: (value) {
+                  final trimmed = value?.trim() ?? '';
+                  if (trimmed.isNotEmpty && trimmed.contains('://')) {
+                    return '无需包含协议，请直接输入主机或IP';
+                  }
+                  if (_hostController.text.trim().isEmpty &&
+                      _wanHostController.text.trim().isEmpty) {
+                    return '请至少填写内网主机或公网主机其中之一';
+                  }
                   return null;
-                }
-                final port = int.tryParse(trimmed);
-                if (port == null || port <= 0 || port > 65535) {
-                  return '端口范围应为 1-65535';
-                }
-                return null;
-              },
-            ),
-            SizedBox(height: 14),
-            _buildTextField(
-              controller: _domainController,
-              label: '域（可选）',
-              hint: '多数情况下可留空',
-            ),
-            SizedBox(height: 14),
-            _buildTextField(
-              controller: _usernameController,
-              label: '用户名（可选）',
-              hint: '留空将使用匿名访问',
-            ),
-            SizedBox(height: 14),
-            _buildTextField(
-              controller: _passwordController,
-              label: '密码（可选）',
-              hint: '留空将使用匿名访问',
-              obscureText: !_passwordVisible,
-              suffixIcon: IconButton(
-                icon: Icon(
-                  _passwordVisible ? Icons.visibility : Icons.visibility_off,
-                  color: _accentColor,
-                ),
-                onPressed: () {
-                  setState(() {
-                    _passwordVisible = !_passwordVisible;
-                  });
                 },
-                style: IconButton.styleFrom(
-                  overlayColor: Colors.transparent,
+              ),
+              SizedBox(height: 14),
+              _buildTextField(
+                controller: _portController,
+                fieldId: 'port',
+                label: '内网端口',
+                hint: '默认 445',
+                keyboardType: TextInputType.number,
+                validator: (value) {
+                  final trimmed = value?.trim() ?? '';
+                  if (trimmed.isEmpty) {
+                    return null;
+                  }
+                  final port = int.tryParse(trimmed);
+                  if (port == null || port <= 0 || port > 65535) {
+                    return '端口范围应为 1-65535';
+                  }
+                  return null;
+                },
+              ),
+              SizedBox(height: 14),
+              _buildTextField(
+                controller: _wanHostController,
+                fieldId: 'wanHost',
+                label: '公网主机/IP 地址（可选）',
+                hint: '例如：your-domain.com 或公网IP',
+                validator: (value) {
+                  final trimmed = value?.trim() ?? '';
+                  if (trimmed.isNotEmpty && trimmed.contains('://')) {
+                    return '无需包含协议，请直接输入主机或IP';
+                  }
+                  return null;
+                },
+              ),
+              SizedBox(height: 14),
+              _buildTextField(
+                controller: _wanPortController,
+                fieldId: 'wanPort',
+                label: '公网端口',
+                hint: '默认 445',
+                keyboardType: TextInputType.number,
+                validator: (value) {
+                  final trimmed = value?.trim() ?? '';
+                  if (trimmed.isEmpty) {
+                    return null;
+                  }
+                  final port = int.tryParse(trimmed);
+                  if (port == null || port <= 0 || port > 65535) {
+                    return '端口范围应为 1-65535';
+                  }
+                  return null;
+                },
+              ),
+              SizedBox(height: 14),
+              _buildTextField(
+                controller: _domainController,
+                fieldId: 'domain',
+                label: '域（可选）',
+                hint: '多数情况下可留空',
+              ),
+              SizedBox(height: 14),
+              _buildTextField(
+                controller: _usernameController,
+                fieldId: 'username',
+                label: '用户名（可选）',
+                hint: '留空将使用匿名访问',
+              ),
+              SizedBox(height: 14),
+              _buildTextField(
+                controller: _passwordController,
+                fieldId: 'password',
+                label: '密码（可选）',
+                hint: '留空将使用匿名访问',
+                obscureText: !_passwordVisible,
+                suffixIcon: IconButton(
+                  icon: Icon(
+                    _passwordVisible ? Icons.visibility : Icons.visibility_off,
+                    color: _accentColor,
+                  ),
+                  onPressed: () {
+                    setState(() {
+                      _passwordVisible = !_passwordVisible;
+                    });
+                  },
+                  style: IconButton.styleFrom(
+                    overlayColor: Colors.transparent,
+                  ).copyWith(
+                    backgroundColor: WidgetStateProperty.resolveWith((states) =>
+                        states.contains(WidgetState.focused)
+                            ? _accentColor.withValues(alpha: 0.18)
+                            : Colors.transparent),
+                    side: WidgetStateProperty.resolveWith((states) =>
+                        BorderSide(
+                            color: states.contains(WidgetState.focused)
+                                ? _accentColor
+                                : Colors.transparent,
+                            width: 2)),
+                  ),
                 ),
               ),
-            ),
-            SizedBox(height: 24),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                TextButton(
-                  onPressed: _isSubmitting
-                      ? null
-                      : () => Navigator.of(context).pop(false),
-                  style: _plainButtonStyle(),
-                  child: const Text('取消'),
-                ),
-                SizedBox(width: 12),
-                TextButton(
-                  onPressed: _isSubmitting ? null : _handleSubmit,
-                  style: _plainButtonStyle(baseColor: _accentColor),
-                  child: _isSubmitting
-                      ? SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            valueColor:
-                                AlwaysStoppedAnimation<Color>(_accentColor),
-                          ),
-                        )
-                      : const Text('保存'),
-                ),
-              ],
-            ),
-          ],
+              SizedBox(height: 24),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: _isSubmitting
+                        ? null
+                        : () => Navigator.of(context).pop(false),
+                    style: _plainButtonStyle(),
+                    child: const Text('取消'),
+                  ),
+                  SizedBox(width: 12),
+                  TextButton(
+                    onPressed: _isSubmitting ? null : _handleSubmit,
+                    style: _plainButtonStyle(baseColor: _accentColor),
+                    child: _isSubmitting
+                        ? SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor:
+                                  AlwaysStoppedAnimation<Color>(_accentColor),
+                            ),
+                          )
+                        : const Text('保存'),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -240,40 +312,56 @@ class _SMBConnectionFormState extends State<_SMBConnectionForm> {
 
   Widget _buildTextField({
     required TextEditingController controller,
+    required String fieldId,
     required String label,
     String? hint,
     String? Function(String?)? validator,
     TextInputType? keyboardType,
     bool obscureText = false,
+    bool required = false,
     Widget? suffixIcon,
   }) {
-    return TextFormField(
-      controller: controller,
-      validator: validator,
-      keyboardType: keyboardType,
+    return TvOSRemoteTextInputControl(
+      title: label,
+      fieldId: fieldId,
+      required: required,
       obscureText: obscureText,
-      cursorColor: _accentColor,
-      style: TextStyle(color: _textColor),
-      decoration: InputDecoration(
-        labelText: label,
-        labelStyle: TextStyle(color: _subTextColor),
-        hintText: hint,
-        hintStyle: TextStyle(color: _mutedTextColor),
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(8),
-          borderSide: BorderSide(color: _borderColor),
+      child: TextFormField(
+        controller: controller,
+        validator: validator,
+        keyboardType: fieldId == 'password'
+            ? TextInputType.visiblePassword
+            : keyboardType,
+        autocorrect: fieldId != 'password',
+        enableSuggestions: fieldId != 'password',
+        smartDashesType:
+            fieldId == 'password' ? SmartDashesType.disabled : null,
+        smartQuotesType:
+            fieldId == 'password' ? SmartQuotesType.disabled : null,
+        obscureText: obscureText,
+        cursorColor: _accentColor,
+        style: TextStyle(color: _textColor),
+        decoration: InputDecoration(
+          labelText: label,
+          labelStyle: TextStyle(color: _subTextColor),
+          hintText: hint,
+          hintStyle: TextStyle(color: _mutedTextColor),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: BorderSide(color: _borderColor),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: BorderSide(color: _borderColor),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: BorderSide(color: _accentColor),
+          ),
+          filled: true,
+          fillColor: _fillColor,
+          suffixIcon: suffixIcon,
         ),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(8),
-          borderSide: BorderSide(color: _borderColor),
-        ),
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(8),
-          borderSide: BorderSide(color: _accentColor),
-        ),
-        filled: true,
-        fillColor: _fillColor,
-        suffixIcon: suffixIcon,
       ),
     );
   }
@@ -291,11 +379,15 @@ class _SMBConnectionFormState extends State<_SMBConnectionForm> {
     final port = int.tryParse(_portController.text.trim()) ??
         widget.editConnection?.port ??
         445;
+    final wanPort = int.tryParse(_wanPortController.text.trim()) ?? 445;
 
     final connection = SMBConnection(
+      id: widget.editConnection?.id,
       name: _nameController.text.trim(),
       host: _hostController.text.trim(),
       port: port,
+      wanHost: _wanHostController.text.trim(),
+      wanPort: wanPort,
       username: _usernameController.text.trim(),
       password: _passwordController.text,
       domain: _domainController.text.trim(),

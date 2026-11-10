@@ -4,20 +4,54 @@
 
 当你用 VS Code 打开项目并让 Codex 一起辅助阅读时，请优先关注 `lib` 文件夹。应用绝大部分的产品逻辑、播放器状态、主题 UI 和服务集成，都在这里。
 
-## 先记住这 4 条主线
+## 先记住这 5 条主线
 
-如果你只想先理解最重要的架构，请先抓住下面这 4 条线：
+如果你只想先理解最重要的架构，请先抓住下面这 5 条线：
 
 1.  `lib/main.dart`: 应用启动入口，负责初始化和注册全局 Provider。
 2.  `lib/themes/`: 真正的页面和组件 UI，大量界面实现都分主题放在这里。
 3.  `lib/utils/video_player_state.dart` 与 `lib/utils/video_player_state/`: 播放器状态中心，几乎所有播放行为都会经过它。
 4.  `lib/player_abstraction/` 与 `lib/danmaku_abstraction/`: 可插拔内核层，让我们可以切换播放器与弹幕实现。
+5.  `lib/plugins/`: JavaScript 插件系统，允许通过 JS 脚本扩展播放器功能。
 
 你可以把它理解成：
 
 *   `themes/` 是“你看到的界面”
 *   `VideoPlayerState` 是“控制播放的一层总调度”
 *   `player_abstraction/` 和 `danmaku_abstraction/` 是“真正对接底层内核的一层适配器”
+*   `plugins/` 是“用户和社区可以自由扩展功能的入口”
+
+## 顶层目录速览
+
+仓库根目录里同时放了 Flutter 平台工程、应用源码、本地 packages、原生扩展、第三方 fork、打包脚本和文档。第一次浏览时，可以先按下面的分组建立地图：
+
+*   **Flutter 平台工程**
+    *   `android/`、`ios/`、`linux/`、`macos/`、`windows/`、`web/`: Flutter 为各平台生成并维护的宿主工程。
+    *   `ohos/`、`harmonyos_test/`: OpenHarmony/HarmonyOS 相关工程与验证内容。
+
+*   **应用核心代码**
+    *   `lib/`: 主应用的 Dart 代码，包含页面、主题、播放器状态、弹幕、服务、Provider、模型和共享组件。
+    *   `assets/`: 应用运行时资源，例如图片、图标、shader、插件资源和 Web 资源。
+    *   `test/`: Dart/Flutter 测试入口。
+
+*   **本地 packages 与原生扩展**
+    *   `packages/`: 仓库内维护或定制的 Dart/Flutter package，例如 `media_kit`、`media_kit_video`、`nipaplay_smb2` 等。
+    *   `cpp_native/`: C/C++ 原生模块、头文件、脚本和测试。
+    *   `rust/`、`rust_builder/`: Rust 代码与跨平台构建辅助工程。
+
+*   **第三方代码与上游快照**
+    *   `third_party/`: 第三方库、上游 fork 或 vendored 代码，例如 mpv、libplacebo、media-kit upstream、volume_controller 等。
+    *   这里的改动通常需要格外谨慎，优先确认是在同步上游、打补丁，还是只在本项目内做适配。
+
+*   **脚本、打包和辅助工具**
+    *   `scripts/`、`tools/`: 开发、构建、打包或维护脚本。
+    *   `server/`、`web-remote/`: 远程播放、Web 端或配套服务相关代码。
+    *   `AppIcons/`、`icons/`: 应用图标源文件和平台图标资源。
+
+*   **文档与贡献指南**
+    *   `CONTRIBUTING_GUIDE/`: 面向贡献者的分章节指南。
+    *   `Documentation/`、`docs/`: 项目说明、开发记录和补充文档。
+    *   `.github/`: GitHub Issue 模板、工作流和仓库协作配置。
 
 ## `lib` 文件夹：项目核心分层
 
@@ -70,16 +104,29 @@
         *   `mdk_player_adapter.dart`
         *   `media_kit_player_adapter.dart`
         *   `video_player_adapter.dart`
-    *   这层的意义是：UI 和 `VideoPlayerState` 不直接依赖某个具体播放器 SDK，而是通过统一接口工作。这样我们才能支持 FVP(MDK)、Media Kit(libmpv)、Video Player 等不同内核。
+    *   这层的意义是：UI 和 `VideoPlayerState` 不直接依赖某个具体播放器 SDK，而是通过统一接口工作。这样我们才能支持自研的 [Erika](https://github.com/AimesSoft/Erika) 内核（Rust；按平台使用 Metal、D3D11 或 wgpu/Vulkan）、FVP(MDK)、Media Kit（libmpv）和 Video Player 等不同内核。Media Kit 是 libmpv 的 Flutter 接入，不是独立内核。
+    *   **Erika 是当前重点发展的自研内核**，它的代码在独立仓库 [AimesSoft/Erika](https://github.com/AimesSoft/Erika)，并以 git dependency 的形式引入其中的 `packages/erika_flutter/` Flutter 插件接入 NipaPlay。
 
-*   `lib/danmaku_abstraction/`、`lib/danmaku_gpu/`、`lib/danmaku_next/`
-    *   这是弹幕系统的核心区域。
+*   `lib/danmaku_abstraction/`、`lib/danmaku_gpu/`、`lib/danmaku_next/`、`lib/danmaku_dfm/`
+    *   这是弹幕系统的核心区域。项目支持多种弹幕引擎：
+        *   **NipaPlay Next**（默认）：自研弹幕逻辑内核
+        *   **NipaPlay Next++**：Next 的激进优化版本
+        *   **Next2**：Next2 逻辑 + Rust 原生渲染
+        *   **DFM+**：基于 B 站 DanmakuFlameMaster 算法 + Rust + GPU 渲染
+        *   **GPU / Canvas / CPU**：不同渲染策略
     *   `danmaku_abstraction/` 负责定义统一的数据结构和渲染抽象。
-    *   `danmaku_gpu/` 负责 GPU 渲染相关实现。
-    *   `danmaku_next/` 是当前项目很重要的一套弹幕逻辑实现。
+    *   `danmaku_gpu/` 负责 GPU 渲染相关实现（含 MSDF 字体渲染）。
+    *   `danmaku_next/` 是 NipaPlay Next/Next2 弹幕引擎实现。
+    *   `danmaku_dfm/` 是 DFM+ 弹幕引擎支持。
+
+*   `lib/plugins/`
+    *   JavaScript 插件系统。NipaPlay 支持通过 JS 脚本扩展功能。
+    *   `plugin_service.dart`：插件服务管理
+    *   `js_runtime_factory.dart`：JS 运行时工厂（分 IO 和 Web 平台实现）
+    *   插件可以操控播放器、弹幕、UI、存储等，详见 `Documentation/js-plugin-api.md`。
 
 *   `lib/services/`
-    *   处理外部交互和“脏活累活”，例如网络请求、弹弹play、Jellyfin/Emby/WebDAV、日志、文件选择、播放同步等。
+    *   处理外部交互和“脏活累活”，例如网络请求、弹弹play、Jellyfin/Emby/WebDAV、日志、文件选择、播放同步、AI 防剧透等。
     *   如果你要改的是“和外部服务打交道”的逻辑，优先看这里。
 
 *   `lib/providers/`
@@ -122,8 +169,15 @@
     *   优先看 `lib/danmaku_abstraction/`
     *   再看 `lib/danmaku_gpu/` 与 `lib/danmaku_next/`
 
+*   **改插件系统、JS 运行时、插件 API**:
+    *   优先看 `lib/plugins/`
+
+*   **改 AI 防剧透、弹幕智能过滤**:
+    *   优先看 `lib/services/danmaku_spoiler_filter_service.dart`
+
 *   **改设置项持久化、主题、账号、媒体服务器逻辑**:
     *   优先看 `lib/providers/` 和 `lib/services/`
+    *   实验室功能相关：`lib/providers/labs_settings_provider.dart`
 
 ## 一个简单的例子
 
@@ -151,7 +205,7 @@
 
 现在你应该已经对 NipaPlay-Reload 的项目结构有了更贴近实战的认识。请优先记住这句话：
 
-**UI 在 `themes/`，播放核心在 `VideoPlayerState`，底层能力在 `player_abstraction/` 和弹幕相关抽象层。**
+**UI 在 `themes/`，播放核心在 `VideoPlayerState`，底层能力在 `player_abstraction/` 和弹幕相关抽象层，扩展能力在 `plugins/`。**
 
 只要先抓住这条线，大多数需求都能快速找到切入点。
 

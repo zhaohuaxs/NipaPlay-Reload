@@ -1,4 +1,8 @@
+import 'dart:convert';
 import 'package:xml/xml.dart';
+import 'package:flutter/foundation.dart';
+import 'package:nipaplay/constants/danmaku/mode.dart';
+import 'package:nipaplay/cpp_native/bindings/danmaku_parser.dart';
 
 String encodeDanmakuXmlText(String input) {
   return input
@@ -19,6 +23,30 @@ String decodeDanmakuXmlText(String input) {
 }
 
 Map<String, dynamic> convertBilibiliXmlDanmakuToJson(String xmlContent) {
+  // 优先使用 C++ 解析器（非 Web 平台）
+  if (!kIsWeb) {
+    try {
+      final jsonStr = DanmakuParser.parseXml(xmlContent);
+      if (jsonStr != null) {
+        final decoded = jsonDecode(jsonStr) as Map<String, dynamic>;
+        final count = decoded['count'];
+        // 防御性检查: 如果 C++ 返回 0 条弹幕但 XML 明显包含 <d 标签，
+        // 可能是 FFI content_len 传错、XML 被截断等异常情况，
+        // 应 fallback 到 Dart 而非返回空列表导致弹幕消失。
+        if (count == 0 && xmlContent.contains('<d')) {
+          final comments = parseBilibiliXmlDanmakuComments(xmlContent);
+          return {'count': comments.length, 'comments': comments};
+        }
+        debugPrint('[DanmakuParser] [C++] [OK] convertBilibiliXml: '
+            '${decoded['count']} comments via C++ path');
+        return decoded;
+      }
+    } catch (_) {
+      debugPrint('[DanmakuParser] [C++] [ERR] convertBilibiliXml: '
+          'C++ exception, falling back to Dart');
+    }
+  }
+  // Fallback: 原 Dart 实现
   final comments = parseBilibiliXmlDanmakuComments(xmlContent);
   return {
     'count': comments.length,
@@ -83,25 +111,17 @@ Map<String, dynamic>? _buildBilibiliDanmakuComment({
     final fontSize = int.tryParse(pParams[2]) ?? 25;
     final colorCode = int.tryParse(pParams[3]) ?? 16777215;
 
-    String danmakuType;
-    switch (typeCode) {
-      case 4:
-        danmakuType = 'bottom';
-        break;
-      case 5:
-        danmakuType = 'top';
-        break;
-      case 1:
-      case 6:
-      default:
-        danmakuType = 'scroll';
-        break;
-    }
+    final danmakuType = DanmakuMode.fromCode(typeCode).typeName;
 
     final r = (colorCode >> 16) & 0xFF;
     final g = (colorCode >> 8) & 0xFF;
     final b = colorCode & 0xFF;
     final color = 'rgb($r,$g,$b)';
+
+    // 可选字段: timestamp, senderId, cid
+    final timestamp = pParams.length > 4 ? int.tryParse(pParams[4]) : null;
+    final senderId = pParams.length > 6 ? pParams[6].trim() : '';
+    final danmakuId = pParams.length > 7 ? pParams[7].trim() : '';
 
     return {
       't': time,
@@ -110,6 +130,11 @@ Map<String, dynamic>? _buildBilibiliDanmakuComment({
       'r': color,
       'fontSize': fontSize,
       'originalType': typeCode,
+
+      if (timestamp != null && timestamp > 0) 'timestamp': timestamp,
+      if (senderId.isNotEmpty && senderId != '0') 'senderId': senderId,
+      if (danmakuId.isNotEmpty && danmakuId != '0') 'cid': danmakuId,
+      'source': 'bilibili', // 标记来源, 便于后续处理
     };
   } catch (_) {
     return null;

@@ -1,16 +1,23 @@
+import 'package:nipaplay/models/media_library_scope.dart';
 import 'dart:convert';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:provider/provider.dart';
 import 'package:nipaplay/models/bangumi_model.dart';
 import 'package:nipaplay/models/playable_item.dart';
 import 'package:nipaplay/models/shared_remote_library.dart';
 import 'package:nipaplay/models/watch_history_model.dart';
 import 'package:nipaplay/services/bangumi_service.dart';
 import 'package:nipaplay/services/dandanplay_service.dart';
+import 'package:nipaplay/services/dandanplay_http_client.dart'
+    show DandanplayLoginRequired;
+import 'package:nipaplay/widgets/dandanplay_login_required_view.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
 import 'package:nipaplay/services/playback_service.dart';
+import 'package:nipaplay/services/large_screen_ui_sfx_service.dart';
 import 'package:nipaplay/services/web_remote_access_service.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/cached_network_image_widget.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/large_screen_bottom_hint_overlay.dart';
@@ -18,25 +25,56 @@ import 'package:nipaplay/themes/nipaplay/widgets/large_screen_focusable_action.d
 import 'package:nipaplay/themes/nipaplay/widgets/large_screen_home_scope.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/large_screen_input_controls.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/large_screen_top_status_overlay.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/tv_safe_blur.dart';
 
 const double _kLargeScreenEpisodeCardWidth = 250;
 const double _kLargeScreenEpisodeCardGap = 10;
 const double _kLargeScreenEpisodeRailHeight = 172;
 
+/// 大屏详情页里一季剧集的展示条目。
+///
+/// 可能来自 Bangumi/弹弹play 的剧集列表（[episode] 非空），也可能只来自
+/// 共享媒体库（WebDAV 等）里没有匹配到具体剧集编号的文件。后者此前会被
+/// 直接丢弃（episodeId == null 即跳过），导致这些文件在遥控端永远无法播放。
+class _EpisodeEntry {
+  const _EpisodeEntry({
+    this.episode,
+    this.sharedEpisode,
+    this.sharedPlayable,
+    this.history,
+  });
+
+  final EpisodeData? episode;
+  final SharedRemoteEpisode? sharedEpisode;
+  final PlayableItem? sharedPlayable;
+  final WatchHistoryItem? history;
+
+  bool get hasPlayableSource =>
+      (sharedEpisode != null &&
+          sharedEpisode!.fileExists &&
+          sharedPlayable != null) ||
+      (history != null && history!.filePath.isNotEmpty);
+}
+
 class NipaplayLargeScreenAnimeDetailPage extends StatefulWidget {
   const NipaplayLargeScreenAnimeDetailPage({
     super.key,
     required this.animeId,
+    this.mediaLibraryScope,
     this.sharedSummary,
     this.sharedEpisodeLoader,
     this.sharedEpisodeBuilder,
     this.sharedSourceLabel,
+    this.animeLoader,
   });
 
+  final MediaLibraryScope? mediaLibraryScope;
   final int animeId;
+  final Future<BangumiAnime> Function(int animeId)? animeLoader;
   final SharedRemoteAnimeSummary? sharedSummary;
   final Future<List<SharedRemoteEpisode>> Function()? sharedEpisodeLoader;
-  final PlayableItem Function(SharedRemoteEpisode episode)? sharedEpisodeBuilder;
+  final PlayableItem Function(SharedRemoteEpisode episode)?
+      sharedEpisodeBuilder;
   final String? sharedSourceLabel;
 
   @override
@@ -64,7 +102,7 @@ class _NipaplayLargeScreenAnimeDetailPageState
 
   BangumiAnime? _anime;
   bool _isLoading = true;
-  String? _error;
+  Object? _error;
 
   bool _isEpisodeListReversed = false;
   bool _isEpisodeAreaActive = false;
@@ -78,6 +116,9 @@ class _NipaplayLargeScreenAnimeDetailPageState
   final Map<int, SharedRemoteEpisode> _sharedEpisodeMap =
       <int, SharedRemoteEpisode>{};
   final Map<int, PlayableItem> _sharedPlayableMap = <int, PlayableItem>{};
+  // 共享媒体库返回的全部剧集（含未匹配到剧集编号的文件），
+  // 由 _displayEntries 决定哪些条目需要单独展示。
+  final List<SharedRemoteEpisode> _sharedEpisodeList = <SharedRemoteEpisode>[];
 
   bool _isLoadingSharedEpisodes = false;
   String? _sharedEpisodesError;
@@ -89,7 +130,7 @@ class _NipaplayLargeScreenAnimeDetailPageState
     super.initState();
     FocusManager.instance.addEarlyKeyEventHandler(_handleEarlyKeyEvent);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
+      if (!mounted || !_isLoading || !_isCurrentRouteActive()) return;
       _inputFocusNode.requestFocus();
     });
     _loadPageData();
@@ -107,13 +148,46 @@ class _NipaplayLargeScreenAnimeDetailPageState
     super.dispose();
   }
 
-  List<EpisodeData> get _displayEpisodes {
+  List<_EpisodeEntry> get _displayEntries {
     final episodes = _anime?.episodeList ?? const <EpisodeData>[];
-    if (_isEpisodeListReversed) {
-      return episodes.reversed.toList(growable: false);
+    final entries = <_EpisodeEntry>[
+      for (final episode in episodes)
+        _EpisodeEntry(
+          episode: episode,
+          sharedEpisode: _sharedEpisodeMap[episode.id],
+          sharedPlayable: _sharedPlayableMap[episode.id],
+          history: _episodeHistoryMap[episode.id],
+        ),
+    ];
+
+    final builder = widget.sharedEpisodeBuilder;
+    if (builder != null) {
+      final matchedIds = <int>{for (final episode in episodes) episode.id};
+      for (final sharedEpisode in _sharedEpisodeList) {
+        final episodeId = sharedEpisode.episodeId;
+        // 已经能对上剧集列表的文件不再重复展示；没有剧集编号、或编号对
+        // 不上当前剧集列表的文件，追加为独立条目，保证始终可以播放。
+        if (episodeId != null && matchedIds.contains(episodeId)) {
+          continue;
+        }
+        final playable = builder(sharedEpisode)
+            .withMediaLibraryScope(widget.mediaLibraryScope);
+        entries.add(_EpisodeEntry(
+          sharedEpisode: sharedEpisode,
+          sharedPlayable: playable,
+          history: playable.historyItem,
+        ));
+      }
     }
-    return episodes;
+
+    if (_isEpisodeListReversed && entries.length > 1) {
+      return entries.reversed.toList(growable: false);
+    }
+    return entries;
   }
+
+  Object? _entryKey(_EpisodeEntry entry) =>
+      entry.episode?.id ?? entry.sharedEpisode?.shareId;
 
   List<FocusNode> get _controlFocusNodes {
     if (DandanplayService.isLoggedIn) {
@@ -161,25 +235,26 @@ class _NipaplayLargeScreenAnimeDetailPageState
     _episodeFocusNodes = <FocusNode>[];
   }
 
-  void _rebuildEpisodeFocusNodes({int? keepEpisodeId}) {
+  void _rebuildEpisodeFocusNodes({Object? keepEntryKey}) {
     _disposeEpisodeFocusNodes();
-    final episodes = _displayEpisodes;
+    final entries = _displayEntries;
     _episodeFocusNodes = List<FocusNode>.generate(
-      episodes.length,
+      entries.length,
       (index) => FocusNode(
-        debugLabel: 'large_screen_anime_detail_episode_${episodes[index].id}',
+        debugLabel: 'large_screen_anime_detail_episode_$index',
       ),
       growable: false,
     );
 
-    if (episodes.isEmpty) {
+    if (entries.isEmpty) {
       _selectedEpisodeIndex = 0;
       _isEpisodeAreaActive = false;
       return;
     }
 
-    if (keepEpisodeId != null) {
-      final matchedIndex = episodes.indexWhere((e) => e.id == keepEpisodeId);
+    if (keepEntryKey != null) {
+      final matchedIndex =
+          entries.indexWhere((entry) => _entryKey(entry) == keepEntryKey);
       if (matchedIndex >= 0) {
         _selectedEpisodeIndex = matchedIndex;
       }
@@ -187,8 +262,21 @@ class _NipaplayLargeScreenAnimeDetailPageState
     _selectedEpisodeIndex = _clampInt(
       _selectedEpisodeIndex,
       0,
-      episodes.length - 1,
+      entries.length - 1,
     );
+  }
+
+  /// 共享剧集/历史记录是异步到达的，到达后条目数量可能变化。
+  /// 只有数量真的变了才重建焦点节点，避免打断用户正在进行的导航。
+  void _syncEpisodeFocusNodes() {
+    if (_episodeFocusNodes.length == _displayEntries.length) {
+      return;
+    }
+    _rebuildEpisodeFocusNodes(keepEntryKey: _currentSelectedEntryKey());
+    if (_isEpisodeAreaActive && _episodeFocusNodes.isNotEmpty) {
+      _requestEpisodeFocus(_selectedEpisodeIndex);
+      _scrollToEpisodeIndex(_selectedEpisodeIndex, animate: false);
+    }
   }
 
   Future<void> _loadPageData() async {
@@ -201,7 +289,23 @@ class _NipaplayLargeScreenAnimeDetailPageState
     });
 
     try {
-      final anime = await _fetchAnimeDetails();
+      BangumiAnime anime;
+      try {
+        anime = await _fetchAnimeDetails();
+      } catch (_) {
+        final summary = widget.sharedSummary;
+        // A media library's own files must remain playable when optional
+        // online metadata is unavailable or requires a different account.
+        if (summary == null || widget.sharedEpisodeLoader == null) rethrow;
+        anime = BangumiAnime(
+          id: widget.animeId,
+          name: summary.name,
+          nameCn: summary.nameCn ?? summary.name,
+          imageUrl: summary.imageUrl ?? '',
+          summary: summary.summary,
+          episodeList: const [],
+        );
+      }
       if (!mounted) return;
 
       setState(() {
@@ -209,8 +313,8 @@ class _NipaplayLargeScreenAnimeDetailPageState
         _isLoading = false;
       });
 
-      final selectedEpisodeId = _currentSelectedEpisodeId();
-      _rebuildEpisodeFocusNodes(keepEpisodeId: selectedEpisodeId);
+      final selectedEntryKey = _currentSelectedEntryKey();
+      _rebuildEpisodeFocusNodes(keepEntryKey: selectedEntryKey);
 
       await Future.wait<void>(<Future<void>>[
         _loadEpisodeHistories(anime),
@@ -228,17 +332,19 @@ class _NipaplayLargeScreenAnimeDetailPageState
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _error = e.toString();
+        _error = e;
         _isLoading = false;
       });
-      _requestControlFocus(0);
+      // The error view has its own real focus targets, rather than the
+      // loaded page's close/favorite/sort selection model.
     }
   }
 
   Future<BangumiAnime> _fetchAnimeDetails() async {
+    if (widget.animeLoader != null) return widget.animeLoader!(widget.animeId);
     if (kIsWeb) {
-      final apiUri =
-          WebRemoteAccessService.apiUri('/api/bangumi/detail/${widget.animeId}');
+      final apiUri = WebRemoteAccessService.apiUri(
+          '/api/bangumi/detail/${widget.animeId}');
       if (apiUri == null) {
         throw Exception('未配置远程访问地址');
       }
@@ -267,10 +373,13 @@ class _NipaplayLargeScreenAnimeDetailPageState
     }
 
     final futures = episodes.map((episode) async {
-      final history = await WatchHistoryManager.getHistoryItemByEpisode(
-        anime.id,
-        episode.id,
-      );
+      final history = widget.mediaLibraryScope == null
+          ? await WatchHistoryManager.getHistoryItemByEpisode(
+              anime.id, episode.id)
+          : (await WatchHistoryManager.getMatchedItemsForEpisode(
+                  anime.id, episode.id))
+              .where(widget.mediaLibraryScope!.contains)
+              .firstOrNull;
       return MapEntry<int, WatchHistoryItem?>(episode.id, history);
     }).toList(growable: false);
 
@@ -323,7 +432,8 @@ class _NipaplayLargeScreenAnimeDetailPageState
   }
 
   Future<void> _loadSharedEpisodes() async {
-    if (widget.sharedEpisodeLoader == null || widget.sharedEpisodeBuilder == null) {
+    if (widget.sharedEpisodeLoader == null ||
+        widget.sharedEpisodeBuilder == null) {
       return;
     }
 
@@ -332,30 +442,38 @@ class _NipaplayLargeScreenAnimeDetailPageState
       _sharedEpisodesError = null;
       _sharedEpisodeMap.clear();
       _sharedPlayableMap.clear();
+      _sharedEpisodeList.clear();
     });
 
     try {
       final episodes = await widget.sharedEpisodeLoader!.call();
       if (!mounted) return;
       setState(() {
+        _sharedEpisodeList.addAll(episodes);
         for (final episode in episodes) {
           final episodeId = episode.episodeId;
           if (episodeId == null) {
+            // 未匹配到具体剧集编号的文件不进按编号索引的映射，
+            // 由 _displayEntries 追加为独立条目，保证可以播放。
             continue;
           }
           _sharedEpisodeMap[episodeId] = episode;
-          _sharedPlayableMap[episodeId] = widget.sharedEpisodeBuilder!(episode);
+          _sharedPlayableMap[episodeId] = widget.sharedEpisodeBuilder!(episode)
+              .withMediaLibraryScope(widget.mediaLibraryScope);
         }
         _isLoadingSharedEpisodes = false;
       });
+      _syncEpisodeFocusNodes();
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _sharedEpisodeMap.clear();
         _sharedPlayableMap.clear();
+        _sharedEpisodeList.clear();
         _sharedEpisodesError = e.toString();
         _isLoadingSharedEpisodes = false;
       });
+      _syncEpisodeFocusNodes();
     }
   }
 
@@ -371,13 +489,13 @@ class _NipaplayLargeScreenAnimeDetailPageState
       );
   }
 
-  int? _currentSelectedEpisodeId() {
-    final episodes = _displayEpisodes;
-    if (episodes.isEmpty) {
+  Object? _currentSelectedEntryKey() {
+    final entries = _displayEntries;
+    if (entries.isEmpty) {
       return null;
     }
-    final index = _clampInt(_selectedEpisodeIndex, 0, episodes.length - 1);
-    return episodes[index].id;
+    final index = _clampInt(_selectedEpisodeIndex, 0, entries.length - 1);
+    return _entryKey(entries[index]);
   }
 
   Future<void> _toggleFavorite() async {
@@ -422,37 +540,41 @@ class _NipaplayLargeScreenAnimeDetailPageState
     }
   }
 
-  Future<void> _playEpisode(EpisodeData episode) async {
+  Future<void> _playEpisode(_EpisodeEntry entry) async {
     final anime = _anime;
-    if (anime == null) return;
 
-    final sharedEpisode = _sharedEpisodeMap[episode.id];
-    final sharedPlayable = _sharedPlayableMap[episode.id];
-    final sharedPlayableAvailable =
-        sharedEpisode != null && sharedPlayable != null && sharedEpisode.fileExists;
-
-    if (sharedPlayableAvailable) {
-      await PlaybackService().play(sharedPlayable);
+    // 共享媒体库（WebDAV 等）的文件始终可以直接播放，
+    // 不要求它已经匹配到 Bangumi/弹弹play 的具体剧集编号。
+    final sharedEpisode = entry.sharedEpisode;
+    final sharedPlayable = entry.sharedPlayable;
+    if (sharedEpisode != null &&
+        sharedPlayable != null &&
+        sharedEpisode.fileExists) {
+      context.read<LargeScreenUiSfxService>().playLaunchPlayer();
+      await PlaybackService()
+          .play(sharedPlayable.withMediaLibraryScope(widget.mediaLibraryScope));
       if (!mounted) return;
       Navigator.of(context).maybePop();
       return;
     }
 
-    final history = _episodeHistoryMap[episode.id];
+    final history = entry.history;
     if (history == null || history.filePath.isEmpty) {
       _showMessage('媒体库中找不到此剧集的视频文件');
       return;
     }
 
     final playableItem = PlayableItem(
+      mediaLibraryScope: widget.mediaLibraryScope,
       videoPath: history.filePath,
-      title: anime.nameCn,
-      subtitle: episode.title,
-      animeId: anime.id,
-      episodeId: episode.id,
+      title: anime?.nameCn ?? history.animeName,
+      subtitle: entry.episode?.title ?? history.episodeTitle,
+      animeId: history.animeId,
+      episodeId: entry.episode?.id ?? history.episodeId,
       historyItem: history,
     );
 
+    context.read<LargeScreenUiSfxService>().playLaunchPlayer();
     await PlaybackService().play(playableItem);
     if (!mounted) return;
     Navigator.of(context).maybePop();
@@ -463,7 +585,7 @@ class _NipaplayLargeScreenAnimeDetailPageState
     if (controlNodes.isEmpty) return;
     final targetIndex = _clampInt(index, 0, controlNodes.length - 1);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
+      if (!mounted || !_isCurrentRouteActive()) return;
       controlNodes[targetIndex].requestFocus();
     });
   }
@@ -472,7 +594,7 @@ class _NipaplayLargeScreenAnimeDetailPageState
     if (_episodeFocusNodes.isEmpty) return;
     final targetIndex = _clampInt(index, 0, _episodeFocusNodes.length - 1);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
+      if (!mounted || !_isCurrentRouteActive()) return;
       _episodeFocusNodes[targetIndex].requestFocus();
     });
   }
@@ -501,8 +623,8 @@ class _NipaplayLargeScreenAnimeDetailPageState
       return;
     }
     final targetIndex = _clampInt(index, 0, _episodeFocusNodes.length - 1);
-    final targetOffset =
-        targetIndex * (_kLargeScreenEpisodeCardWidth + _kLargeScreenEpisodeCardGap);
+    final targetOffset = targetIndex *
+        (_kLargeScreenEpisodeCardWidth + _kLargeScreenEpisodeCardGap);
 
     final clamped = targetOffset.clamp(
       _episodeScrollController.position.minScrollExtent,
@@ -579,10 +701,10 @@ class _NipaplayLargeScreenAnimeDetailPageState
 
   void _activateCurrentSelection() {
     if (_isEpisodeAreaActive && _episodeFocusNodes.isNotEmpty) {
-      final episodes = _displayEpisodes;
-      if (episodes.isEmpty) return;
-      final index = _clampInt(_selectedEpisodeIndex, 0, episodes.length - 1);
-      _playEpisode(episodes[index]);
+      final entries = _displayEntries;
+      if (entries.isEmpty) return;
+      final index = _clampInt(_selectedEpisodeIndex, 0, entries.length - 1);
+      _playEpisode(entries[index]);
       return;
     }
 
@@ -595,11 +717,11 @@ class _NipaplayLargeScreenAnimeDetailPageState
   }
 
   void _toggleEpisodeOrder() {
-    final selectedEpisodeId = _currentSelectedEpisodeId();
+    final selectedEntryKey = _currentSelectedEntryKey();
     setState(() {
       _isEpisodeListReversed = !_isEpisodeListReversed;
     });
-    _rebuildEpisodeFocusNodes(keepEpisodeId: selectedEpisodeId);
+    _rebuildEpisodeFocusNodes(keepEntryKey: selectedEntryKey);
     if (_isEpisodeAreaActive && _episodeFocusNodes.isNotEmpty) {
       _requestEpisodeFocus(_selectedEpisodeIndex);
       _scrollToEpisodeIndex(_selectedEpisodeIndex, animate: false);
@@ -628,6 +750,18 @@ class _NipaplayLargeScreenAnimeDetailPageState
   }
 
   KeyEventResult _handleInputCommandEvent(KeyEvent event) {
+    if (_isLoading || _error != null) {
+      final command = NipaplayLargeScreenInputControls.fromKeyEvent(event);
+      if (command == NipaplayLargeScreenInputCommand.back ||
+          command == NipaplayLargeScreenInputCommand.toggleMenu) {
+        Navigator.of(context).maybePop();
+        return KeyEventResult.handled;
+      }
+      // Let error/login buttons receive Select and directional navigation.
+      // The old loaded-page handler treated Select as "close" even when
+      // the visible action said "retry".
+      return KeyEventResult.ignored;
+    }
     final command = NipaplayLargeScreenInputControls.fromKeyEvent(event);
     if (command == null) {
       return KeyEventResult.ignored;
@@ -635,6 +769,7 @@ class _NipaplayLargeScreenAnimeDetailPageState
 
     switch (command) {
       case NipaplayLargeScreenInputCommand.toggleMenu:
+      case NipaplayLargeScreenInputCommand.back:
         Navigator.of(context).maybePop();
         return KeyEventResult.handled;
       case NipaplayLargeScreenInputCommand.navigateLeft:
@@ -652,6 +787,9 @@ class _NipaplayLargeScreenAnimeDetailPageState
       case NipaplayLargeScreenInputCommand.activate:
         _activateCurrentSelection();
         return KeyEventResult.handled;
+      case NipaplayLargeScreenInputCommand.previousTab:
+      case NipaplayLargeScreenInputCommand.nextTab:
+        return KeyEventResult.ignored;
     }
   }
 
@@ -717,25 +855,21 @@ class _NipaplayLargeScreenAnimeDetailPageState
           : anime.summary,
     );
 
-    final episodes = _displayEpisodes;
-    final watchedCount = episodes
-        .where((episode) => _dandanplayWatchStatus[episode.id] == true)
+    final entries = _displayEntries;
+    final watchedCount = entries
+        .where((entry) =>
+            entry.episode != null &&
+            _dandanplayWatchStatus[entry.episode!.id] == true)
         .length;
-    final playableCount = episodes.where((episode) {
-      final history = _episodeHistoryMap[episode.id];
-      if (history != null && history.filePath.isNotEmpty) {
-        return true;
-      }
-      final sharedEpisode = _sharedEpisodeMap[episode.id];
-      return sharedEpisode != null && sharedEpisode.fileExists;
-    }).length;
+    final playableCount =
+        entries.where((entry) => entry.hasPlayableSource).length;
 
     final metaLines = <String>[
       if (anime.airDate != null && anime.airDate!.isNotEmpty)
         '首播: ${anime.airDate}',
       if (anime.typeDescription != null && anime.typeDescription!.isNotEmpty)
         '类型: ${anime.typeDescription}',
-      '剧集: ${episodes.length}',
+      '剧集: ${entries.length}',
       '可播放: $playableCount',
       if (DandanplayService.isLoggedIn) '已看: $watchedCount',
     ];
@@ -940,26 +1074,40 @@ class _NipaplayLargeScreenAnimeDetailPageState
   }
 
   Widget _buildEpisodeCard({
-    required EpisodeData episode,
+    required _EpisodeEntry entry,
     required int index,
     required bool isDarkMode,
   }) {
     final textColor = isDarkMode ? Colors.white : Colors.black87;
     final mutedColor = isDarkMode ? Colors.white60 : Colors.black54;
 
-    final history = _episodeHistoryMap[episode.id];
-    final isWatched = _dandanplayWatchStatus[episode.id] == true;
-    final sharedEpisode = _sharedEpisodeMap[episode.id];
-    final hasSharedPlayable = sharedEpisode != null && sharedEpisode.fileExists;
+    final history = entry.history;
+    final sharedEpisode = entry.sharedEpisode;
+    final hasSharedPlayable = sharedEpisode != null &&
+        sharedEpisode.fileExists &&
+        entry.sharedPlayable != null;
+    final isWatched = entry.episode != null &&
+        _dandanplayWatchStatus[entry.episode!.id] == true;
+    final title = entry.episode?.title ??
+        sharedEpisode?.title ??
+        sharedEpisode?.fileName ??
+        '';
 
     String progressLabel = '';
     Color progressColor = mutedColor;
+    final sharedProgress = sharedEpisode?.progress ?? 0.0;
     if (history != null && history.watchProgress > 0.01) {
       progressLabel = '${(history.watchProgress * 100).toStringAsFixed(0)}%';
-      progressColor = isDarkMode ? Colors.orangeAccent : const Color(0xFFB45309);
+      progressColor =
+          isDarkMode ? Colors.orangeAccent : const Color(0xFFB45309);
+    } else if (hasSharedPlayable && sharedProgress > 0.01) {
+      progressLabel = '${(sharedProgress * 100).toStringAsFixed(0)}%';
+      progressColor =
+          isDarkMode ? Colors.orangeAccent : const Color(0xFFB45309);
     } else if (hasSharedPlayable) {
       progressLabel = '共享媒体';
-      progressColor = isDarkMode ? Colors.lightBlueAccent : const Color(0xFF1565C0);
+      progressColor =
+          isDarkMode ? Colors.lightBlueAccent : const Color(0xFF1565C0);
     }
 
     return NipaplayLargeScreenFocusableAction(
@@ -967,7 +1115,7 @@ class _NipaplayLargeScreenAnimeDetailPageState
       borderRadius: BorderRadius.circular(10),
       onActivate: () {
         _setEpisodeSelection(index);
-        _playEpisode(episode);
+        _playEpisode(entry);
       },
       child: Padding(
         padding: const EdgeInsets.fromLTRB(10, 10, 10, 8),
@@ -984,7 +1132,7 @@ class _NipaplayLargeScreenAnimeDetailPageState
             ),
             const SizedBox(height: 6),
             Text(
-              episode.title,
+              title,
               locale: const Locale('zh-Hans', 'zh'),
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
@@ -1053,7 +1201,7 @@ class _NipaplayLargeScreenAnimeDetailPageState
   }
 
   Widget _buildEpisodeRail(BangumiAnime anime, bool isDarkMode) {
-    final episodes = _displayEpisodes;
+    final entries = _displayEntries;
     final mutedColor = isDarkMode ? Colors.white60 : Colors.black54;
 
     if (_isLoadingSharedEpisodes) {
@@ -1079,7 +1227,7 @@ class _NipaplayLargeScreenAnimeDetailPageState
       );
     }
 
-    if (episodes.isEmpty) {
+    if (entries.isEmpty) {
       return SizedBox(
         height: _kLargeScreenEpisodeRailHeight,
         child: Center(
@@ -1098,13 +1246,14 @@ class _NipaplayLargeScreenAnimeDetailPageState
         controller: _episodeScrollController,
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: 16),
-        itemCount: episodes.length,
-        separatorBuilder: (_, __) => const SizedBox(width: _kLargeScreenEpisodeCardGap),
+        itemCount: entries.length,
+        separatorBuilder: (_, __) =>
+            const SizedBox(width: _kLargeScreenEpisodeCardGap),
         itemBuilder: (context, index) {
           return SizedBox(
             width: _kLargeScreenEpisodeCardWidth,
             child: _buildEpisodeCard(
-              episode: episodes[index],
+              entry: entries[index],
               index: index,
               isDarkMode: isDarkMode,
             ),
@@ -1117,7 +1266,6 @@ class _NipaplayLargeScreenAnimeDetailPageState
   Widget _buildLoadedBody(BangumiAnime anime) {
     final bool isDarkMode = Theme.of(context).brightness == Brightness.dark;
     final Color dividerColor = isDarkMode ? Colors.white12 : Colors.black12;
-    final episodes = _displayEpisodes;
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -1141,7 +1289,7 @@ class _NipaplayLargeScreenAnimeDetailPageState
                   child: Row(
                     children: [
                       Text(
-                        '剧集 ${episodes.length} 集',
+                        '剧集 ${_displayEntries.length} 集',
                         locale: const Locale('zh-Hans', 'zh'),
                         style: TextStyle(
                           color: isDarkMode ? Colors.white70 : Colors.black54,
@@ -1178,7 +1326,6 @@ class _NipaplayLargeScreenAnimeDetailPageState
         isDark ? const Color(0xFF1E1E1E) : const Color(0xFFF2F2F2);
     final Color dividerColor = isDark ? Colors.white12 : Colors.black12;
     final mediaPadding = MediaQuery.of(context).padding;
-
     final anime = _anime;
     final coverImageUrl = anime == null ? '' : _coverImageUrl(anime);
 
@@ -1186,26 +1333,28 @@ class _NipaplayLargeScreenAnimeDetailPageState
         ? const Center(child: CircularProgressIndicator())
         : (_error != null
             ? Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      _error!,
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        color: isDark ? Colors.white70 : Colors.black54,
+                child: _error is DandanplayLoginRequired
+                    ? DandanplayLoginRequiredView(
+                        onSignedIn: _loadPageData,
+                        onClose: () => Navigator.of(context).maybePop(),
+                      )
+                    : Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text('暂时无法加载详情，请重试'),
+                          const SizedBox(height: 16),
+                          AdaptiveMediaActionButton(
+                            label: '重试',
+                            desktopIcon: Icons.refresh_rounded,
+                            autofocus: true,
+                            onPressed: _loadPageData,
+                          ),
+                          AdaptiveMediaActionButton(
+                            label: '返回',
+                            onPressed: () => Navigator.of(context).maybePop(),
+                          ),
+                        ],
                       ),
-                    ),
-                    const SizedBox(height: 12),
-                    _buildControlButton(
-                      focusNode: _closeFocusNode,
-                      icon: Icons.refresh_rounded,
-                      label: '重试',
-                      controlIndex: 0,
-                      onPressed: _loadPageData,
-                    ),
-                  ],
-                ),
               )
             : _buildLoadedBody(_anime!));
 
@@ -1237,19 +1386,28 @@ class _NipaplayLargeScreenAnimeDetailPageState
                       children: [
                         if (coverImageUrl.isNotEmpty)
                           Positioned.fill(
-                            child: ImageFiltered(
-                              imageFilter:
-                                  ui.ImageFilter.blur(sigmaX: 40, sigmaY: 40),
-                              child: Opacity(
-                                opacity: isDark ? 0.25 : 0.35,
-                                child: CachedNetworkImageWidget(
-                                  imageUrl: coverImageUrl,
-                                  fit: BoxFit.cover,
-                                  shouldCompress: false,
-                                  loadMode: CachedImageLoadMode.hybrid,
-                                ),
-                              ),
-                            ),
+                            // 这层只是给面板垫一层模糊的封面氛围色。
+                            // 原实现解码整张封面（shouldCompress: false）再每帧做
+                            // σ40 模糊 + Opacity，在电视 GPU 上是持续的全屏
+                            // saveLayer 开销。电视上直接省略，非电视上把解码尺寸
+                            // 压到 240px 宽——反正它会被 σ40 抹平，细节没有意义。
+                            child: TvSafeBackdropFilter.shouldSkipBlur
+                                ? const SizedBox.shrink()
+                                : ImageFiltered(
+                                    imageFilter: ui.ImageFilter.blur(
+                                      sigmaX: 40,
+                                      sigmaY: 40,
+                                    ),
+                                    child: Opacity(
+                                      opacity: isDark ? 0.25 : 0.35,
+                                      child: CachedNetworkImageWidget(
+                                        imageUrl: coverImageUrl,
+                                        fit: BoxFit.cover,
+                                        memCacheWidth: 240,
+                                        loadMode: CachedImageLoadMode.hybrid,
+                                      ),
+                                    ),
+                                  ),
                           ),
                         Positioned.fill(
                           child: Container(
@@ -1265,7 +1423,10 @@ class _NipaplayLargeScreenAnimeDetailPageState
                             ),
                           ),
                         ),
-                        Positioned.fill(child: body),
+                        Positioned.fill(
+                            child: _error == null
+                                ? body
+                                : FocusScope(autofocus: true, child: body)),
                       ],
                     ),
                   ),

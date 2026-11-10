@@ -29,32 +29,6 @@ brew upgrade nipaplay-reload
 - 通过 Homebrew 更新时，系统不会再次要求在"隐私与安全性"中手动允许应用
 - 自动处理依赖关系和清理旧版本
 
-## Arch Linux - AUR
-
-**包名**：`nipaplay-reload-bin`
-
-**更新方式**：
-
-使用 `paru`：
-
-```bash
-# 检查可更新的 AUR 包
-paru -Sua
-
-# 更新 NipaPlay
-paru -S nipaplay-reload-bin
-```
-
-使用 `yay`：
-
-```bash
-# 检查可更新的 AUR 包  
-yay -Sua
-
-# 更新 NipaPlay
-yay -S nipaplay-reload-bin
-```
-
 ## Windows
 
 **更新方式**：
@@ -70,6 +44,18 @@ yay -S nipaplay-reload-bin
 - 手动检查新版本并下载对应架构的 APK
 - 安装时系统会提示"更新应用"
 - 无需卸载旧版本
+
+## HarmonyOS
+
+- 当前以源码构建 HAP 为主，没有与 Android APK 等价的稳定公开更新通道。
+- 更新需要重新构建、签名并安装 HAP；请保留旧版本数据目录后再执行升级。
+- DevEco/SDK 或设备兼容性变化可能导致构建结果不同，升级前建议记录 SDK、签名和 Erika 版本。
+
+## tvOS
+
+- tvOS 当前是开发者预览和侧载路径，不提供常规 GitHub 自动更新。
+- 更新需要重新构建并使用有效的 tvOS 开发者签名安装；模拟器构建不等同于真机发布包。
+- 版本回退前请确认应用数据模型兼容，必要时先导出设置和观看记录。
 
 ## iOS
 

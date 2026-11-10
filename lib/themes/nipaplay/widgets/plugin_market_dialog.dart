@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/cupertino.dart' as cupertino;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:kmbal_ionicons/kmbal_ionicons.dart';
@@ -7,9 +8,16 @@ import 'package:nipaplay/providers/appearance_settings_provider.dart';
 import 'package:nipaplay/providers/settings_provider.dart';
 import 'package:nipaplay/plugins/plugin_service.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/blur_dialog.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/nipaplay_window.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
 import 'package:nipaplay/widgets/adaptive_markdown.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_mode_scope.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_view_container.dart';
 import 'package:nipaplay/utils/github_accel_resolver.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:provider/provider.dart';
@@ -29,9 +37,31 @@ const String _repoBaseUrlForProxy =
 const String _readmeBaseUrl = '$_repoBaseUrl/plugins';
 
 class PluginMarketDialog extends StatefulWidget {
-  const PluginMarketDialog({super.key});
+  const PluginMarketDialog({super.key, this.embedded = false});
+
+  final bool embedded;
 
   static Future<void> show(BuildContext context) {
+    if (NipaplayLargeScreenModeScope.isActiveOf(context)) {
+      return NipaplayLargeScreenViewContainer.show<void>(
+        context: context,
+        title: '插件市场',
+        subtitle: '使用遥控器浏览、查看说明并安装插件',
+        maxWidth: 1180,
+        maxHeightFactor: 0.9,
+        autofocusClose: false,
+        builder: (_) => const PluginMarketDialog(embedded: true),
+      );
+    }
+    if (AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone) {
+      return CupertinoBottomSheet.show<void>(
+        context: context,
+        title: '插件市场',
+        floatingTitle: true,
+        child: const PluginMarketDialog(embedded: true),
+      );
+    }
+
     final enableAnimation = Provider.of<AppearanceSettingsProvider>(
       context,
       listen: false,
@@ -53,9 +83,11 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
   static Color get _accentColor => AppAccentColors.current;
 
   final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocusNode = FocusNode();
   final ScrollController _scrollController = ScrollController();
 
-  Future<String> _applyProxyIfNeeded(String rawUrl, String proxyUrl, String? proxy) async {
+  Future<String> _applyProxyIfNeeded(
+      String rawUrl, String proxyUrl, String? proxy) async {
     if (proxy == null || proxy.trim().isEmpty) {
       return await GithubAccelResolver.resolveFirstReachable(rawUrl) ?? rawUrl;
     }
@@ -81,7 +113,6 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
     super.initState();
     _loadAppVersion();
     _loadPlugins();
-    _searchController.addListener(_onSearchChanged);
   }
 
   Future<void> _loadAppVersion() async {
@@ -96,6 +127,7 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
   @override
   void dispose() {
     _searchController.dispose();
+    _searchFocusNode.dispose();
     _scrollController.dispose();
     super.dispose();
   }
@@ -151,6 +183,14 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
     }
   }
 
+  Future<void> _refreshPlugins() async {
+    if (_isLoading || _isRefreshing) return;
+    setState(() {
+      _isRefreshing = true;
+    });
+    await _loadPlugins();
+  }
+
   void _onSearchChanged() {
     final query = _searchController.text.toLowerCase().trim();
     if (query.isEmpty) {
@@ -191,8 +231,7 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
   }
 
   void _syncInstalledStatus() {
-    final pluginService =
-        Provider.of<PluginService>(context, listen: false);
+    final pluginService = Provider.of<PluginService>(context, listen: false);
     final index = pluginService.pluginIndex;
 
     // 构建 remoteId → (localId, version) 的映射，支持前缀匹配
@@ -229,8 +268,10 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
         Provider.of<SettingsProvider>(context, listen: false);
     final proxyUrl = settingsProvider.githubProxyUrl;
     final rawReadmeUrl = '$_readmeBaseUrl/${plugin.id}/README.md';
-    final proxyReadmeUrl = '${_repoBaseUrlForProxy}/plugins/${plugin.id}/README.md';
-    final url = await _applyProxyIfNeeded(rawReadmeUrl, proxyReadmeUrl, proxyUrl);
+    final proxyReadmeUrl =
+        '$_repoBaseUrlForProxy/plugins/${plugin.id}/README.md';
+    final url =
+        await _applyProxyIfNeeded(rawReadmeUrl, proxyReadmeUrl, proxyUrl);
 
     try {
       final response = await http.get(Uri.parse(url));
@@ -285,32 +326,103 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
       final url = await _applyProxyIfNeeded(
           plugin.downloadUrl, plugin.proxyDownloadUrl, proxyUrl);
       final response = await http.get(Uri.parse(url));
+      if (!mounted) return;
       if (response.statusCode == 200) {
-        if (!mounted) return;
         final pluginService =
             Provider.of<PluginService>(context, listen: false);
         final wasInstalled = plugin.isInstalled;
         await pluginService.importPluginFromContent(response.body,
             updateForId: plugin.localId);
-        plugin.isInstalled = true;
-        plugin.localVersion = plugin.version;
-        plugin.localId = plugin.id;
-        BlurSnackBar.show(
-            context, wasInstalled ? '插件更新成功' : '插件安装成功');
+        if (!mounted) return;
+        _syncInstalledStatus();
+        BlurSnackBar.show(context, wasInstalled ? '插件更新成功' : '插件安装成功');
       } else {
         BlurSnackBar.show(context, '下载插件失败: ${response.statusCode}');
       }
     } catch (e) {
+      if (!mounted) return;
       BlurSnackBar.show(context, '安装错误: $e');
     } finally {
-      setState(() {
-        plugin.isInstalling = false;
-      });
+      if (mounted) {
+        setState(() {
+          plugin.isInstalling = false;
+        });
+      }
+    }
+  }
+
+  bool _canDeletePlugin(_PluginInfo plugin) {
+    final localId = plugin.localId;
+    if (!plugin.isInstalled || localId == null) return false;
+    return context.read<PluginService>().plugins.any(
+          (installed) =>
+              installed.manifest.id == localId && !installed.isBuiltin,
+        );
+  }
+
+  Future<void> _deletePlugin(_PluginInfo plugin) async {
+    final localId = plugin.localId;
+    if (localId == null || !_canDeletePlugin(plugin)) return;
+
+    final confirmed = await BlurDialog.show<bool>(
+      context: context,
+      title: '确认删除',
+      content: '确定要删除插件「${plugin.name}」吗？此操作不可撤销。',
+      actionsBuilder: (dialogContext) => [
+        AdaptiveMediaActionButton(
+          label: '取消',
+          compact: true,
+          onPressed: () => Navigator.of(dialogContext).pop(false),
+        ),
+        AdaptiveMediaActionButton(
+          label: '删除',
+          compact: true,
+          emphasis: AdaptiveMediaActionEmphasis.destructive,
+          onPressed: () => Navigator.of(dialogContext).pop(true),
+        ),
+      ],
+    );
+    if (!mounted || confirmed != true) return;
+
+    setState(() => plugin.isDeleting = true);
+    try {
+      final deleted = await context.read<PluginService>().deletePlugin(localId);
+      if (!mounted) return;
+      if (deleted) {
+        _syncInstalledStatus();
+        BlurSnackBar.show(context, '插件已删除');
+      } else {
+        BlurSnackBar.show(context, '删除失败，请在插件设置中检查此插件');
+      }
+    } catch (error) {
+      if (mounted) BlurSnackBar.show(context, '删除插件失败: $error');
+    } finally {
+      if (mounted) setState(() => plugin.isDeleting = false);
     }
   }
 
   Widget _buildHeader(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    if (widget.embedded) {
+      final topInset =
+          CupertinoBottomSheetScope.maybeOf(context)?.contentTopInset ?? 0;
+      return Padding(
+        padding: EdgeInsets.fromLTRB(20, topInset + 8, 20, 12),
+        child: Row(
+          children: [
+            Expanded(child: _buildSearchBar(context)),
+            const SizedBox(width: 8),
+            AdaptiveMediaIconButton(
+              desktopIcon: Ionicons.refresh_outline,
+              phoneIcon: cupertino.CupertinoIcons.refresh,
+              tooltip: '刷新',
+              onPressed:
+                  _isLoading || _isRefreshing ? null : () => _refreshPlugins(),
+            ),
+          ],
+        ),
+      );
+    }
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(24, 24, 24, 16),
@@ -319,7 +431,7 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
         children: [
           Row(
             children: [
-              Icon(Ionicons.storefront_outline, size: 28),
+              const Icon(Ionicons.storefront_outline, size: 28),
               const SizedBox(width: 12),
               Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -342,12 +454,13 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
                 ],
               ),
               const Spacer(),
-              IconButton(
-                icon: _isRefreshing
-                    ? const CircularProgressIndicator(strokeWidth: 2)
-                    : Icon(Ionicons.refresh_outline),
-                onPressed: _loadPlugins,
+              AdaptiveMediaIconButton(
+                desktopIcon: Ionicons.refresh_outline,
+                phoneIcon: cupertino.CupertinoIcons.refresh,
                 tooltip: '刷新',
+                onPressed: _isLoading || _isRefreshing
+                    ? null
+                    : () => _refreshPlugins(),
               ),
             ],
           ),
@@ -359,35 +472,17 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
   }
 
   Widget _buildSearchBar(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-
-    return Container(
-      decoration: BoxDecoration(
-        color: isDark ? const Color(0xFF1E1E1E) : Colors.grey[100],
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(
-          color: isDark ? const Color(0xFF3A3A3A) : Colors.grey[200]!,
-        ),
-      ),
-      child: TextField(
-        controller: _searchController,
-        decoration: InputDecoration(
-          prefixIcon: Icon(Ionicons.search_outline, color: Colors.grey[400]),
-          hintText: '搜索插件',
-          hintStyle: TextStyle(color: Colors.grey[400]),
-          border: InputBorder.none,
-          contentPadding: const EdgeInsets.symmetric(vertical: 12),
-        ),
-        style: TextStyle(color: isDark ? Colors.white : Colors.black87),
-      ),
+    return AdaptiveMediaSearchField(
+      controller: _searchController,
+      focusNode: _searchFocusNode,
+      placeholder: '搜索插件',
+      onChanged: (_) => _onSearchChanged(),
     );
   }
 
   Widget _buildContent(BuildContext context) {
     if (_isLoading) {
-      return const Center(
-        child: CircularProgressIndicator(),
-      );
+      return const Center(child: AdaptiveMediaActivityIndicator());
     }
 
     if (_errorMessage != null) {
@@ -395,7 +490,7 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Ionicons.cloud_outline, size: 48, color: Colors.grey),
+            const Icon(Ionicons.cloud_outline, size: 48, color: Colors.grey),
             const SizedBox(height: 16),
             Text(
               _errorMessage!,
@@ -403,9 +498,11 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 16),
-            ElevatedButton(
+            AdaptiveMediaActionButton(
+              label: '重新加载',
+              desktopIcon: Ionicons.refresh_outline,
               onPressed: _loadPlugins,
-              child: const Text('重新加载'),
+              emphasis: AdaptiveMediaActionEmphasis.primary,
             ),
           ],
         ),
@@ -417,7 +514,7 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Ionicons.search_outline, size: 48, color: Colors.grey),
+            const Icon(Ionicons.search_outline, size: 48, color: Colors.grey),
             const SizedBox(height: 16),
             Text(
               _searchController.text.isNotEmpty ? '未找到匹配的插件' : '暂无插件',
@@ -600,14 +697,18 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
               ),
             ],
             const SizedBox(height: 12),
-            Row(
+            OverflowBar(
+              alignment: MainAxisAlignment.spaceBetween,
+              overflowAlignment: OverflowBarAlignment.end,
+              spacing: 8,
+              overflowSpacing: 8,
               children: [
-                TextButton.icon(
+                AdaptiveMediaActionButton(
+                  label: '查看文档',
+                  desktopIcon: Ionicons.document_outline,
+                  compact: true,
                   onPressed: () => _showPluginReadme(plugin),
-                  icon: Icon(Ionicons.document_outline, size: 16),
-                  label: const Text('查看文档'),
                 ),
-                const Spacer(),
                 _buildActionButtons(plugin),
               ],
             ),
@@ -620,65 +721,67 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
   Widget _buildActionButtons(_PluginInfo plugin) {
     final isVersionCompatible = _isVersionCompatible(plugin.minHostVersion);
 
-    if (plugin.isInstalling) {
+    if (plugin.isInstalling || plugin.isDeleting) {
       return const SizedBox(
         width: 24,
         height: 24,
-        child: CircularProgressIndicator(strokeWidth: 2),
+        child: AdaptiveMediaActivityIndicator(size: 20),
       );
     }
 
     if (plugin.isInstalled) {
       final hasUpdate = plugin.localVersion != null &&
           _compareVersions(plugin.version, plugin.localVersion!) > 0;
+      final canDelete = _canDeletePlugin(plugin);
+      final deleteButton = AdaptiveMediaActionButton(
+        label: '删除',
+        desktopIcon: Ionicons.trash_outline,
+        phoneIcon: cupertino.CupertinoIcons.trash,
+        compact: true,
+        emphasis: AdaptiveMediaActionEmphasis.destructive,
+        onPressed: () => _deletePlugin(plugin),
+      );
       if (hasUpdate) {
-        return ElevatedButton(
-          onPressed: () => _installPlugin(plugin),
-          style: ElevatedButton.styleFrom(
-            backgroundColor: _accentColor,
-            foregroundColor: Colors.white,
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(8),
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AdaptiveMediaActionButton(
+              label: '更新',
+              desktopIcon: Ionicons.refresh_outline,
+              onPressed: () => _installPlugin(plugin),
+              emphasis: AdaptiveMediaActionEmphasis.primary,
+              compact: true,
             ),
-          ),
-          child: const Text('更新'),
+            if (canDelete) ...[
+              const SizedBox(width: 8),
+              deleteButton,
+            ],
+          ],
         );
       }
-      return TextButton(
+      if (canDelete) return deleteButton;
+      return AdaptiveMediaActionButton(
+        label: '已安装',
+        desktopIcon: Ionicons.checkmark_circle_outline,
         onPressed: () {
           BlurSnackBar.show(context, '该插件已安装');
         },
-        child: const Text('已安装'),
       );
     }
 
     if (!isVersionCompatible) {
-      return ElevatedButton(
+      return const AdaptiveMediaActionButton(
+        label: '版本不兼容',
+        desktopIcon: Ionicons.warning_outline,
         onPressed: null,
-        style: ElevatedButton.styleFrom(
-          backgroundColor: Colors.grey[600],
-          foregroundColor: Colors.white,
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(8),
-          ),
-        ),
-        child: const Text('版本不兼容'),
       );
     }
 
-    return ElevatedButton(
+    return AdaptiveMediaActionButton(
+      label: '安装',
+      desktopIcon: Ionicons.download_outline,
       onPressed: () => _installPlugin(plugin),
-      style: ElevatedButton.styleFrom(
-        backgroundColor: _accentColor,
-        foregroundColor: Colors.white,
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8),
-        ),
-      ),
-      child: const Text('安装'),
+      emphasis: AdaptiveMediaActionEmphasis.primary,
     );
   }
 
@@ -691,8 +794,10 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
           padding: const EdgeInsets.fromLTRB(24, 20, 24, 16),
           child: Row(
             children: [
-              IconButton(
-                icon: Icon(Ionicons.chevron_back_outline),
+              AdaptiveMediaIconButton(
+                desktopIcon: Ionicons.chevron_back_outline,
+                phoneIcon: cupertino.CupertinoIcons.back,
+                tooltip: '返回插件列表',
                 onPressed: _closeReadme,
               ),
               const SizedBox(width: 12),
@@ -726,7 +831,7 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
           child: Padding(
             padding: const EdgeInsets.all(24),
             child: _isLoadingReadme
-                ? const Center(child: CircularProgressIndicator())
+                ? const Center(child: AdaptiveMediaActivityIndicator())
                 : _readmeContent != null
                     ? SingleChildScrollView(
                         child: AdaptiveMarkdown(
@@ -752,21 +857,29 @@ class _PluginMarketDialogState extends State<PluginMarketDialog> {
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    final isLargeScreen = NipaplayLargeScreenModeScope.isActiveOf(context);
+    final content = _showReadme
+        ? _buildReadmeView(context)
+        : Column(
+            children: [
+              _buildHeader(context),
+              Expanded(child: _buildContent(context)),
+            ],
+          );
+
+    if (isLargeScreen && widget.embedded) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+        child: content,
+      );
+    }
 
     return NipaplayWindowScaffold(
+      embedded: widget.embedded,
       maxWidth: 800,
       maxHeightFactor: 0.85,
       backgroundColor: isDark ? const Color(0xFF1E1E1E) : Colors.white,
-      child: _showReadme
-          ? _buildReadmeView(context)
-          : Column(
-              children: [
-                _buildHeader(context),
-                Expanded(
-                  child: _buildContent(context),
-                ),
-              ],
-            ),
+      child: content,
     );
   }
 }
@@ -783,6 +896,7 @@ class _PluginInfo {
   final List<String> tags;
   bool isInstalled = false;
   bool isInstalling = false;
+  bool isDeleting = false;
   String? localVersion;
   String? localId;
 

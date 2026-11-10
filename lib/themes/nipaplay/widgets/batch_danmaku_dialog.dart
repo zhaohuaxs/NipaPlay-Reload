@@ -1,12 +1,8 @@
-import 'dart:convert';
-import 'dart:ui';
-
+import 'package:flutter/cupertino.dart' as cupertino;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
 import 'package:nipaplay/providers/appearance_settings_provider.dart';
-import 'package:nipaplay/services/dandanplay_service.dart';
-import 'package:nipaplay/services/web_remote_access_service.dart';
+import 'package:nipaplay/services/danmaku_matching_service.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/nipaplay_window.dart';
 import 'package:nipaplay/utils/global_hotkey_manager.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
@@ -14,26 +10,74 @@ import 'package:nipaplay/utils/chinese_converter.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_focusable_action.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_mode_scope.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_view_container.dart';
 
 class BatchDanmakuMatchDialog extends StatefulWidget {
   final List<String> filePaths;
   final String? initialSearchKeyword;
+  final bool embedded;
+
+  /// 当用户切换"包括子文件夹"勾选项时调用，返回新的文件列表。
+  /// 为 null 时表示不支持切换（如远程媒体库）。
+  final Future<List<String>> Function(bool includeSubfolders)?
+      onIncludeSubfoldersChanged;
 
   const BatchDanmakuMatchDialog({
     super.key,
     required this.filePaths,
     this.initialSearchKeyword,
+    this.embedded = false,
+    this.onIncludeSubfoldersChanged,
   });
 
   static Future<Map<String, dynamic>?> show(
     BuildContext context, {
     required List<String> filePaths,
     String? initialSearchKeyword,
+    Future<List<String>> Function(bool includeSubfolders)?
+        onIncludeSubfoldersChanged,
   }) {
+    if (NipaplayLargeScreenModeScope.isActiveOf(context)) {
+      return NipaplayLargeScreenViewContainer.show<Map<String, dynamic>>(
+        context: context,
+        title: '批量匹配弹幕',
+        subtitle: '选择文件和剧集，使用方向键在两侧列表间移动',
+        maxWidth: 1240,
+        maxHeightFactor: 0.92,
+        autofocusClose: false,
+        builder: (_) => BatchDanmakuMatchDialog(
+          filePaths: filePaths,
+          initialSearchKeyword: initialSearchKeyword,
+          onIncludeSubfoldersChanged: onIncludeSubfoldersChanged,
+          embedded: true,
+        ),
+      );
+    }
+
     final enableAnimation = Provider.of<AppearanceSettingsProvider>(
       context,
       listen: false,
     ).enablePageAnimation;
+
+    if (AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone) {
+      return CupertinoBottomSheet.show<Map<String, dynamic>>(
+        context: context,
+        title: '批量匹配弹幕',
+        floatingTitle: true,
+        child: BatchDanmakuMatchDialog(
+          filePaths: filePaths,
+          initialSearchKeyword: initialSearchKeyword,
+          onIncludeSubfoldersChanged: onIncludeSubfoldersChanged,
+          embedded: true,
+        ),
+      );
+    }
 
     return NipaplayWindow.show<Map<String, dynamic>>(
       context: context,
@@ -42,6 +86,7 @@ class BatchDanmakuMatchDialog extends StatefulWidget {
       child: BatchDanmakuMatchDialog(
         filePaths: filePaths,
         initialSearchKeyword: initialSearchKeyword,
+        onIncludeSubfoldersChanged: onIncludeSubfoldersChanged,
       ),
     );
   }
@@ -57,6 +102,8 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
   static Color get _accentColor => AppAccentColors.current;
 
   final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocusNode = FocusNode();
+  bool _requestedInitialTelevisionFocus = false;
 
   bool _isSearching = false;
   String _searchMessage = '';
@@ -70,6 +117,8 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
   final Set<int> _selectedEpisodeIds = {};
 
   late final List<_FileItem> _files;
+  bool _includeSubfolders = false;
+  bool _isReloadingFiles = false;
 
   @override
   String get hotkeyDisableReason => 'batch_danmaku_dialog';
@@ -85,7 +134,8 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
         final smbPath = uri.queryParameters['path'];
         if (smbPath != null && smbPath.isNotEmpty) {
           final lastSlash = smbPath.lastIndexOf('/');
-          final tail = lastSlash >= 0 ? smbPath.substring(lastSlash + 1) : smbPath;
+          final tail =
+              lastSlash >= 0 ? smbPath.substring(lastSlash + 1) : smbPath;
           if (tail.isNotEmpty) return tail;
         }
         // 一般 HTTP URL：取 pathSegments 最后一段
@@ -122,8 +172,22 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_requestedInitialTelevisionFocus ||
+        !NipaplayLargeScreenModeScope.isActiveOf(context)) {
+      return;
+    }
+    _requestedInitialTelevisionFocus = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _searchFocusNode.requestFocus();
+    });
+  }
+
+  @override
   void dispose() {
     _searchController.dispose();
+    _searchFocusNode.dispose();
     disposeHotkeys();
     super.dispose();
   }
@@ -169,29 +233,6 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
         selectionHandleColor: _accentColor,
       );
 
-  ButtonStyle _primaryButtonStyle() {
-    return ButtonStyle(
-      backgroundColor: MaterialStateProperty.resolveWith((states) {
-        if (states.contains(MaterialState.disabled)) {
-          return _accentColor.withOpacity(0.5);
-        }
-        return _accentColor;
-      }),
-      foregroundColor: MaterialStateProperty.all(Colors.white),
-      overlayColor: MaterialStateProperty.all(Colors.transparent),
-      splashFactory: NoSplash.splashFactory,
-      padding: MaterialStateProperty.all(
-        const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-      ),
-      minimumSize: MaterialStateProperty.all(const Size(96, 44)),
-      elevation: MaterialStateProperty.all(0),
-      shadowColor: MaterialStateProperty.all(Colors.transparent),
-      shape: MaterialStateProperty.all(
-        RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      ),
-    );
-  }
-
   Future<void> _performSearch() async {
     final keyword = _searchController.text.trim();
     if (keyword.isEmpty) {
@@ -209,43 +250,11 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
     });
 
     try {
-      final appSecret = await DandanplayService.getAppSecret();
-      final timestamp =
-          (DateTime.now().toUtc().millisecondsSinceEpoch / 1000).round();
-      const apiPath = '/api/v2/search/anime';
-      final baseUrl = await DandanplayService.getApiBaseUrl();
-      final url = '$baseUrl$apiPath?keyword=${Uri.encodeComponent(keyword)}';
-
-      final response = await http.get(
-        WebRemoteAccessService.proxyUri(Uri.parse(url)),
-        headers: {
-          'Accept': 'application/json',
-          'X-AppId': DandanplayService.appId,
-          'X-Signature': DandanplayService.generateSignature(
-            DandanplayService.appId,
-            timestamp,
-            apiPath,
-            appSecret,
-          ),
-          'X-Timestamp': '$timestamp',
-        },
-      );
-
       if (!mounted) return;
 
-      if (response.statusCode != 200) {
-        setState(() {
-          _isSearching = false;
-          _searchMessage = '搜索失败: HTTP ${response.statusCode}';
-          _searchResults = [];
-        });
-        return;
-      }
-
-      final data = json.decode(response.body);
-      final results = (data is Map<String, dynamic> && data['animes'] is List)
-          ? List<Map<String, dynamic>>.from(data['animes'] as List)
-          : <Map<String, dynamic>>[];
+      final results =
+          await DanmakuMatchingService.instance.searchAnime(keyword);
+      if (!mounted) return;
 
       // 对搜索结果进行简繁转换
       final isTraditional =
@@ -297,74 +306,33 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
     });
 
     try {
-      final appSecret = await DandanplayService.getAppSecret();
-      final timestamp =
-          (DateTime.now().toUtc().millisecondsSinceEpoch / 1000).round();
-      final apiPath = '/api/v2/bangumi/$animeId';
-      final baseUrl = await DandanplayService.getApiBaseUrl();
-      final url = '$baseUrl$apiPath';
-
-      final response = await http.get(
-        WebRemoteAccessService.proxyUri(Uri.parse(url)),
-        headers: {
-          'Accept': 'application/json',
-          'X-AppId': DandanplayService.appId,
-          'X-Signature': DandanplayService.generateSignature(
-            DandanplayService.appId,
-            timestamp,
-            apiPath,
-            appSecret,
-          ),
-          'X-Timestamp': '$timestamp',
-        },
-      );
-
+      final rawEpisodes =
+          await DanmakuMatchingService.instance.getAnimeEpisodes(animeId);
       if (!mounted) return;
-
-      setState(() {
-        _isLoadingEpisodes = false;
-      });
-
-      if (response.statusCode != 200) {
-        setState(() {
-          _episodesMessage = '加载剧集失败: HTTP ${response.statusCode}';
-        });
-        return;
-      }
-
-      final data = json.decode(response.body);
-      final rawEpisodes = (data is Map<String, dynamic> &&
-              data['success'] == true &&
-              data['bangumi'] is Map<String, dynamic>)
-          ? (data['bangumi'] as Map<String, dynamic>)['episodes']
-          : (data is Map<String, dynamic> ? data['episodes'] : null);
 
       final parsedEpisodes = <_EpisodeItem>[];
       // 检查是否需要繁体中文
       final isTraditional =
           await ChineseConverter.isTraditionalChineseEnvironment(context);
-      if (rawEpisodes is List) {
-        for (final entry in rawEpisodes) {
-          if (entry is! Map) continue;
-          final map = Map<String, dynamic>.from(entry);
-          final episodeId = _tryParsePositiveInt(map['episodeId']);
-          if (episodeId == null) continue;
-          var episodeTitle = map['episodeTitle']?.toString().trim() ?? '未命名剧集';
-          // 对剧集标题进行简繁转换
-          if (isTraditional) {
-            episodeTitle = ChineseConverter.convert(episodeTitle);
-          }
-          parsedEpisodes.add(
-            _EpisodeItem(
-              episodeId: episodeId,
-              episodeTitle: episodeTitle,
-              episodeNumber: _tryParsePositiveInt(map['episodeNumber']),
-            ),
-          );
+      for (final map in rawEpisodes) {
+        final episodeId = _tryParsePositiveInt(map['episodeId']);
+        if (episodeId == null) continue;
+        var episodeTitle = map['episodeTitle']?.toString().trim() ?? '未命名剧集';
+        // 对剧集标题进行简繁转换
+        if (isTraditional) {
+          episodeTitle = ChineseConverter.convert(episodeTitle);
         }
+        parsedEpisodes.add(
+          _EpisodeItem(
+            episodeId: episodeId,
+            episodeTitle: episodeTitle,
+            episodeNumber: _tryParsePositiveInt(map['episodeNumber']),
+          ),
+        );
       }
 
       setState(() {
+        _isLoadingEpisodes = false;
         _episodes
           ..clear()
           ..addAll(parsedEpisodes);
@@ -409,17 +377,34 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
     });
   }
 
-  void _toggleSelectAllEpisodes(bool selectAll) {
-    if (_episodes.isEmpty) return;
+  Future<void> _onIncludeSubfoldersChanged(bool value) async {
+    if (widget.onIncludeSubfoldersChanged == null) return;
     setState(() {
-      if (!selectAll) {
-        _selectedEpisodeIds.clear();
-        return;
-      }
-      _selectedEpisodeIds
-        ..clear()
-        ..addAll(_episodes.map((e) => e.episodeId));
+      _includeSubfolders = value;
+      _isReloadingFiles = true;
     });
+    try {
+      final newPaths = await widget.onIncludeSubfoldersChanged!(value);
+      if (!mounted) return;
+      setState(() {
+        _files
+          ..clear()
+          ..addAll(
+            newPaths.map(
+              (path) => _FileItem(
+                  path: path, displayName: _displayNameFromPath(path)),
+            ),
+          );
+        _sortFilesByEpisodeNumber();
+        _isReloadingFiles = false;
+      });
+      _autoSelectEpisodesToMatchFileCount();
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _isReloadingFiles = false;
+      });
+    }
   }
 
   void _confirmAndClose() {
@@ -494,7 +479,6 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
   }) {
     final textColor = _textColor;
     final iconColor = _mutedTextColor;
-    final checkboxSide = BorderSide(color: _borderColor, width: 1);
     final backgroundColor = isDragging ? _surfaceColor : _panelAltColor;
     final borderColor =
         isDragging ? _accentColor.withOpacity(0.35) : _borderColor;
@@ -507,8 +491,8 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
         borderRadius: BorderRadius.circular(10),
         border: Border.all(color: borderColor),
       ),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(10),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
         onTap: isDragging
             ? null
             : () {
@@ -520,18 +504,15 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
           child: Row(
             children: [
-              Checkbox(
+              AdaptiveMediaCheckbox(
                 value: item.selected,
                 onChanged: isDragging
                     ? null
                     : (value) {
                         setState(() {
-                          item.selected = value ?? true;
+                          item.selected = value;
                         });
                       },
-                checkColor: Colors.white,
-                activeColor: _accentColor,
-                side: checkboxSide,
               ),
               Expanded(
                 child: Column(
@@ -583,7 +564,6 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
 
     final textColor = _textColor;
     final iconColor = _mutedTextColor;
-    final checkboxSide = BorderSide(color: _borderColor, width: 1);
     final backgroundColor = isDragging ? _surfaceColor : _panelAltColor;
     final borderColor =
         isDragging ? _accentColor.withOpacity(0.35) : _borderColor;
@@ -596,8 +576,8 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
         borderRadius: BorderRadius.circular(10),
         border: Border.all(color: borderColor),
       ),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(10),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
         onTap: isDragging
             ? null
             : () {
@@ -613,23 +593,19 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
           child: Row(
             children: [
-              Checkbox(
+              AdaptiveMediaCheckbox(
                 value: checked,
                 onChanged: isDragging
                     ? null
                     : (value) {
                         setState(() {
-                          final v = value ?? false;
-                          if (v) {
+                          if (value) {
                             _selectedEpisodeIds.add(episode.episodeId);
                           } else {
                             _selectedEpisodeIds.remove(episode.episodeId);
                           }
                         });
                       },
-                checkColor: Colors.white,
-                activeColor: _accentColor,
-                side: checkboxSide,
               ),
               Expanded(
                 child: Text(
@@ -662,49 +638,58 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
     final title = anime['animeTitle']?.toString() ?? '未知动画';
     final animeId = anime['animeId']?.toString() ?? '';
 
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
+    final content = Container(
+      margin: EdgeInsets.only(bottom: showBottomDivider ? 8 : 0),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: _panelAltColor,
         borderRadius: BorderRadius.circular(10),
-        onTap: () => _selectAnime(anime),
-        child: Container(
-          margin: EdgeInsets.only(bottom: showBottomDivider ? 8 : 0),
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          decoration: BoxDecoration(
-            color: _panelAltColor,
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: _borderColor),
-          ),
-          child: Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      title,
-                      style: TextStyle(
-                        color: _textColor,
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    if (animeId.isNotEmpty) ...[
-                      SizedBox(height: 4),
-                      Text(
-                        'ID: $animeId',
-                        style: TextStyle(color: _subTextColor, fontSize: 12),
-                      ),
-                    ],
-                  ],
+        border: Border.all(color: _borderColor),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    color: _textColor,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
-              ),
-              _buildRowIndexText(index, isDragging: false),
-            ],
+                if (animeId.isNotEmpty) ...[
+                  SizedBox(height: 4),
+                  Text(
+                    'ID: $animeId',
+                    style: TextStyle(color: _subTextColor, fontSize: 12),
+                  ),
+                ],
+              ],
+            ),
           ),
-        ),
+          _buildRowIndexText(index, isDragging: false),
+        ],
+      ),
+    );
+    if (NipaplayLargeScreenModeScope.isActiveOf(context)) {
+      return NipaplayLargeScreenFocusableAction(
+        onActivate: () => _selectAnime(anime),
+        borderRadius: BorderRadius.circular(10),
+        focusScale: 1.01,
+        child: content,
+      );
+    }
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => _selectAnime(anime),
+        child: content,
       ),
     );
   }
@@ -712,19 +697,6 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
   Widget _buildHeader() {
     return Row(
       children: [
-        Container(
-          padding: const EdgeInsets.all(10),
-          decoration: BoxDecoration(
-            color: _accentColor.withOpacity(0.18),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Icon(
-            Icons.playlist_add_check,
-            color: _accentColor,
-            size: 20,
-          ),
-        ),
-        SizedBox(width: 12),
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -753,50 +725,40 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
     return Row(
       children: [
         Expanded(
-          child: TextField(
+          child: AdaptiveMediaTextField(
             controller: _searchController,
-            cursorColor: _accentColor,
+            focusNode: _searchFocusNode,
+            remoteInputTitle: '搜索番剧',
+            remoteInputFieldId: 'batch_danmaku_search',
+            showClearButton: true,
             style: TextStyle(color: _textColor),
             decoration: InputDecoration(
               hintText: '搜索番剧（右侧先选番剧再选话数）',
               hintStyle: TextStyle(color: _mutedTextColor),
-              prefixIcon: Icon(Icons.search, color: _mutedTextColor, size: 18),
               filled: true,
               fillColor: _panelAltColor,
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 12,
-                vertical: 14,
-              ),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(10),
-                borderSide: BorderSide(color: _borderColor),
-              ),
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
               enabledBorder: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(10),
                 borderSide: BorderSide(color: _borderColor),
               ),
               focusedBorder: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(10),
-                borderSide: BorderSide(color: _accentColor),
+                borderSide: BorderSide(color: _accentColor, width: 2),
               ),
             ),
+            onChanged: (_) {},
             onSubmitted: (_) => _performSearch(),
           ),
         ),
         SizedBox(width: 12),
-        ElevatedButton(
+        AdaptiveMediaActionButton(
           onPressed: _isSearching ? null : _performSearch,
-          style: _primaryButtonStyle(),
-          child: _isSearching
-              ? SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                  ),
-                )
-              : const Text('搜索'),
+          label: _isSearching ? '搜索中' : '搜索',
+          desktopIcon: Icons.search_rounded,
+          phoneIcon: cupertino.CupertinoIcons.search,
+          emphasis: AdaptiveMediaActionEmphasis.primary,
         ),
       ],
     );
@@ -880,60 +842,111 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
     final windowHeight = MediaQuery.of(context).size.height;
     final panelHeight = windowHeight * 0.4; // 占窗口高度的40%
 
+    // 构建"包括子文件夹"勾选项
+    Widget? subfolderCheckbox;
+    if (widget.onIncludeSubfoldersChanged != null) {
+      subfolderCheckbox = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 18,
+            height: 18,
+            child: AdaptiveMediaCheckbox(
+              value: _includeSubfolders,
+              onChanged: _isReloadingFiles ? null : _onIncludeSubfoldersChanged,
+            ),
+          ),
+          SizedBox(width: 4),
+          GestureDetector(
+            onTap: _isReloadingFiles
+                ? null
+                : () => _onIncludeSubfoldersChanged(!_includeSubfolders),
+            child: Text(
+              '包括子文件夹',
+              style: TextStyle(color: _subTextColor, fontSize: 12),
+            ),
+          ),
+        ],
+      );
+    }
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _buildSectionTitle(
           '待匹配文件',
-          trailing: Text(
-            '已选 $_selectedFileCount/${_files.length}',
-            style: TextStyle(color: _subTextColor, fontSize: 12),
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (subfolderCheckbox != null) ...[
+                subfolderCheckbox,
+                SizedBox(width: 12),
+              ],
+              Text(
+                '已选 $_selectedFileCount/${_files.length}',
+                style: TextStyle(color: _subTextColor, fontSize: 12),
+              ),
+            ],
           ),
         ),
         SizedBox(height: 8),
         Container(
           height: panelHeight,
           decoration: _panelDecoration(),
-          child: ReorderableListView.builder(
-            shrinkWrap: true,
-            padding: const EdgeInsets.all(12),
-            itemCount: _files.length,
-            buildDefaultDragHandles: false,
-            proxyDecorator: (child, index, animation) {
-              final item = _files[index];
-              return Material(
-                color: Colors.transparent,
-                elevation: 8,
-                shadowColor: Colors.black26,
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(10),
-                  child: _buildFileListItem(
-                    item,
-                    index,
-                    isDragging: true,
-                    showBottomDivider: false,
+          child: _isReloadingFiles
+              ? Center(
+                  child: AdaptiveMediaActivityIndicator(
+                    size: 18,
+                    color: _accentColor,
                   ),
+                )
+              : ReorderableListView.builder(
+                  shrinkWrap: true,
+                  padding: const EdgeInsets.all(12),
+                  itemCount: _files.length,
+                  buildDefaultDragHandles: false,
+                  proxyDecorator: (child, index, animation) {
+                    final item = _files[index];
+                    return DecoratedBox(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(8),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Colors.black26,
+                            blurRadius: 12,
+                            offset: Offset(0, 5),
+                          ),
+                        ],
+                      ),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(10),
+                        child: _buildFileListItem(
+                          item,
+                          index,
+                          isDragging: true,
+                          showBottomDivider: false,
+                        ),
+                      ),
+                    );
+                  },
+                  onReorder: (oldIndex, newIndex) {
+                    setState(() {
+                      if (newIndex > oldIndex) newIndex -= 1;
+                      final item = _files.removeAt(oldIndex);
+                      _files.insert(newIndex, item);
+                    });
+                  },
+                  itemBuilder: (context, index) {
+                    final item = _files[index];
+                    final showBottomDivider = index != _files.length - 1;
+                    return _buildFileListItem(
+                      item,
+                      index,
+                      isDragging: false,
+                      showBottomDivider: showBottomDivider,
+                    );
+                  },
                 ),
-              );
-            },
-            onReorder: (oldIndex, newIndex) {
-              setState(() {
-                if (newIndex > oldIndex) newIndex -= 1;
-                final item = _files.removeAt(oldIndex);
-                _files.insert(newIndex, item);
-              });
-            },
-            itemBuilder: (context, index) {
-              final item = _files[index];
-              final showBottomDivider = index != _files.length - 1;
-              return _buildFileListItem(
-                item,
-                index,
-                isDragging: false,
-                showBottomDivider: showBottomDivider,
-              );
-            },
-          ),
         ),
       ],
     );
@@ -958,9 +971,9 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
           decoration: _panelDecoration(),
           child: _isSearching
               ? Center(
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation<Color>(_accentColor),
+                  child: AdaptiveMediaActivityIndicator(
+                    size: 18,
+                    color: _accentColor,
                   ),
                 )
               : _searchResults.isEmpty
@@ -998,9 +1011,9 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
     Widget panelContent;
     if (_isLoadingEpisodes) {
       panelContent = Center(
-        child: CircularProgressIndicator(
-          strokeWidth: 2,
-          valueColor: AlwaysStoppedAnimation<Color>(_accentColor),
+        child: AdaptiveMediaActivityIndicator(
+          size: 18,
+          color: _accentColor,
         ),
       );
     } else if (_episodes.isEmpty) {
@@ -1013,10 +1026,17 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
         buildDefaultDragHandles: false,
         proxyDecorator: (child, index, animation) {
           final episode = _episodes[index];
-          return Material(
-            color: Colors.transparent,
-            elevation: 8,
-            shadowColor: Colors.black26,
+          return DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              boxShadow: const [
+                BoxShadow(
+                  color: Colors.black26,
+                  blurRadius: 12,
+                  offset: Offset(0, 5),
+                ),
+              ],
+            ),
             child: ClipRRect(
               borderRadius: BorderRadius.circular(6),
               child: _buildEpisodeListItem(
@@ -1088,87 +1108,91 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
   @override
   Widget build(BuildContext context) {
     final keyboardHeight = MediaQuery.of(context).viewInsets.bottom;
-    return Focus(
-      autofocus: true,
-      onKeyEvent: _handleKeyEvent,
-      child: TextSelectionTheme(
-        data: _selectionTheme,
-        child: NipaplayWindowScaffold(
-          maxWidth: MediaQuery.of(context).size.width >= 1200
-              ? 980
-              : globals.DialogSizes.getDialogWidth(
-                  MediaQuery.of(context).size.width,
-                ),
-          maxHeightFactor: (globals.isPhone &&
-                  MediaQuery.of(context).size.shortestSide < 600)
-              ? 0.9
-              : 0.9,
-          onClose: () => Navigator.of(context).maybePop(),
-          backgroundColor: _surfaceColor,
-          child: SingleChildScrollView(
-            padding: EdgeInsets.fromLTRB(
-                24, 16, 24, 24 + keyboardHeight), // 使用viewInsets.bottom适应键盘高度
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _buildHeader(),
-                SizedBox(height: 16),
-                _buildSearchBar(),
-                SizedBox(height: 12),
-                LayoutBuilder(
-                  builder: (context, constraints) {
-                    final isWideLayout = constraints.maxWidth >= 820;
-                    final rightPanel = _selectedAnime == null
-                        ? _buildAnimeSearchResultsPanel(context)
-                        : _buildEpisodesPanel(context);
+    final sheetScope = CupertinoBottomSheetScope.maybeOf(context);
+    final topPadding = widget.embedded && sheetScope != null
+        ? sheetScope.contentTopInset / 1.3 + sheetScope.contentTopSpacing + 8
+        : 16.0;
+    final content = SingleChildScrollView(
+      padding: EdgeInsets.fromLTRB(24, topPadding, 24, 24 + keyboardHeight),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (!widget.embedded) ...[
+            _buildHeader(),
+            const SizedBox(height: 16),
+          ],
+          _buildSearchBar(),
+          const SizedBox(height: 12),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final isWideLayout = constraints.maxWidth >= 820;
+              final rightPanel = _selectedAnime == null
+                  ? _buildAnimeSearchResultsPanel(context)
+                  : _buildEpisodesPanel(context);
 
-                    if (isWideLayout) {
-                      return Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Expanded(child: _buildFilesPanel(context)),
-                          SizedBox(width: 16),
-                          Expanded(child: rightPanel),
-                        ],
-                      );
-                    }
-
-                    return Column(
-                      children: [
-                        _buildFilesPanel(context),
-                        SizedBox(height: 12),
-                        rightPanel,
-                      ],
-                    );
-                  },
-                ),
-                SizedBox(height: 12),
-                Row(
+              if (isWideLayout) {
+                return Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Expanded(
-                      child: Text(
-                        _selectedAnime == null
-                            ? (_searchMessage.isNotEmpty
-                                ? _searchMessage
-                                : '先在右侧搜索并选择番剧')
-                            : '对齐顺序后点击“一键匹配”',
-                        style: TextStyle(color: _subTextColor),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    ElevatedButton(
-                      onPressed: _canConfirm ? _confirmAndClose : null,
-                      style: _primaryButtonStyle(),
-                      child: const Text('一键匹配'),
-                    ),
+                    Expanded(child: _buildFilesPanel(context)),
+                    const SizedBox(width: 16),
+                    Expanded(child: rightPanel),
                   ],
-                ),
-              ],
-            ),
+                );
+              }
+
+              return Column(
+                children: [
+                  _buildFilesPanel(context),
+                  const SizedBox(height: 12),
+                  rightPanel,
+                ],
+              );
+            },
           ),
-        ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  _selectedAnime == null
+                      ? (_searchMessage.isNotEmpty
+                          ? _searchMessage
+                          : '先在右侧搜索并选择番剧')
+                      : '对齐顺序后点击“一键匹配”',
+                  style: TextStyle(color: _subTextColor),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              AdaptiveMediaActionButton(
+                onPressed: _canConfirm ? _confirmAndClose : null,
+                label: '一键匹配',
+                desktopIcon: Icons.done_all_rounded,
+                phoneIcon: cupertino.CupertinoIcons.check_mark_circled,
+                emphasis: AdaptiveMediaActionEmphasis.primary,
+              ),
+            ],
+          ),
+        ],
       ),
+    );
+    final body = Focus(
+      autofocus: !NipaplayLargeScreenModeScope.isActiveOf(context),
+      onKeyEvent: _handleKeyEvent,
+      child: TextSelectionTheme(data: _selectionTheme, child: content),
+    );
+    if (widget.embedded) return body;
+    return NipaplayWindowScaffold(
+      maxWidth: MediaQuery.of(context).size.width >= 1200
+          ? 980
+          : globals.DialogSizes.getDialogWidth(
+              MediaQuery.of(context).size.width,
+            ),
+      maxHeightFactor: 0.9,
+      onClose: () => Navigator.of(context).maybePop(),
+      backgroundColor: _surfaceColor,
+      child: body,
     );
   }
 }
@@ -1176,14 +1200,13 @@ class _BatchDanmakuMatchDialogState extends State<BatchDanmakuMatchDialog>
 class _FileItem {
   final String path;
   final String displayName;
-  bool selected;
+  bool selected = true;
   final String? episodeNumber;
   final int? sortKey;
 
   _FileItem({
     required this.path,
     required this.displayName,
-    this.selected = true,
   })  : episodeNumber = _extractEpisodeNumber(displayName),
         sortKey = _generateSortKey(_extractEpisodeNumber(displayName));
 
@@ -1258,5 +1281,3 @@ class _EpisodeItem {
     this.episodeNumber,
   });
 }
-
-enum _EpisodesMenuAction { changeAnime, selectAll, clearAll, selectFirstN }

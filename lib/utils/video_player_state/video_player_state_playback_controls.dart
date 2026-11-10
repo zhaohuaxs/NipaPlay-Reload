@@ -67,6 +67,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
       // 立即重置屏幕方向，不受后续等待阻塞，避免用户被卡在横屏状态
       if (globals.isMobilePlatform) {
         await ScreenOrientationManager.instance.resetOrientation();
+        _isFullscreen = false;
         await _restoreSystemUiOverlayStyleIfNeeded();
       }
 
@@ -74,11 +75,17 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
       // 截图依赖 player.snapshot()，播放器停止后截图会失败
       // 须先等截图完成，_currentThumbnailPath 才是最新值，_updateWatchHistory 才能写入正确缩略图
       if (_isCapturingFrame) {
+        // The OHOS native surface can stop drawing while the phone rotates.
+        // Its thumbnail is best effort and must not hold up leaving playback.
+        final screenshotWait = globals.isHarmonyOS &&
+                player.getPlayerKernelName() == 'MDK'
+            ? const Duration(milliseconds: 300)
+            : const Duration(seconds: 4);
         _logMacOSHdrResetTrace('waiting for exit screenshot to complete');
         try {
           await Future.any([
             _waitForScreenshotComplete(),
-            Future.delayed(const Duration(seconds: 4)),
+            Future.delayed(screenshotWait),
           ]);
           _logMacOSHdrResetTrace(
             'exit screenshot wait done, isCapturing=$_isCapturingFrame',
@@ -90,7 +97,8 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
           if (_isCapturingFrame) {
             _isCapturingFrame = false;
             _screenshotCompleter = null;
-            _logMacOSHdrResetTrace('force reset screenshot state after timeout');
+            _logMacOSHdrResetTrace(
+                'force reset screenshot state after timeout');
           }
         }
       }
@@ -99,7 +107,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
       // 移动端使用系统音量，player.volume 不需要改，但标志位需要重置
       if (_mutedForExit) {
         if (!_useSystemVolume) {
-          player.volume = _currentVolume;
+          applyPlayerVolume();
           _logMacOSHdrResetTrace('restored player volume to $_currentVolume');
         }
         _mutedForExit = false;
@@ -109,6 +117,11 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
       // 截图已完成，_currentThumbnailPath 是最新值，不会被旧缩略图覆盖
       if (_currentVideoPath != null) {
         await _updateWatchHistory(forceRemoteSync: true);
+        unawaited(
+          AutoSyncService.instance.syncOnPlaybackEnd().catchError((error) {
+            debugPrint('退出播放时增量同步失败: $error');
+          }),
+        );
       }
 
       // Jellyfin同步：如果是Jellyfin流媒体，停止同步
@@ -182,6 +195,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
       // 重置状态
       await _clearTimelinePreviewFiles();
       _currentVideoPath = null;
+      _currentMediaKey = null;
       _macOSWindowHostedVideoRect = null;
       _danmakuOverlayKey = 'idle'; // 重置弹幕覆盖层key
       _position = Duration.zero;
@@ -226,7 +240,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
 
       // 关闭唤醒锁
       try {
-        WakelockPlus.disable();
+        _setWakelockSafely(false);
       } catch (e) {
         //debugPrint("Error disabling wakelock: $e");
       }
@@ -278,6 +292,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
     bool clearPreviousMessages = false,
     bool resetState = false,
   }) {
+    final wasPlaying = _status == PlayerStatus.playing;
     if (newStatus == PlayerStatus.idle || resetState) {
       _resetVideoState();
     }
@@ -294,23 +309,51 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
       });
     }
 
+    if (newStatus == PlayerStatus.loading) {
+      _isStartupMessageFlowActive = true;
+    }
     if (clearPreviousMessages) {
       _statusMessages.clear();
     }
     if (message != null && message.isNotEmpty) {
-      _statusMessages.add(message);
-      // Optionally, limit the number of messages stored
-      // if (_statusMessages.length > 10) {
-      //   _statusMessages.removeAt(0);
-      // }
+      if (_isStartupMessageFlowActive) {
+        _recordStartupStatusMessage(message);
+      } else {
+        _statusMessages.add(message);
+      }
+    }
+
+    final preservePlaybackStatus = _isBackgroundDanmakuLoading &&
+        (_status == PlayerStatus.playing || _status == PlayerStatus.paused) &&
+        (newStatus == PlayerStatus.recognizing ||
+            newStatus == PlayerStatus.ready ||
+            newStatus == PlayerStatus.playing);
+    final preserveStartupLoadingStatus = _isStartupMessageFlowActive &&
+        (_status == PlayerStatus.loading ||
+            _status == PlayerStatus.recognizing) &&
+        newStatus == PlayerStatus.playing;
+    if (preservePlaybackStatus || preserveStartupLoadingStatus) {
+      _notifyListeners();
+      return;
     }
 
     _status = newStatus;
+    if (newStatus == PlayerStatus.ready ||
+        newStatus == PlayerStatus.error ||
+        newStatus == PlayerStatus.idle ||
+        newStatus == PlayerStatus.disposed) {
+      _isStartupMessageFlowActive = false;
+    }
 
     // Wakelock logic
     if (_status == PlayerStatus.playing) {
+      // 视频一开始播放就后台预热播放列表。片尾的“是否有下一话”检查
+      // 会直接命中缓存，不再等待 WebDAV/SMB/媒体服务器枚举目录。
+      if (!wasPlaying) {
+        unawaited(preloadPlaybackPlaylist());
+      }
       try {
-        WakelockPlus.enable();
+        _setWakelockSafely(true);
         ////debugPrint("Wakelock enabled: Playback started/resumed.");
       } catch (e) {
         ////debugPrint("Error enabling wakelock: $e");
@@ -329,7 +372,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
     } else {
       // Disable for any other status (paused, error, idle, disposed, ready, loading, recognizing)
       try {
-        WakelockPlus.disable();
+        _setWakelockSafely(false);
         ////debugPrint("Wakelock disabled. Status: $_status");
       } catch (e) {
         ////debugPrint("Error disabling wakelock: $e");
@@ -343,6 +386,43 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
     }
 
     _notifyListeners();
+  }
+
+  void _requestPlaybackErrorDialog() {
+    if (_playbackErrorDialogRequested || _isDisposed) return;
+    _playbackErrorDialogRequested = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_isDisposed) return;
+      final callback = onSeriousPlaybackErrorAndShouldPop;
+      if (callback != null) {
+        callback();
+        return;
+      }
+
+      // Fallback for playback surfaces that have not installed the normal UI
+      // callback. Remote load failures must never remain silent.
+      final dialogContext = _context;
+      if (dialogContext == null || !dialogContext.mounted) return;
+      unawaited(
+        BlurDialog.show<void>(
+          context: dialogContext,
+          title: '播放错误',
+          content: MediaSourceUtils.playbackErrorForDisplay(
+            _error ?? '远程视频载入失败，请检查网络或存储设备。',
+            _currentVideoPath,
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                resetPlayer();
+              },
+              child: const Text('确定'),
+            ),
+          ],
+        ),
+      );
+    });
   }
 
   void togglePlayPause() {
@@ -366,7 +446,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
     switch (_playbackEndAction) {
       case PlaybackEndAction.autoNext:
         if (_context != null && _context!.mounted) {
-          AutoNextEpisodeService.instance.startAutoNextEpisode(
+          await AutoNextEpisodeService.instance.startAutoNextEpisode(
             _context!,
             _currentVideoPath!,
           );
@@ -406,15 +486,16 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
       _bufferedPositionMs = 0;
       _playbackTimeMs.value = 0;
       _lastRawPlayerMs = -1; // 重置平滑时钟，下次 Ticker 重新对齐
-      // ✅ P2-LOOP-RESTART 修复：补齐 seekTo() 中正确设置的三个锚点字段
+      //  P2-LOOP-RESTART 修复：补齐 seekTo() 中正确设置的三个锚点字段
       // 根因：缺少 _smoothAnchorMs/_smoothAnchorElapsedUs/_seekTargetMs 设置
-      // → Ticker callback 下一帧从旧 player.position 重新锚定
-      // → playbackTimeMs 被覆盖回末尾 → 弹幕/视频跳回 → 鬼畜
+      //  Ticker callback 下一帧从旧 player.position 重新锚定
+      //  playbackTimeMs 被覆盖回末尾  弹幕/视频跳回  鬼畜
       // 参照：seekTo() (line 670-674) 正确设置了这三个字段
       _smoothAnchorMs = 0.0;
       _smoothAnchorElapsedUs = _lastElapsedUs;
       _seekTargetMs = 0.0; // 启用 seek 保护，而非清除
       _anchorSetBySeek = true; // 标记锚点由 seek/loop 设置
+      _seekRevision++;
       // [LOOP-RESTART-DIAG] 诊断：记录重置后的锚点状态
       if (!kReleaseMode) {
         debugPrint('[LOOP-RESTART-DIAG] AFTER RESET: '
@@ -437,6 +518,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
   }
 
   void pause() {
+    _playbackIntentGeneration++;
     if (_status == PlayerStatus.playing) {
       final bool isWindowsMediaKit = !kIsWeb &&
           Platform.isWindows &&
@@ -446,6 +528,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
           // Hint mpv to pause immediately on Windows to reduce control latency.
           player.setProperty('pause', 'yes');
         } catch (_) {}
+        _setStatus(PlayerStatus.paused, message: '已暂停');
       }
 
       // 使用直接暂停方法，确保VideoPlayer插件能够暂停视频
@@ -482,13 +565,24 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
       }
 
       _saveCurrentPositionToHistory();
-      // 在暂停时触发截图（Windows+MediaKit 延迟，避免与 mpv 暂停竞争）
-      if (isWindowsMediaKit) {
-        Future.delayed(const Duration(milliseconds: 400), () {
-          if (_status == PlayerStatus.paused) {
-            _captureConditionalScreenshot("暂停时");
-          }
-        });
+      final bool deferInteractiveThumbnailCapture =
+          _usesWindowsPlatformVideoSurface;
+      if (deferInteractiveThumbnailCapture) {
+        // 在暂停时触发截图（Windows+MediaKit 延迟，避免与 mpv 暂停竞争）
+        if (_currentThumbnailPath == null || _currentThumbnailPath!.isEmpty) {
+          Future.delayed(const Duration(seconds: 3), () {
+            if (_status == PlayerStatus.paused &&
+                !_isCapturingFrame &&
+                (_currentThumbnailPath == null ||
+                    _currentThumbnailPath!.isEmpty)) {
+              _captureConditionalScreenshot("暂停时");
+            }
+          });
+        }
+      } else if (isWindowsMediaKit) {
+        // Windows+MediaKit 暂停后不做 snapshot：暂停态对 mpv 渲染管线取帧
+        // 会在本地大文件（MFT 硬解）上冻死 platform 线程（UI 全卡）。
+        // 缩略图由首播截图提供；恢复播放后由现有条件截图补新帧。
       } else {
         _captureConditionalScreenshot("暂停时");
       }
@@ -496,14 +590,16 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
       _pausedPlaybackTimeMs = _playbackTimeMs.value;
       // 停止UI更新Ticker，避免继续产帧
       _uiUpdateTicker?.stop();
-      // WakelockPlus.disable(); // Already handled by _setStatus
+      // _setWakelockSafely(false); // Already handled by _setStatus
     }
   }
 
   void play() {
+    _playbackIntentGeneration++;
     // <<< ADDED DEBUG LOG >>>
     debugPrint(
-      '[VideoPlayerState] play() called. hasVideo: $hasVideo, _status: $_status, currentMedia: ${player.media}',
+      '[VideoPlayerState] play() called. hasVideo: $hasVideo, _status: $_status, '
+      'currentMedia: ${_redactMediaUrlForLog(player.media)}',
     );
     final bool isWindowsMediaKit = !kIsWeb &&
         Platform.isWindows &&
@@ -518,13 +614,16 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
     // 兜底恢复：若 handleBackButton 静音后未经 resetPlayer 进入新一轮播放（如错误弹窗流程）
     if (_mutedForExit) {
       if (!_useSystemVolume) {
-        player.volume = _currentVolume;
+        applyPlayerVolume();
       }
       _mutedForExit = false;
     }
     if (hasVideo &&
         (_status == PlayerStatus.paused || _status == PlayerStatus.ready)) {
       _lastPlaybackStartMs = DateTime.now().millisecondsSinceEpoch;
+      if (isWindowsMediaKit) {
+        _setStatus(PlayerStatus.playing, message: '开始播放');
+      }
       // 使用直接播放方法，确保VideoPlayer插件能够播放视频
       player.playDirectly().then((_) {
         //debugPrint('[VideoPlayerState] playDirectly() 调用成功');
@@ -533,16 +632,25 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
 
         // 播放开始时提交观看记录到弹弹play
         _submitWatchHistoryToDandanplay();
-      }).catchError((e) {
+      }).catchError((e) async {
         debugPrint('[VideoPlayerState] playDirectly() 调用失败: $e');
-        // 尝试使用传统方法
+        // 内核在后台可能进入 idle（erika ErikaStatus 3）：play 无效，需重载 media 再播
+        try {
+          final kernel = player.getPlayerKernelName();
+          if (kernel.toLowerCase().contains('erika') &&
+              _currentVideoPath != null && _currentVideoPath!.isNotEmpty) {
+            debugPrint('[VideoPlayerState] erika idle 检测到，重载 media 恢复播放');
+            await player.retryCurrentMediaLoad();
+            await Future<void>.delayed(const Duration(milliseconds: 300));
+            await player.playDirectly();
+          }
+        } catch (reopenErr) {
+          debugPrint('[VideoPlayerState] 重载 media 失败: $reopenErr');
+        }
         player.state = PlaybackState.playing;
         _setStatus(PlayerStatus.playing, message: '开始播放');
-
-        // 播放开始时提交观看记录到弹弹play
         _submitWatchHistoryToDandanplay();
       });
-
       // <<< ADDED DEBUG LOG >>>
       debugPrint(
         '[VideoPlayerState] play() -> _status set to PlayerStatus.playing. Notifying listeners.',
@@ -551,10 +659,12 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
       // 在首次播放时进行截图
       if (!_hasInitialScreenshot) {
         _hasInitialScreenshot = true;
-        // 延迟一秒再截图，确保视频已经开始显示
-        Future.delayed(const Duration(seconds: 1), () {
-          _captureConditionalScreenshot("首次播放时");
-        });
+        if (!_usesWindowsPlatformVideoSurface) {
+          // 延迟一秒再截图，确保视频已经开始显示
+          Future.delayed(const Duration(seconds: 1), () {
+            _captureConditionalScreenshot("首次播放时");
+          });
+        }
       }
       // 视频开始播放后更新解码器信息
       Future.delayed(const Duration(seconds: 1), () {
@@ -568,21 +678,49 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
         _startUiUpdateTimer();
       }
       if (!(_uiUpdateTicker?.isActive ?? false)) {
-        // ✅ P2 修复：恢复播放时重设锚点，避免 Ticker elapsed 重置导致 elapsedDeltaUs 负值
+        //  P2 修复：恢复播放时重设锚点，避免 Ticker elapsed 重置导致 elapsedDeltaUs 负值
         // Flutter Ticker stop()+start() 后 elapsed 从 0 重新开始，
         // 但 _smoothAnchorElapsedUs 保留暂停前的值（如 5,000,000μs），
-        // 导致恢复首帧 elapsedDeltaUs = 16,667 - 5,000,000 = 负数 → smoothMs 大幅落后
+        // 导致恢复首帧 elapsedDeltaUs = 16,667 - 5,000,000 = 负数  smoothMs 大幅落后
         //
-        // ✅ P3 修复：使用暂停时保存的 playbackTimeMs 作为锚点，
+        //  P3 修复：使用暂停时保存的 playbackTimeMs 作为锚点，
         // 而不是让首帧走"重锚到 player.position"路径。
         // mpv 恢复后 player.position 可能回退（比暂停前小几十ms），
         // 直接锚定到 playerMs 会导致弹幕跳变到错误时间点。
         // 使用暂停时的精确值确保弹幕从暂停位置无缝继续。
         if (_pausedPlaybackTimeMs != null) {
-          _smoothAnchorMs = _pausedPlaybackTimeMs!;
-          _smoothAnchorElapsedUs = 0; // Ticker 重启后 elapsed 从 0 开始
-          _lastRawPlayerMs = -1; // 保持 -1，让漂移修正自然校准
-          _pausedPlaybackTimeMs = null;
+          // ════════════════════════════════════════════════════════════════════
+          //  切集污染判定（2026-06-21）：丢弃可疑的 _pausedPlaybackTimeMs
+          // ════════════════════════════════════════════════════════════════════
+          // 正常暂停恢复：_pausedPlaybackTimeMs 是本集暂停位置，用作锚点无缝继续
+          // 切集污染：_pausedPlaybackTimeMs 是旧集末尾（_clearPreviousVideoState 漏清理时），
+          //   误用会导致 playbackTimeMs 卡在旧集末尾  弹幕查不到  后续突跌回弹
+          //   判定：_pausedPlaybackTimeMs > 新集 duration+1s（旧集末尾超过新集时长）
+          //         或 _pausedPlaybackTimeMs>1s 且 _position<100ms（旧集末尾值 + 新集开头位置）
+          final isSuspectEpisodeSwitch = _pausedPlaybackTimeMs! >
+                  _duration.inMilliseconds.toDouble() + 1000.0 ||
+              (_pausedPlaybackTimeMs! > 1000.0 &&
+                  _position.inMilliseconds < 100);
+          if (!kReleaseMode) {
+            debugPrint('[EP-SWITCH-DIAG] play() RESUME-FROM-PAUSE: '
+                'pausedPlaybackTimeMs=${_pausedPlaybackTimeMs!.toStringAsFixed(1)}ms '
+                'newDuration=${_duration.inMilliseconds}ms '
+                'newPosition=${_position.inMilliseconds}ms '
+                ' SUSPECT_EPISODE_SWITCH=$isSuspectEpisodeSwitch '
+                '${isSuspectEpisodeSwitch ? "丢弃旧集末尾污染值，走正常首帧锚定" : "正常暂停恢复，用作锚点"}');
+          }
+          if (isSuspectEpisodeSwitch) {
+            // 丢弃污染值，走正常首帧锚定（ticker 首帧锚定到 player.position=0）
+            _smoothAnchorMs = 0.0;
+            _smoothAnchorElapsedUs = 0;
+            _lastRawPlayerMs = -1;
+            _pausedPlaybackTimeMs = null;
+          } else {
+            _smoothAnchorMs = _pausedPlaybackTimeMs!;
+            _smoothAnchorElapsedUs = 0; // Ticker 重启后 elapsed 从 0 开始
+            _lastRawPlayerMs = -1; // 保持 -1，让漂移修正自然校准
+            _pausedPlaybackTimeMs = null;
+          }
         } else {
           _lastRawPlayerMs = -1;
         }
@@ -608,10 +746,42 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
   }
 
   void _clearPreviousVideoState() {
+    _cancelDfmStartupGate();
+    _isStartupMessageFlowActive = false;
+    _playbackGeneration++;
+    _isBackgroundDanmakuLoading = false;
+    // ════════════════════════════════════════════════════════════════════
+    //  切集时清理平滑时钟锚点 + _pausedPlaybackTimeMs（2026-06-21）
+    // ════════════════════════════════════════════════════════════════════
+    // 原缺陷：_clearPreviousVideoState 不重置平滑时钟字段，旧集末尾位置残留。
+    // 切集时序：playNextEpisodetogglePlayPausepause 保存 _pausedPlaybackTimeMs=旧集末尾
+    //  initializePlayer_clearPreviousVideoState（此处）不清理
+    //  新集 play() 暂停恢复路径误把 _pausedPlaybackTimeMs(旧集末尾) 当新集锚点
+    //  playbackTimeMs 卡在旧集末尾（clamp 到新集 duration） 弹幕查不到  后续突跌回弹
+    //
+    // 切集首个清理点同步重置所有平滑时钟字段 + _pausedPlaybackTimeMs
+    // 让新集 play() 走正常首帧锚定（锚定到 player.position=0），而非误用旧集末尾。
+    _playbackTimeMs.value = 0.0;
+    _smoothAnchorMs = 0.0;
+    _smoothAnchorElapsedUs = _lastElapsedUs; // 用当前 elapsed，非 0（0 是暂停恢复专用）
+    _seekTargetMs = null; // 切集非 seek 场景，无需 seek 保护
+    _lastRawPlayerMs = -1; // 重置，让下次 ticker 走首帧锚定
+    _anchorSetBySeek = false;
+    _pausedPlaybackTimeMs = null; // 清理旧集暂停保存值，避免新集 play() 误用
+    _mdkNearEndLastPositionMs = -1;
+    _mdkNearEndStalledSinceMs = 0;
+    if (!kReleaseMode) {
+      debugPrint('[EP-SWITCH-DIAG] _clearPreviousVideoState ANCHOR RESET: '
+          'ptm=0.0 smoothAnchorMs=0.0 smoothAnchorElapsedUs=$_smoothAnchorElapsedUs '
+          'seekTargetMs=null lastRawPlayerMs=-1 pausedPlaybackTimeMs=null '
+          ' 切集锚点已清理，新集将走正常首帧锚定');
+    }
     _subtitleManager.clearExternalSubtitle(notifyListenersToo: false);
     _currentVideoPath = null;
+    _currentMediaKey = null;
     _currentActualPlayUrl = null; // 清除实际播放URL
     _currentPlaybackSession = null;
+    _currentEmbyAccountKey = null;
     _lastPlaybackStartMs = 0;
     _danmakuOverlayKey = 'idle'; // 重置弹幕覆盖层key
     _currentVideoHash = null;
@@ -620,9 +790,21 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
     _episodeTitle = null;
     _episodeId = null; // 清除弹幕ID
     _animeId = null; // 清除弹幕ID
+    // 跳过片头：连带清掉 ID 解析状态。
+    // 同一部番的 bangumiId / MAL ID 在切集时是稳定的，但缓存它们会让
+    // 「换一部番播放」时拿到上一部的 ID——而这里没有任何信息能可靠区分
+    // 「同番切集」和「换番重播」，所以一律清空重解析（Bangumi / AniList
+    // 各自有内存缓存兜底，重复解析几乎零成本）。
+    _bangumiId = null;
+    _episodeNumber = null;
+    _animeMalId = null;
+    _malIdResolved = false;
     _initialHistoryItem = null;
+    _playbackDetailContext = null;
+    _playbackPlaylistCache.invalidate();
     _danmakuList.clear();
     _danmakuListVersion++;
+    clearSkipSegments();
     _danmakuTracks.clear();
     _danmakuTrackEnabled.clear();
     _isSpoilerDanmakuAnalyzing = false;
@@ -651,10 +833,18 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
     // Do NOT call WakelockPlus.disable() here directly, _setStatus will handle it
   }
 
-  void _saveCurrentPositionToHistory() {
+  Future<void> _saveCurrentPositionToHistory() async {
     if (_currentVideoPath != null) {
-      _saveVideoPosition(_currentVideoPath!, _position.inMilliseconds);
+      await _saveVideoPosition(_currentVideoPath!, _position.inMilliseconds);
     }
+    await PlaybackPositionStore.instance.flush();
+  }
+
+  /// Called only after the user has accepted exiting, before process shutdown.
+  Future<void> savePlaybackPositionForExit() async {
+    _uiUpdateTicker?.stop();
+    _uiUpdateTimer?.cancel();
+    await _saveCurrentPositionToHistory();
   }
 
   void _resetVideoState() {
@@ -668,21 +858,24 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
     _progress = 0.0;
     _duration = Duration.zero;
     _bufferedPositionMs = 0;
-      _playbackTimeMs.value = 0;
-      _lastRawPlayerMs = -1; // 重置平滑时钟
-      // ✅ P2-LOOP-RESTART 一致性修复：补齐锚点字段（与 seekTo() 保持一致）
-      _smoothAnchorMs = 0.0;
-      _smoothAnchorElapsedUs = 0;
-      _seekTargetMs = null; // [SEEK-TRACE] source=RESET-VIDEO-STATE — idle/stop 场景无需 seek 保护
-      _anchorSetBySeek = false; // idle/stop 场景锚点非 seek 设置
-      _lastPlaybackStartMs = 0;
+    _playbackTimeMs.value = 0;
+    _lastRawPlayerMs = -1; // 重置平滑时钟
+    //  P2-LOOP-RESTART 一致性修复：补齐锚点字段（与 seekTo() 保持一致）
+    _smoothAnchorMs = 0.0;
+    _smoothAnchorElapsedUs = 0;
+    _seekTargetMs =
+        null; // [SEEK-TRACE] source=RESET-VIDEO-STATE — idle/stop 场景无需 seek 保护
+    _anchorSetBySeek = false; // idle/stop 场景锚点非 seek 设置
+    _lastPlaybackStartMs = 0;
     if (!_isErrorStopping) {
       // <<< MODIFIED HERE
       _error = null;
     }
     _currentVideoPath = null;
+    _currentMediaKey = null;
     _currentActualPlayUrl = null;
     _currentPlaybackSession = null;
+    _currentEmbyAccountKey = null;
     _danmakuOverlayKey = 'idle'; // 重置弹幕覆盖层key
     _currentVideoHash = null;
     _currentThumbnailPath = null;
@@ -692,9 +885,21 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
     _episodeTitle = null;
     _episodeId = null; // 清除弹幕ID
     _animeId = null; // 清除弹幕ID
+    // 跳过片头：连带清掉 ID 解析状态。
+    // 同一部番的 bangumiId / MAL ID 在切集时是稳定的，但缓存它们会让
+    // 「换一部番播放」时拿到上一部的 ID——而这里没有任何信息能可靠区分
+    // 「同番切集」和「换番重播」，所以一律清空重解析（Bangumi / AniList
+    // 各自有内存缓存兜底，重复解析几乎零成本）。
+    _bangumiId = null;
+    _episodeNumber = null;
+    _animeMalId = null;
+    _malIdResolved = false;
     _initialHistoryItem = null;
+    _playbackDetailContext = null;
+    _playbackPlaylistCache.invalidate();
     _danmakuList.clear();
     _danmakuListVersion++;
+    clearSkipSegments();
     _danmakuTracks.clear();
     _danmakuTrackEnabled.clear();
     _isSpoilerDanmakuAnalyzing = false;
@@ -763,6 +968,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
       _smoothAnchorElapsedUs = _lastElapsedUs;
       _seekTargetMs = _position.inMilliseconds.toDouble();
       _anchorSetBySeek = true; // 标记锚点由 seek 设置
+      _seekRevision++;
       if (_duration.inMilliseconds > 0) {
         _progress = clampedPosition.inMilliseconds / _duration.inMilliseconds;
       }
@@ -799,6 +1005,35 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
           setShowControls(false);
         }
       });
+    }
+  }
+
+  /// Uses a single, television-friendly timeout for large-screen controls.
+  ///
+  /// The desktop player also owns legacy 1.5 second mouse timers. Those are
+  /// deliberately cancelled here so remote navigation always gets five full
+  /// seconds after the latest interaction.
+  void resetLargeScreenControlsAutoHideTimer() {
+    _hideControlsTimer?.cancel();
+    _hideMouseTimer?.cancel();
+    resetAutoHideTimer();
+  }
+
+  /// Idempotently reveals the controls for a remote MENU/Escape event.
+  ///
+  /// flutter-tvos can surface one remote press both as a key event and as a
+  /// navigation popRoute. Making reveal idempotent prevents the two delivery
+  /// paths from toggling the controls on and immediately back off.
+  void revealLargeScreenControls() {
+    _hideControlsTimer?.cancel();
+    _hideMouseTimer?.cancel();
+    _autoHideTimer?.cancel();
+
+    final visibilityChanged = !_showControls;
+    _showControls = true;
+    resetLargeScreenControlsAutoHideTimer();
+    if (visibilityChanged) {
+      _notifyListeners();
     }
   }
 
@@ -974,11 +1209,29 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
     return !_isFullscreen;
   }
 
-  // 切换全屏状态（仅用于桌面平台）
+  // 手机上在横屏全屏和竖屏窗口布局之间切换；桌面端切换系统全屏。
   Future<void> toggleFullscreen() async {
     if (kIsWeb) return;
-    if (!Platform.isWindows && !Platform.isMacOS && !Platform.isLinux) return;
     if (_isFullscreenTransitioning) return;
+
+    if (globals.isPhone) {
+      _isFullscreenTransitioning = true;
+      try {
+        if (_isFullscreen) {
+          await ScreenOrientationManager.instance.setPhonePlaybackPortrait();
+          _isFullscreen = false;
+        } else {
+          await ScreenOrientationManager.instance.setPhonePlaybackLandscape();
+          _isFullscreen = true;
+        }
+        _notifyListeners();
+      } finally {
+        _isFullscreenTransitioning = false;
+      }
+      return;
+    }
+
+    if (!Platform.isWindows && !Platform.isMacOS && !Platform.isLinux) return;
 
     _isFullscreenTransitioning = true;
     try {
@@ -1023,8 +1276,133 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
 
   // 添加单个状态消息的方法
   void _addStatusMessage(String message) {
-    _statusMessages.add(message);
+    if (_isStartupMessageFlowActive) {
+      _recordStartupStatusMessage(message);
+    } else {
+      _statusMessages.add(message);
+    }
     _notifyListeners();
+  }
+
+  bool _isDfmStartupMessageMode() =>
+      !kIsWeb &&
+      DanmakuKernelFactory.activePluginRenderer == null &&
+      DanmakuKernelFactory.getKernelType() == DanmakuRenderEngine.dfmPlus;
+
+  bool _isDanmakuStartupMessage(String message) {
+    return message.contains('弹幕') ||
+        message.contains('识别视频') ||
+        message.contains('视频识别');
+  }
+
+  bool _isFailedStartupMessage(String message) {
+    return message.contains('失败') ||
+        message.contains('无法') ||
+        message.contains('无效') ||
+        message.contains('未匹配') ||
+        message.contains('未找到') ||
+        message.contains('未登录') ||
+        message.contains('跳过');
+  }
+
+  bool _isCompletedStartupMessage(String message) {
+    return message.contains('完成') ||
+        message.contains('成功') ||
+        message.startsWith('已自动加载');
+  }
+
+  String _asStartupProgress(String message) {
+    final base = message.trim().replaceFirst(RegExp(r'[.…]+$'), '');
+    return '$base...';
+  }
+
+  bool _isPendingStartupMessage(String message) {
+    return message.endsWith('...') &&
+        !message.endsWith('...[完成]') &&
+        !message.endsWith('...[失败]');
+  }
+
+  void _finishLatestStartupMessage({required bool successful}) {
+    if (_statusMessages.isEmpty) return;
+    final index = _statusMessages.length - 1;
+    final current = _statusMessages[index];
+    if (!_isPendingStartupMessage(current)) return;
+    _statusMessages[index] = '$current${successful ? '[完成]' : '[失败]'}';
+  }
+
+  void _startStartupMessage(String message) {
+    final progress = _asStartupProgress(message);
+    if (_statusMessages.isNotEmpty && _statusMessages.last == progress) return;
+    if (_statusMessages.isNotEmpty &&
+        _isPendingStartupMessage(_statusMessages.last) &&
+        progress.startsWith('正在初始化播放器') &&
+        _statusMessages.last.startsWith('正在初始化播放器')) {
+      return;
+    }
+    _finishLatestStartupMessage(successful: true);
+    _statusMessages.add(progress);
+  }
+
+  String _failedStageFor(String message) {
+    if (message.contains('识别') || message.contains('匹配')) {
+      return '正在识别视频...';
+    }
+    if (message.contains('弹幕')) return '正在加载弹幕...';
+    return _asStartupProgress(message);
+  }
+
+  void _recordStartupStatusMessage(String message) {
+    final trimmed = message.trim();
+    if (trimmed.isEmpty) return;
+
+    final isDanmaku = _isDanmakuStartupMessage(trimmed);
+    if (_isDfmStartupMessageMode() && isDanmaku) {
+      const stage = '全舰弹幕装填...';
+      var stageIndex = _statusMessages.lastIndexWhere(
+        (entry) => entry.startsWith(stage),
+      );
+      if (stageIndex < 0) {
+        _startStartupMessage(stage);
+        stageIndex = _statusMessages.length - 1;
+      } else if (!_isFailedStartupMessage(trimmed) &&
+          _statusMessages[stageIndex].endsWith('[失败]')) {
+        // A later fallback source can recover a failed online attempt. Reuse
+        // the same condensed DFM line while that fallback is still working.
+        _statusMessages[stageIndex] = stage;
+      }
+      if (_isFailedStartupMessage(trimmed)) {
+        if (_statusMessages[stageIndex] == stage) {
+          _statusMessages[stageIndex] = '$stage[失败]';
+        }
+      }
+      return;
+    }
+
+    if (trimmed.startsWith('视频识别成功，正在加载弹幕')) {
+      _finishLatestStartupMessage(successful: true);
+      _startStartupMessage('正在加载弹幕...');
+      return;
+    }
+    if (_isFailedStartupMessage(trimmed)) {
+      final failedStage = _failedStageFor(trimmed);
+      final activeIsStartupPreparation = _statusMessages.isNotEmpty &&
+          _isPendingStartupMessage(_statusMessages.last) &&
+          (_statusMessages.last.contains('初始化播放器') ||
+              _statusMessages.last.contains('准备') ||
+              _statusMessages.last.contains('媒体播放'));
+      if (_statusMessages.isEmpty ||
+          !_isPendingStartupMessage(_statusMessages.last) ||
+          activeIsStartupPreparation) {
+        _startStartupMessage(failedStage);
+      }
+      _finishLatestStartupMessage(successful: false);
+      return;
+    }
+    if (_isCompletedStartupMessage(trimmed) || trimmed == '准备就绪') {
+      _finishLatestStartupMessage(successful: true);
+      return;
+    }
+    _startStartupMessage(trimmed);
   }
 
   // 清除所有状态消息的方法
@@ -1033,9 +1411,20 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
     _notifyListeners();
   }
 
+  // SRT 字幕拖动激活标志：拖动期间屏蔽音量/亮度/进度手势，避免误触
+  // （字段声明在 VideoPlayerState 主类，见 video_player_state.dart）
+  bool get subtitleDragActive => _subtitleDragActive;
+
+  void setSubtitleDragActive(bool active) {
+    if (_subtitleDragActive == active) return;
+    _subtitleDragActive = active;
+    _notifyListeners();
+  }
+
   // Volume Drag Methods
   void startVolumeDrag() {
     if (!globals.isMobilePlatform) return;
+    if (_subtitleDragActive) return; // 字幕拖动中不响应音量手势
     _initialDragVolume = _currentVolume;
     _showVolumeIndicator(); // We'll define this next
     debugPrint("Volume drag started. Initial drag volume: $_initialDragVolume");
@@ -1068,7 +1457,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
         _queueSystemVolumeUpdate(newVolume);
       } else {
         // Web 等不支持系统音量时：使用播放器内部音量
-        player.volume = newVolume;
+        applyPlayerVolume();
       }
     } catch (e) {
       //debugPrint("Failed to set system volume via player: $e");
@@ -1087,8 +1476,11 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
   void increaseVolume({double? step}) {
     try {
       final double baseStep = step ?? _volumeStep;
-      final double currentVolume = _currentVolume;
-      final double newVolume = (currentVolume + baseStep).clamp(0.0, 1.0);
+      // 使用整数百分比运算避免浮点精度问题（100%95%90% 而非 100%94.9%89.9%）
+      final int currentPercent = (_currentVolume * 100).round();
+      final int stepPercent = (baseStep * 100).round();
+      final int newPercent = (currentPercent + stepPercent).clamp(0, 100);
+      final double newVolume = newPercent / 100.0;
 
       _currentVolume = newVolume;
       _initialDragVolume = newVolume;
@@ -1100,7 +1492,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
         _ensurePlayerVolumeMatchesPlatformPolicy();
         _queueSystemVolumeUpdate(newVolume);
       } else {
-        player.volume = newVolume;
+        applyPlayerVolume();
       }
 
       if (globals.isDesktop) {
@@ -1117,8 +1509,11 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
   void decreaseVolume({double? step}) {
     try {
       final double baseStep = step ?? _volumeStep;
-      final double currentVolume = _currentVolume;
-      final double newVolume = (currentVolume - baseStep).clamp(0.0, 1.0);
+      // 使用整数百分比运算避免浮点精度问题（100%95%90% 而非 100%94.9%89.9%）
+      final int currentPercent = (_currentVolume * 100).round();
+      final int stepPercent = (baseStep * 100).round();
+      final int newPercent = (currentPercent - stepPercent).clamp(0, 100);
+      final double newVolume = newPercent / 100.0;
 
       _currentVolume = newVolume;
       _initialDragVolume = newVolume;
@@ -1130,7 +1525,7 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
         _ensurePlayerVolumeMatchesPlatformPolicy();
         _queueSystemVolumeUpdate(newVolume);
       } else {
-        player.volume = newVolume;
+        applyPlayerVolume();
       }
 
       if (globals.isDesktop) {
@@ -1201,32 +1596,15 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
   void _showSeekIndicator() {
     if (!globals.isMobilePlatform || _context == null) return;
 
-    final uiThemeProvider = Provider.of<UIThemeProvider>(
-      _context!,
-      listen: false,
-    );
-    final bool useCupertinoStyle =
-        uiThemeProvider.isCupertinoTheme && globals.isPhone;
-
     _isSeekIndicatorVisible = true;
 
     if (_seekOverlayEntry == null) {
       _seekOverlayEntry = OverlayEntry(
         builder: (context) {
-          final seekWidget = useCupertinoStyle
-              ? const CupertinoSeekIndicator()
-              : const SeekIndicator();
-          Widget overlayChild = ChangeNotifierProvider<VideoPlayerState>.value(
+          return ChangeNotifierProvider<VideoPlayerState>.value(
             value: this,
-            child: seekWidget,
+            child: const SeekIndicator(),
           );
-          if (useCupertinoStyle) {
-            overlayChild = ChangeNotifierProvider<UIThemeProvider>.value(
-              value: uiThemeProvider,
-              child: overlayChild,
-            );
-          }
-          return overlayChild;
         },
       );
       Overlay.of(_context!).insert(_seekOverlayEntry!);
@@ -1262,6 +1640,101 @@ extension VideoPlayerStatePlaybackControls on VideoPlayerState {
         _seekOverlayEntry!.remove();
         _seekOverlayEntry = null;
       }
+    }
+  }
+
+  // ── 逐帧跳转 ──
+
+  /// 逐帧前进：暂停后前进一帧
+  void stepForward() {
+    if (!hasVideo) return;
+    // 先暂停
+    if (_status == PlayerStatus.playing) {
+      togglePlayPause();
+    }
+    player.stepForward();
+  }
+
+  /// 逐帧后退：暂停后后退一帧
+  void stepBackward() {
+    if (!hasVideo) return;
+    // 先暂停
+    if (_status == PlayerStatus.playing) {
+      togglePlayPause();
+    }
+    player.stepBackward();
+  }
+
+  // ── 窗口适配视频分辨率 ──
+
+  /// 将桌面窗口大小调整为视频原始分辨率（窗口 >= 视频大小，视频不拉伸）
+  Future<void> resizeWindowToVideoSize() async {
+    if (!globals.isDesktop || !hasVideo) return;
+    try {
+      final info = player.mediaInfo;
+      final videoStreams = info.video;
+      if (videoStreams == null || videoStreams.isEmpty) return;
+      final videoWidth = videoStreams.first.codec.width;
+      final videoHeight = videoStreams.first.codec.height;
+      if (videoWidth <= 0 || videoHeight <= 0) return;
+
+      final windowManager = WindowManager.instance;
+
+      // 如果窗口处于全屏或最大化状态，先退出才能设置大小
+      if (await windowManager.isFullScreen()) {
+        await windowManager.setFullScreen(false);
+      }
+      if (await windowManager.isMaximized()) {
+        await windowManager.unmaximize();
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
+
+      // 解除之前的宽高比锁定，以便自由设置窗口大小
+      await windowManager.setAspectRatio(0);
+
+      final devicePixelRatio = WidgetsBinding
+          .instance.platformDispatcher.views.first.devicePixelRatio;
+
+      // 动态测量窗口偏移量：窗口尺寸(WINDOW RECT) - 内容区(CLIENT AREA)
+      // 偏移量包含透明调整边框、标题栏、窗口chrome等，无需硬编码
+      final currentWindowSize = await windowManager.getSize();
+      final currentViewSize =
+          WidgetsBinding.instance.platformDispatcher.views.first.physicalSize;
+      final offsetW =
+          currentWindowSize.width - currentViewSize.width / devicePixelRatio;
+      final offsetH =
+          currentWindowSize.height - currentViewSize.height / devicePixelRatio;
+
+      // 测量内容区中非视频UI元素（如AppBar/TabBar）的高度
+      // 需要遍历所有祖先Scaffold，因为_context在VideoPlayerWidget内，
+      // 最近的是PlayVideoPage的Scaffold(无appBar)，外层才是CustomScaffold的Scaffold(有appBar)
+      double inContentUIHeight = 0;
+      final context = _context;
+      if (context != null && context.mounted) {
+        context.visitAncestorElements((element) {
+          if (element is StatefulElement && element.state is ScaffoldState) {
+            final scaffoldState = element.state as ScaffoldState;
+            final appBarHeight = scaffoldState.appBarMaxHeight ?? 0;
+            if (appBarHeight > 0) {
+              inContentUIHeight += appBarHeight;
+            }
+          }
+          return true; // 继续遍历所有祖先
+        });
+      }
+
+      // 目标窗口尺寸 = 视频逻辑尺寸 + 窗口边框偏移 + 内容区UI高度
+      double logicalWidth = videoWidth / devicePixelRatio + offsetW;
+      double logicalHeight =
+          videoHeight / devicePixelRatio + offsetH + inContentUIHeight;
+
+      // 最小尺寸保护
+      logicalWidth = logicalWidth.clamp(320.0, 7680.0);
+      logicalHeight = logicalHeight.clamp(240.0, 4320.0);
+
+      await windowManager.setSize(Size(logicalWidth, logicalHeight));
+    } catch (e) {
+      debugPrint('调整窗口大小失败: $e');
     }
   }
 }

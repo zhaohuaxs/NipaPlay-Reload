@@ -1,3 +1,5 @@
+import 'package:nipaplay/services/media_server_pagination.dart';
+import 'package:nipaplay/utils/performance_trace.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'package:flutter/foundation.dart';
@@ -13,10 +15,65 @@ import 'debug_log_service.dart';
 import 'package:nipaplay/models/jellyfin_transcode_settings.dart';
 import 'package:nipaplay/services/emby_transcode_manager.dart';
 import 'package:nipaplay/services/media_server_playback_client.dart';
+import 'package:nipaplay/services/media_server_image_loader.dart';
 import 'media_server_service_base.dart';
+
+/// 在后台 isolate 里完成 `json.decode` + 逐条 `fromJson`。
+///
+/// Emby 的媒体库接口同样使用 `Recursive=true&Limit=99999`，响应体可达几十 MB。
+/// 在主 isolate 上解析会让 UI 整段卡死，因此把纯 CPU 的解码与建模挪出主线程。
+List<EmbyMediaItem> _decodeEmbyItems(String body) {
+  final data = json.decode(body);
+  final List<dynamic> items = data['Items'] ?? const [];
+  return items
+      .map((item) => EmbyMediaItem.fromJson(item))
+      .toList(growable: true);
+}
+
+/// 小于该长度的响应直接在主 isolate 解析，避免为小请求白付一次 isolate 启动开销。
+const int _kEmbyInlineDecodeLimit = 64 * 1024;
+
+/// 解析 `/Items` 响应，大响应自动转到后台 isolate。
+Future<List<EmbyMediaItem>> _decodeEmbyItemsMaybeIsolated(String body) {
+  return PerformanceTrace.measure('emby.items.decode', () {
+    if (body.length < _kEmbyInlineDecodeLimit) {
+      return Future.value(_decodeEmbyItems(body));
+    }
+    return compute(_decodeEmbyItems, body);
+  }, itemCount: (items) => items.length);
+}
+
+MediaServerPage<EmbyMediaItem> _decodeEmbyMediaPage(String body) =>
+    decodeMediaServerPage(body, EmbyMediaItem.fromJson);
+MediaServerPage<EmbyMovieInfo> _decodeEmbyMoviePage(String body) =>
+    decodeMediaServerPage(body, EmbyMovieInfo.fromJson);
 
 class EmbyService extends MediaServerServiceBase
     implements MediaServerPlaybackClient {
+  Future<List<T>> _loadItemPages<T>(
+      String endpoint, MediaServerPage<T> Function(String) decoder,
+      {bool Function()? isCurrent}) {
+    final server = _serverUrl;
+    final user = _userId;
+    final token = _accessToken;
+    return loadMediaServerItems(
+      endpoint: endpoint,
+      request: _makeAuthenticatedRequest,
+      decode: (body) => PerformanceTrace.measure(
+          'emby.items.decode',
+          () => body.length < 64 * 1024
+              ? Future.value(decoder(body))
+              : compute(decoder, body),
+          itemCount: (page) => page.items.length),
+      isCurrent: () =>
+          (isCurrent?.call() ?? true) &&
+          _isConnected &&
+          _serverUrl == server &&
+          _userId == user &&
+          _accessToken == token,
+    );
+  }
+
   static final EmbyService instance = EmbyService._internal();
 
   EmbyService._internal();
@@ -190,6 +247,49 @@ class EmbyService extends MediaServerServiceBase
     }
   }
 
+  /// Fetches source metadata for the selection UI without creating playback.
+  Future<List<PlaybackMediaSource>> getPlaybackMediaSources(
+    String itemId,
+  ) async {
+    if (!_isConnected || _userId == null) {
+      throw StateError('Not connected to an Emby server.');
+    }
+
+    final response = await _makeAuthenticatedRequest(
+      '/emby/Items/$itemId/PlaybackInfo?UserId=$_userId',
+    );
+    if (response.statusCode != 200) {
+      throw StateError(
+        'Unable to load Emby media sources (HTTP ${response.statusCode}).',
+      );
+    }
+
+    final decoded = json.decode(response.body);
+    if (decoded is! Map) return const <PlaybackMediaSource>[];
+    final rawSources = decoded['MediaSources'];
+    if (rawSources is! List) return const <PlaybackMediaSource>[];
+    return <PlaybackMediaSource>[
+      for (final rawSource in rawSources)
+        if (rawSource is Map)
+          _metadataOnlyMediaSource(
+            PlaybackMediaSource.fromJson(
+              Map<String, dynamic>.from(rawSource),
+            ),
+          ),
+    ];
+  }
+
+  PlaybackMediaSource _metadataOnlyMediaSource(PlaybackMediaSource source) =>
+      PlaybackMediaSource(
+        id: source.id,
+        name: source.name,
+        size: source.size,
+        bitRate: source.bitRate,
+        container: source.container,
+        path: source.path,
+        mediaStreams: source.mediaStreams,
+      );
+
   // Getters
   @override
   bool get isConnected => _isConnected;
@@ -202,7 +302,11 @@ class EmbyService extends MediaServerServiceBase
   @override
   String? get serverUrl => _serverUrl;
   @override
-  set serverUrl(String? value) => _serverUrl = value;
+  set serverUrl(String? value) {
+    _serverUrl = value;
+    setMediaServerBaseUrl('emby', value);
+  }
+
   @override
   String? get username => _username;
   @override
@@ -335,8 +439,15 @@ class EmbyService extends MediaServerServiceBase
       return trimmed;
     }
 
-    String normalized = trimmed.startsWith('/') ? trimmed : '/$trimmed';
-    if (!normalized.toLowerCase().startsWith('/emby')) {
+    bool bypassEmby = false;
+    String cleanPath = trimmed;
+    if (trimmed.startsWith('[no-emby]')) {
+      bypassEmby = true;
+      cleanPath = trimmed.substring('[no-emby]'.length);
+    }
+
+    String normalized = cleanPath.startsWith('/') ? cleanPath : '/$cleanPath';
+    if (!bypassEmby && !normalized.toLowerCase().startsWith('/emby')) {
       normalized = '/emby$normalized';
     }
 
@@ -352,8 +463,14 @@ class EmbyService extends MediaServerServiceBase
       {String method = 'GET',
       Map<String, dynamic>? body,
       Duration? timeout}) async {
-    return makeAuthenticatedRequest(path,
-        method: method, body: body, timeout: timeout);
+    return PerformanceTrace.measure(
+        PerformanceTrace.enabled && PerformanceTrace.isItemListing(path)
+            ? 'emby.http.items'
+            : 'emby.http.other',
+        () => makeAuthenticatedRequest(path,
+            method: method, body: body, timeout: timeout),
+        responseBytes: (response) => response.bodyBytes.length,
+        isFailure: (response) => response.statusCode >= 400);
   }
 
   @override
@@ -361,12 +478,46 @@ class EmbyService extends MediaServerServiceBase
     if (!_isConnected || _userId == null) return;
 
     try {
-      final response =
-          await _makeAuthenticatedRequest('/emby/Library/MediaFolders');
+      List<dynamic>? items;
 
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        final items = data['Items'] as List;
+      // Helper function to safely fetch items from a given path
+      Future<List<dynamic>?> fetchItemsFromPath(String path) async {
+        try {
+          final response = await _makeAuthenticatedRequest(path);
+          if (response.statusCode != 200) {
+            return null;
+          }
+          final contentType = response.headers['content-type'] ?? '';
+          if (contentType.toLowerCase().contains('text/html')) {
+            return null;
+          }
+          final data = json.decode(response.body);
+          if (data is Map && data.containsKey('Items')) {
+            final list = data['Items'];
+            if (list is List && list.isNotEmpty) {
+              return list;
+            }
+          }
+        } catch (e) {
+          DebugLogService().addLog('EmbyService: 获取媒体库路径 ($path) 失败: $e');
+        }
+        return null;
+      }
+
+      // 1. Try requesting '/emby/Library/MediaFolders'
+      items = await fetchItemsFromPath('/emby/Library/MediaFolders');
+
+      // 2. Try requesting '/emby/Users/{userId}/Views'
+      if (items == null || items.isEmpty) {
+        items = await fetchItemsFromPath('/emby/Users/$_userId/Views');
+      }
+
+      // 3. Try requesting '/Users/{userId}/Views' (without /emby prefix)
+      if (items == null || items.isEmpty) {
+        items = await fetchItemsFromPath('[no-emby]/Users/$_userId/Views');
+      }
+
+      if (items != null) {
         final List<EmbyLibrary> tempLibraries = [];
 
         for (var item in items) {
@@ -409,7 +560,7 @@ class EmbyService extends MediaServerServiceBase
         }
         _availableLibraries = tempLibraries;
       } else {
-        print('Error response: ${response.statusCode} - ${response.body}');
+        DebugLogService().addLog('EmbyService: 所有媒体库获取路径均失败或返回空项');
       }
     } catch (e, stackTrace) {
       print('Error loading available libraries: $e');
@@ -420,6 +571,7 @@ class EmbyService extends MediaServerServiceBase
   // 获取媒体库或文件夹下的子项（用于混合类型文件夹导航）
   Future<List<EmbyMediaItem>> getFolderItems(
     String parentId, {
+    bool Function()? isCurrent,
     int limit = 99999,
   }) async {
     if (!_isConnected || _userId == null) {
@@ -441,25 +593,19 @@ class EmbyService extends MediaServerServiceBase
           .map((e) => '${e.key}=${Uri.encodeComponent(e.value)}')
           .join('&');
 
-      final response = await _makeAuthenticatedRequest(
-          '/emby/Users/$_userId/Items?$queryString');
+      final results = await _loadItemPages(
+          '/emby/Users/$_userId/Items?$queryString', _decodeEmbyMediaPage,
+          isCurrent: isCurrent);
+      results.sort((a, b) {
+        if (a.isFolder != b.isFolder) {
+          return a.isFolder ? -1 : 1;
+        }
+        return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      });
 
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        final List<dynamic> items = data['Items'] ?? [];
-
-        final results =
-            items.map((item) => EmbyMediaItem.fromJson(item)).toList();
-
-        results.sort((a, b) {
-          if (a.isFolder != b.isFolder) {
-            return a.isFolder ? -1 : 1;
-          }
-          return a.name.toLowerCase().compareTo(b.name.toLowerCase());
-        });
-
-        return results;
-      }
+      return results;
+    } on MediaServerRequestSuperseded {
+      return [];
     } catch (e) {
       debugPrint('Error fetching folder items for parent $parentId: $e');
     }
@@ -467,13 +613,28 @@ class EmbyService extends MediaServerServiceBase
     return [];
   }
 
+  /// Views 已经提供库类型；兼容没有实现库详情接口的第三方 Emby 服务。
+  Future<String> _getLibraryCollectionType(String libraryId) async {
+    for (final library in _availableLibraries) {
+      if (library.id == libraryId) {
+        return _resolveCollectionType(library.type);
+      }
+    }
+    final response = await _makeAuthenticatedRequest(
+        '/emby/Users/$_userId/Items/$libraryId');
+    final data = json.decode(response.body);
+    return _resolveCollectionType(data['CollectionType']);
+  }
+
   // 按特定媒体库获取最新内容
   Future<List<EmbyMediaItem>> getLatestMediaItemsByLibrary(
     String libraryId, {
+    bool Function()? isCurrent,
     int limit = 20,
     String? sortBy,
     String? sortOrder,
   }) async {
+    final session = (_serverUrl, _userId, _accessToken);
     if (!_isConnected) {
       return [];
     }
@@ -483,17 +644,11 @@ class EmbyService extends MediaServerServiceBase
       final defaultSortBy = sortBy ?? 'DateCreated,SortName';
       final defaultSortOrder = sortOrder ?? 'Descending';
 
-      // 首先获取媒体库信息以确定类型
-      final libraryResponse =
-          await _makeAuthenticatedRequest('/Users/$_userId/Items/$libraryId');
-
-      if (libraryResponse.statusCode != 200) {
+      final collectionType = await _getLibraryCollectionType(libraryId);
+      if (session != (_serverUrl, _userId, _accessToken) ||
+          !(isCurrent?.call() ?? true)) {
         return [];
       }
-
-      final libraryData = json.decode(libraryResponse.body);
-      final String collectionType =
-          _resolveCollectionType(libraryData['CollectionType']);
 
       // 根据媒体库类型选择不同的IncludeItemTypes
       String includeItemTypes;
@@ -505,15 +660,12 @@ class EmbyService extends MediaServerServiceBase
         includeItemTypes = 'Movie,Episode,Video';
       }
 
-      final response = await _makeAuthenticatedRequest(
-          '/Items?ParentId=$libraryId&IncludeItemTypes=$includeItemTypes&Recursive=true&SortBy=$defaultSortBy&SortOrder=$defaultSortOrder&Limit=$limit&Fields=Overview,CommunityRating');
-
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        final List<dynamic> items = data['Items'];
-
-        return items.map((item) => EmbyMediaItem.fromJson(item)).toList();
-      }
+      return await _loadItemPages(
+          '/emby/Users/$_userId/Items?ParentId=$libraryId&IncludeItemTypes=$includeItemTypes&Recursive=true&SortBy=$defaultSortBy&SortOrder=$defaultSortOrder&Limit=$limit&Fields=Overview,CommunityRating',
+          _decodeEmbyMediaPage,
+          isCurrent: isCurrent);
+    } on MediaServerRequestSuperseded {
+      return [];
     } catch (e) {
       print('Error fetching media items for library $libraryId: $e');
     }
@@ -531,17 +683,7 @@ class EmbyService extends MediaServerServiceBase
     }
 
     try {
-      // 首先获取媒体库信息以确定类型
-      final libraryResponse =
-          await _makeAuthenticatedRequest('/Users/$_userId/Items/$libraryId');
-
-      if (libraryResponse.statusCode != 200) {
-        return [];
-      }
-
-      final libraryData = json.decode(libraryResponse.body);
-      final String collectionType =
-          _resolveCollectionType(libraryData['CollectionType']);
+      final collectionType = await _getLibraryCollectionType(libraryId);
 
       // 根据媒体库类型选择不同的IncludeItemTypes
       String includeItemTypes;
@@ -555,13 +697,10 @@ class EmbyService extends MediaServerServiceBase
 
       // 使用Emby的随机排序获取随机内容，并请求Overview字段
       final response = await _makeAuthenticatedRequest(
-          '/Items?ParentId=$libraryId&IncludeItemTypes=$includeItemTypes&Recursive=true&SortBy=Random&Limit=$limit&Fields=Overview,CommunityRating');
+          '/emby/Users/$_userId/Items?ParentId=$libraryId&IncludeItemTypes=$includeItemTypes&Recursive=true&SortBy=Random&Limit=$limit&Fields=Overview,CommunityRating');
 
       if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        final List<dynamic> items = data['Items'];
-
-        return items.map((item) => EmbyMediaItem.fromJson(item)).toList();
+        return _decodeEmbyItemsMaybeIsolated(response.body);
       }
     } catch (e) {
       print('Error fetching random media items for library $libraryId: $e');
@@ -571,11 +710,13 @@ class EmbyService extends MediaServerServiceBase
   }
 
   Future<List<EmbyMediaItem>> getLatestMediaItems({
+    bool Function()? isCurrent,
     int limitPerLibrary = 99999,
     int totalLimit = 99999,
     String? sortBy,
     String? sortOrder,
   }) async {
+    final session = (_serverUrl, _userId, _accessToken);
     if (!_isConnected || _selectedLibraryIds.isEmpty || _userId == null) {
       return [];
     }
@@ -590,12 +731,20 @@ class EmbyService extends MediaServerServiceBase
         'EmbyService: 获取媒体项 - sortBy: $defaultSortBy, sortOrder: $defaultSortOrder');
 
     try {
-      for (final libraryId in _selectedLibraryIds) {
+      for (final libraryId in List<String>.of(_selectedLibraryIds)) {
+        if (session != (_serverUrl, _userId, _accessToken) ||
+            !(isCurrent?.call() ?? true)) {
+          return [];
+        }
         try {
           // 首先获取媒体库信息以确定类型
           final libraryResponse = await _makeAuthenticatedRequest(
               '/emby/Users/$_userId/Items/$libraryId');
 
+          if (session != (_serverUrl, _userId, _accessToken) ||
+              !(isCurrent?.call() ?? true)) {
+            return [];
+          }
           if (libraryResponse.statusCode == 200) {
             final libraryData = json.decode(libraryResponse.body);
             final String collectionType =
@@ -626,20 +775,11 @@ class EmbyService extends MediaServerServiceBase
             final queryString = Uri(queryParameters: queryParameters).query;
             final fullPath = '$path?$queryString';
 
-            final response = await _makeAuthenticatedRequest(fullPath);
-
-            if (response.statusCode == 200) {
-              final data = json.decode(response.body);
-              if (data['Items'] != null) {
-                final items = data['Items'] as List;
-                allItems.addAll(
-                    items.map((item) => EmbyMediaItem.fromJson(item)).toList());
-              }
-            } else {
-              print(
-                  'Error fetching Emby items for library $libraryId: ${response.statusCode} - ${response.body}');
-            }
+            allItems.addAll(await _loadItemPages(fullPath, _decodeEmbyMediaPage,
+                isCurrent: isCurrent));
           }
+        } on MediaServerRequestSuperseded {
+          return [];
         } catch (e, stackTrace) {
           print('Error fetching Emby items for library $libraryId: $e');
           print('Stack trace: $stackTrace');
@@ -656,12 +796,21 @@ class EmbyService extends MediaServerServiceBase
         });
       }
 
+      final seenIds = <String>{};
+      allItems.retainWhere((item) => seenIds.add(item.id));
+
       // 应用总数限制
       if (allItems.length > totalLimit) {
         allItems = allItems.sublist(0, totalLimit);
       }
 
+      if (session != (_serverUrl, _userId, _accessToken) ||
+          !(isCurrent?.call() ?? true)) {
+        return [];
+      }
       return allItems;
+    } on MediaServerRequestSuperseded {
+      return [];
     } catch (e, stackTrace) {
       print('Error getting latest media items from Emby: $e');
       print('Stack trace: $stackTrace');
@@ -670,7 +819,9 @@ class EmbyService extends MediaServerServiceBase
   }
 
   // 获取最新电影列表
-  Future<List<EmbyMovieInfo>> getLatestMovies({int limit = 99999}) async {
+  Future<List<EmbyMovieInfo>> getLatestMovies(
+      {int limit = 99999, bool Function()? isCurrent}) async {
+    final session = (_serverUrl, _userId, _accessToken);
     if (!_isConnected || _selectedLibraryIds.isEmpty || _userId == null) {
       return [];
     }
@@ -678,20 +829,18 @@ class EmbyService extends MediaServerServiceBase
     List<EmbyMovieInfo> allMovies = [];
 
     // 从每个选中的媒体库获取最新电影
-    for (String libraryId in _selectedLibraryIds) {
+    for (String libraryId in List<String>.of(_selectedLibraryIds)) {
+      if (session != (_serverUrl, _userId, _accessToken) ||
+          !(isCurrent?.call() ?? true)) {
+        return [];
+      }
       try {
-        final response = await _makeAuthenticatedRequest(
-            '/emby/Users/$_userId/Items?ParentId=$libraryId&IncludeItemTypes=Movie&Recursive=true&SortBy=DateCreated,SortName&SortOrder=Descending&Limit=$limit');
-
-        if (response.statusCode == 200) {
-          final data = json.decode(response.body);
-          final List<dynamic> items = data['Items'];
-
-          List<EmbyMovieInfo> libraryMovies =
-              items.map((item) => EmbyMovieInfo.fromJson(item)).toList();
-
-          allMovies.addAll(libraryMovies);
-        }
+        allMovies.addAll(await _loadItemPages(
+            '/emby/Users/$_userId/Items?ParentId=$libraryId&IncludeItemTypes=Movie&Recursive=true&SortBy=DateCreated,SortName&SortOrder=Descending&Limit=$limit',
+            _decodeEmbyMoviePage,
+            isCurrent: isCurrent));
+      } on MediaServerRequestSuperseded {
+        return [];
       } catch (e, stackTrace) {
         print('Error fetching movies for library $libraryId: $e');
         print('Stack trace: $stackTrace');
@@ -701,11 +850,18 @@ class EmbyService extends MediaServerServiceBase
     // 按最近添加日期排序
     allMovies.sort((a, b) => b.dateAdded.compareTo(a.dateAdded));
 
+    final seenIds = <String>{};
+    allMovies.retainWhere((item) => seenIds.add(item.id));
+
     // 限制总数
     if (allMovies.length > limit) {
       allMovies = allMovies.sublist(0, limit);
     }
 
+    if (session != (_serverUrl, _userId, _accessToken) ||
+        !(isCurrent?.call() ?? true)) {
+      return [];
+    }
     return allMovies;
   }
 
@@ -804,14 +960,28 @@ class EmbyService extends MediaServerServiceBase
     }
 
     try {
-      final response = await _makeAuthenticatedRequest(
-          '/emby/Users/$_userId/Items?parentId=$seriesId&IncludeItemTypes=Season&Recursive=false&Fields=Overview');
+      // 先用标准的季接口。部分服务端（版本或反代配置不同）会忽略通用 Items
+      // 接口的 IncludeItemTypes=Season，把单集当成季返回：季 Tab 显示单集名，
+      // 再按这个“季”查集自然为空（#570）。
+      http.Response response;
+      try {
+        response = await _makeAuthenticatedRequest(
+            '/emby/Shows/$seriesId/Seasons?userId=$_userId&Fields=Overview');
+      } catch (e) {
+        // 不支持标准季接口的服务端回退到通用 Items 接口，结果在下面按类型过滤。
+        DebugLogService().addLog('EmbyService: 标准季接口失败，回退到 Items 接口: $e');
+        response = await _makeAuthenticatedRequest(
+            '/emby/Users/$_userId/Items?parentId=$seriesId&IncludeItemTypes=Season&Recursive=false&Fields=Overview');
+      }
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         final items = data['Items'] as List;
 
-        return items.map((item) => EmbySeasonInfo.fromJson(item)).toList();
+        return items
+            .where((item) => _hasItemType(item, 'Season'))
+            .map((item) => EmbySeasonInfo.fromJson(item))
+            .toList();
       } else {
         print('Error response: ${response.statusCode} - ${response.body}');
         throw Exception('HTTP ${response.statusCode}: 无法获取季节信息');
@@ -821,6 +991,13 @@ class EmbyService extends MediaServerServiceBase
       print('Stack trace: $stackTrace');
       throw Exception('无法获取季节信息: $e');
     }
+  }
+
+  /// 条目带了 Type 且不是 [type] 时排除；没带 Type 的条目保留。
+  static bool _hasItemType(dynamic item, String type) {
+    if (item is! Map) return false;
+    final itemType = item['Type'];
+    return itemType == null || itemType == type;
   }
 
   Future<List<EmbyEpisodeInfo>> getEpisodes(String seasonId) async {
@@ -836,7 +1013,11 @@ class EmbyService extends MediaServerServiceBase
         final data = json.decode(response.body);
         final items = data['Items'] as List;
 
-        return items.map((item) => EmbyEpisodeInfo.fromJson(item)).toList();
+        // 通用 Items 接口同样可能不执行 IncludeItemTypes 过滤。
+        return items
+            .where((item) => _hasItemType(item, 'Episode'))
+            .map((item) => EmbyEpisodeInfo.fromJson(item))
+            .toList();
       } else {
         print('Error response: ${response.statusCode} - ${response.body}');
         throw Exception('HTTP ${response.statusCode}: 无法获取剧集信息');
@@ -1731,7 +1912,8 @@ class EmbyService extends MediaServerServiceBase
   }
 
   /// 获取Emby视频的字幕轨道信息，包括内嵌字幕和外挂字幕
-  Future<List<Map<String, dynamic>>> getSubtitleTracks(String itemId) async {
+  Future<List<Map<String, dynamic>>> getSubtitleTracks(String itemId,
+      {String? mediaSourceId}) async {
     if (!_isConnected) {
       throw Exception('未连接到Emby服务器');
     }
@@ -1746,7 +1928,15 @@ class EmbyService extends MediaServerServiceBase
           debugPrint('EmbyService: 未找到媒体源信息');
           return [];
         }
-        final mediaSource = mediaSources[0];
+        dynamic mediaSource = mediaSources[0];
+        if (mediaSourceId != null && mediaSourceId.isNotEmpty) {
+          for (final source in mediaSources) {
+            if (source is Map && source['Id']?.toString() == mediaSourceId) {
+              mediaSource = source;
+              break;
+            }
+          }
+        }
         final mediaStreams = mediaSource['MediaStreams'] as List?;
         if (mediaStreams == null) {
           debugPrint('EmbyService: 未找到媒体流信息');
@@ -1828,7 +2018,8 @@ class EmbyService extends MediaServerServiceBase
 
   /// 下载Emby外挂字幕文件
   Future<String?> downloadSubtitleFile(
-      String itemId, int subtitleIndex, String format) async {
+      String itemId, int subtitleIndex, String format,
+      {String? mediaSourceId}) async {
     if (kIsWeb) return null;
     if (!_isConnected || _accessToken == null) {
       throw Exception('未连接到Emby服务器');
@@ -1847,16 +2038,30 @@ class EmbyService extends MediaServerServiceBase
         debugPrint('EmbyService: 未找到媒体源信息');
         return null;
       }
-      final mediaSourceId = mediaSources[0]['Id'];
+      dynamic mediaSource = mediaSources[0];
+      if (mediaSourceId != null && mediaSourceId.isNotEmpty) {
+        for (final source in mediaSources) {
+          if (source is Map && source['Id']?.toString() == mediaSourceId) {
+            mediaSource = source;
+            break;
+          }
+        }
+      }
+      final resolvedMediaSourceId = mediaSource['Id'];
       // 构建字幕下载URL
       final subtitleUrl =
-          '$_serverUrl/emby/Videos/$itemId/$mediaSourceId/Subtitles/$subtitleIndex/Stream.$format?api_key=$_accessToken';
+          '$_serverUrl/emby/Videos/$itemId/$resolvedMediaSourceId/Subtitles/$subtitleIndex/Stream.$format?api_key=$_accessToken';
       debugPrint(
         'EmbyService: 下载字幕文件: ${Uri.parse(subtitleUrl).replace(queryParameters: const <String, String>{})}',
       );
       // 下载字幕文件
-      final subtitleResponse = await http
-          .get(WebRemoteAccessService.proxyUri(Uri.parse(subtitleUrl)));
+      final subtitleResponse = await sendRequestFollowingRedirects(
+        WebRemoteAccessService.proxyUri(Uri.parse(subtitleUrl)),
+        method: 'GET',
+        headers: const {},
+        timeout: const Duration(seconds: 30),
+        redirectLogLabel: 'EmbyService: 下载字幕',
+      );
       if (subtitleResponse.statusCode == 200) {
         // 保存到临时文件
         final tempDir = await getTemporaryDirectory();

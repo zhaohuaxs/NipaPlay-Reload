@@ -27,6 +27,207 @@ class AppLocalizationsEn extends AppLocalizations {
   String get tabAccount => 'Account';
 
   @override
+  String get tabDanmakuConsole => 'Danmaku Console';
+
+  @override
+  String get externalPlayerConsoleTitle => 'External Player Danmaku Console';
+
+  @override
+  String get externalPlayerConsoleEmptyTitle => 'No external player is running';
+
+  @override
+  String get externalPlayerConsoleEmptyDescription =>
+      'Start playback with an external player to see its session and controls here.';
+
+  @override
+  String get externalPlayerConsoleAnime => 'Anime';
+
+  @override
+  String get externalPlayerConsoleEpisode => 'Episode';
+
+  @override
+  String get externalPlayerConsoleEpisodeId => 'Episode ID';
+
+  @override
+  String get externalPlayerConsoleProcessId => 'Player PID';
+
+  @override
+  String get externalPlayerConsoleMediaPath => 'Media path';
+
+  @override
+  String get externalPlayerConsoleUnknownAnime => 'Unknown anime';
+
+  @override
+  String get externalPlayerConsoleUnknownEpisode => 'Unknown episode';
+
+  @override
+  String get externalPlayerConsoleProgress => 'Playback progress';
+
+  @override
+  String get externalPlayerConsoleProgressUnsupported =>
+      'This player does not support progress synchronization.';
+
+  @override
+  String get externalPlayerConsoleProgressLoading =>
+      'Reading playback progress…';
+
+  @override
+  String get externalPlayerConsoleTimestampLabel => 'Exact timestamp';
+
+  @override
+  String get externalPlayerConsoleTimestampHint => 'HH:MM:SS / MM:SS / seconds';
+
+  @override
+  String get externalPlayerConsoleTimestampInvalid => 'Enter a valid timestamp';
+
+  @override
+  String get externalPlayerConsoleTimestampSeek => 'Jump';
+
+  @override
+  String get externalPlayerConsoleDanmakuList => 'Danmaku list';
+
+  @override
+  String externalPlayerConsoleDanmakuStats(int total, int active) {
+    return '$total total · $active on screen';
+  }
+
+  @override
+  String get externalPlayerConsoleDanmakuEmpty =>
+      'No danmaku was loaded for this playback session.';
+
+  @override
+  String get externalPlayerConsoleDanmakuUnknownSender => 'Unknown';
+
+  @override
+  String get externalPlayerConsoleDanmakuSender => 'Sender';
+
+  @override
+  String get externalPlayerConsoleDanmakuTypeScroll => 'Scroll';
+
+  @override
+  String get externalPlayerConsoleDanmakuTypeTop => 'Top';
+
+  @override
+  String get externalPlayerConsoleDanmakuTypeBottom => 'Bottom';
+
+  @override
+  String get externalPlayerConsoleDanmakuActive => 'On screen';
+
+  @override
+  String get externalPlayerConsoleDanmakuFollowEnabled => 'Following playback';
+
+  @override
+  String get externalPlayerConsoleDanmakuFollowDisabled => 'Auto-follow paused';
+
+  @override
+  String get externalPlayerConsoleDanmakuKeywordFilter => 'Danmaku block rules';
+
+  @override
+  String get externalPlayerConsoleDanmakuKeywordHint => 'Enter rule content';
+
+  @override
+  String get externalPlayerConsoleDanmakuKeywordAdd => 'Add';
+
+  @override
+  String get externalPlayerConsoleDanmakuBlocked => 'Blocked';
+
+  @override
+  String get externalPlayerConsoleDanmakuBlockModeKeyword => 'Keyword';
+
+  @override
+  String get externalPlayerConsoleDanmakuBlockModeRegex => 'Regular expression';
+
+  @override
+  String get externalPlayerConsoleDanmakuBlockModeSender => 'Sender ID';
+
+  @override
+  String get externalPlayerConsoleDanmakuBlockInvalid =>
+      'Enter a valid, non-duplicate rule';
+
+  @override
+  String get externalPlayerConsoleDanmakuBlockRemove => 'Remove rule';
+
+  @override
+  String get externalPlayerConsoleDanmakuShow => 'Show danmaku';
+
+  @override
+  String get externalPlayerConsoleDanmakuHide => 'Hide danmaku';
+
+  @override
+  String get externalPlayerConsoleDanmakuOffsetTitle => 'Danmaku timing offset';
+
+  @override
+  String externalPlayerConsoleDanmakuOffsetAdvance(String seconds) {
+    return 'Show ${seconds}s earlier';
+  }
+
+  @override
+  String externalPlayerConsoleDanmakuOffsetDelay(String seconds) {
+    return 'Show ${seconds}s later';
+  }
+
+  @override
+  String get externalPlayerConsoleDanmakuOffsetReset => 'Reset';
+
+  @override
+  String get externalPlayerConsoleDanmakuOffsetCustomLabel =>
+      'Custom offset in seconds';
+
+  @override
+  String get externalPlayerConsoleDanmakuOffsetCustomHint =>
+      'Negative is earlier, positive is later';
+
+  @override
+  String get externalPlayerConsoleDanmakuOffsetInvalid =>
+      'Enter a valid number of seconds';
+
+  @override
+  String get externalPlayerConsoleDanmakuOffsetApply => 'Apply';
+
+  @override
+  String externalPlayerConsoleDanmakuOffsetCurrentAdvance(String seconds) {
+    return 'Danmaku currently appears ${seconds}s earlier';
+  }
+
+  @override
+  String externalPlayerConsoleDanmakuOffsetCurrentDelay(String seconds) {
+    return 'Danmaku currently appears ${seconds}s later';
+  }
+
+  @override
+  String get externalPlayerConsoleDanmakuOffsetCurrentNone =>
+      'Current danmaku offset is 0s';
+
+  @override
+  String get danmakuOpacityTitle => 'Danmaku opacity';
+
+  @override
+  String get danmakuFontSizeTitle => 'Danmaku font size';
+
+  @override
+  String get danmakuOpacitySubtitle =>
+      'Adjust danmaku text opacity. Newly opened videos will use this setting.';
+
+  @override
+  String get danmakuOutlineEnabledTitle => 'Enable danmaku outline';
+
+  @override
+  String get danmakuOutlineEnabledSubtitle =>
+      '0 disables the outline, 1 uses a thin outline, and 2 restores the original thick outline. Newly opened videos use this setting.';
+
+  @override
+  String get danmakuOutlineWidthTitle => 'Danmaku outline thickness';
+
+  @override
+  String get externalPlayerConsoleResume => 'Resume';
+
+  @override
+  String get externalPlayerConsolePause => 'Pause';
+
+  @override
+  String get externalPlayerConsoleClose => 'Close Player';
+
+  @override
   String get tabSettings => 'Settings';
 
   @override
@@ -529,6 +730,22 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get webdavAddress => 'WebDAV Address';
+
+  @override
+  String get addressAtLeastOne =>
+      'Please fill in at least one of the internal or public address';
+
+  @override
+  String get webdavLanAddress => 'Internal Address';
+
+  @override
+  String get webdavWanAddress => 'Public Address';
+
+  @override
+  String get smbLanHost => 'Internal Host / IP';
+
+  @override
+  String get smbWanHost => 'Public Host / IP';
 
   @override
   String get smbAddServer => 'Add SMB Server';
@@ -1269,6 +1486,59 @@ class AppLocalizationsEn extends AppLocalizations {
       'Auto-match on play disabled (manual matching available)';
 
   @override
+  String get skipDanmakuMatchingTitle => 'Skip Danmaku Matching';
+
+  @override
+  String get skipDanmakuMatchingDescription =>
+      'Do not automatically identify or load danmaku, or open a matching dialog, when playing videos from any source. Manual matching remains available from the player.';
+
+  @override
+  String get skipDanmakuMatchingEnabled => 'Danmaku matching will be skipped';
+
+  @override
+  String get skipDanmakuMatchingDisabled => 'Danmaku matching restored';
+
+  @override
+  String get danmakuAutoLoadStrategyTitle => 'Danmaku Auto-Load';
+
+  @override
+  String get danmakuAutoLoadStrategySubtitle =>
+      'Choose what danmaku should be loaded automatically when opening a local video.';
+
+  @override
+  String get danmakuAutoLoadStrategyRemoteAndLocal =>
+      'Remote + Local Same-Name';
+
+  @override
+  String get danmakuAutoLoadStrategyRemoteAndLocalDescription =>
+      'Default: auto-load remote danmaku and also add same-name .xml/.json files from the video folder.';
+
+  @override
+  String get danmakuAutoLoadStrategyRemote => 'Remote Danmaku';
+
+  @override
+  String get danmakuAutoLoadStrategyRemoteDescription =>
+      'Auto-match and load danmaku from DanDanPlay.';
+
+  @override
+  String get danmakuAutoLoadStrategyLocal => 'Local Same-Name File';
+
+  @override
+  String get danmakuAutoLoadStrategyLocalDescription =>
+      'Load a same-name .xml or .json danmaku file from the video folder.';
+
+  @override
+  String get danmakuAutoLoadStrategyManual => 'Manual Selection';
+
+  @override
+  String get danmakuAutoLoadStrategyManualDescription =>
+      'Do not auto-load danmaku; choose a match manually.';
+
+  @override
+  String get danmakuAutoLoadStrategyUpdated =>
+      'Danmaku auto-load strategy updated';
+
+  @override
   String get autoMatchOnHashFailTitle => 'Auto-Match on Hash Failure';
 
   @override
@@ -1566,15 +1836,11 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get networkServerDescriptionPrimary =>
-      'api.dandanplay.net (Official server, recommended)';
-
-  @override
-  String get networkServerDescriptionBackup =>
-      '139.224.252.88:16001 (Mirror server, use when the primary server is unavailable)';
+      'Dandanplay online services require a Dandanplay account. Custom third-party danmaku services do not.';
 
   @override
   String get networkServerSelectSubtitle =>
-      'Select a DanDanPlay danmaku server. The backup server can be used when the primary server is unavailable.';
+      'Choose the default Dandanplay service or a custom third-party danmaku service.';
 
   @override
   String customServerWithValue(Object server) {
@@ -1739,6 +2005,9 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get appreciationCode => 'Tip Jar';
+
+  @override
+  String get appreciationCodeHint => 'Tap to view the tip jar';
 
   @override
   String get appreciationImageLoadFailed => 'Failed to load tip jar image';

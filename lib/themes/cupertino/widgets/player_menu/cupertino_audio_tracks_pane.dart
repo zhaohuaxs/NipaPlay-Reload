@@ -2,24 +2,23 @@ import 'package:nipaplay/themes/cupertino/cupertino_imports.dart';
 import 'package:provider/provider.dart';
 
 import 'package:nipaplay/player_abstraction/player_data_models.dart';
-import 'package:nipaplay/models/jellyfin_transcode_settings.dart';
+import 'package:nipaplay/models/emby_media_selection.dart';
 import 'package:nipaplay/providers/jellyfin_transcode_provider.dart';
 import 'package:nipaplay/providers/emby_transcode_provider.dart';
 import 'package:nipaplay/services/jellyfin_service.dart';
-import 'package:nipaplay/services/emby_service.dart';
+import 'package:nipaplay/services/emby_player_menu_selection.dart';
 import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
-import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_pane_back_button.dart';
+import 'package:nipaplay/themes/cupertino/widgets/player_menu/adaptive_player_menu_primitives.dart';
 import 'package:nipaplay/utils/video_player_state.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 
 class CupertinoAudioTracksPane extends StatelessWidget {
   const CupertinoAudioTracksPane({
     super.key,
     required this.videoState,
-    required this.onBack,
   });
 
   final VideoPlayerState videoState;
-  final VoidCallback onBack;
 
   @override
   Widget build(BuildContext context) {
@@ -29,7 +28,7 @@ class CupertinoAudioTracksPane extends StatelessWidget {
     final isServerStream = isJellyfin || isEmby;
     final useServerTracks = (isJellyfin &&
             JellyfinService.instance.isTranscodeEnabled) ||
-        (isEmby && EmbyService.instance.isTranscodeEnabled);
+        (isEmby && videoState.currentPlaybackSession?.isTranscoding == true);
     final serverTracks = useServerTracks
         ? _getServerAudioTracks(videoState)
         : <_ServerAudioTrack>[];
@@ -63,31 +62,13 @@ class CupertinoAudioTracksPane extends StatelessWidget {
           SliverPadding(
             padding: EdgeInsets.fromLTRB(20, topSpacing, 20, 12),
             sliver: SliverToBoxAdapter(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '音频轨道',
-                    style: CupertinoTheme.of(context)
-                        .textTheme
-                        .navTitleTextStyle
-                        .copyWith(fontSize: 22),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    '选择希望使用的音轨语言或关闭其他音轨',
-                    style: CupertinoTheme.of(context)
-                        .textTheme
-                        .textStyle
-                        .copyWith(
-                          fontSize: 13,
-                          color:
-                              CupertinoColors.secondaryLabel.resolveFrom(
-                            context,
-                          ),
-                        ),
-                  ),
-                ],
+              child: Text(
+                '选择希望使用的音轨语言或关闭其他音轨',
+                style: CupertinoTheme.of(context).textTheme.textStyle.copyWith(
+                      fontSize: 13,
+                      color:
+                          CupertinoColors.secondaryLabel.resolveFrom(context),
+                    ),
               ),
             ),
           ),
@@ -95,7 +76,7 @@ class CupertinoAudioTracksPane extends StatelessWidget {
             padding: const EdgeInsets.only(bottom: 24),
             sliver: SliverList(
               delegate: SliverChildListDelegate.fixed([
-                CupertinoListSection.insetGrouped(
+                AdaptivePlayerMenuSection(
                   header: const Text('可用音轨'),
                   children: [
                     for (final track in serverTracks)
@@ -109,9 +90,6 @@ class CupertinoAudioTracksPane extends StatelessWidget {
               ]),
             ),
           ),
-          SliverToBoxAdapter(
-            child: CupertinoPaneBackButton(onPressed: onBack),
-          ),
         ],
       );
     }
@@ -121,27 +99,12 @@ class CupertinoAudioTracksPane extends StatelessWidget {
         SliverPadding(
           padding: EdgeInsets.fromLTRB(20, topSpacing, 20, 12),
           sliver: SliverToBoxAdapter(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '音频轨道',
-                  style: CupertinoTheme.of(context)
-                      .textTheme
-                      .navTitleTextStyle
-                      .copyWith(fontSize: 22),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  '选择希望使用的音轨语言或关闭其他音轨',
-                  style: CupertinoTheme.of(context).textTheme.textStyle.copyWith(
-                        fontSize: 13,
-                        color: CupertinoColors.secondaryLabel.resolveFrom(
-                          context,
-                        ),
-                      ),
-                ),
-              ],
+            child: Text(
+              '选择希望使用的音轨语言或关闭其他音轨',
+              style: CupertinoTheme.of(context).textTheme.textStyle.copyWith(
+                    fontSize: 13,
+                    color: CupertinoColors.secondaryLabel.resolveFrom(context),
+                  ),
             ),
           ),
         ),
@@ -149,7 +112,7 @@ class CupertinoAudioTracksPane extends StatelessWidget {
           padding: const EdgeInsets.only(bottom: 24),
           sliver: SliverList(
             delegate: SliverChildListDelegate.fixed([
-              CupertinoListSection.insetGrouped(
+              AdaptivePlayerMenuSection(
                 header: const Text('可用音轨'),
                 children: [
                   for (final entry in audioTracks!.asMap().entries)
@@ -158,9 +121,6 @@ class CupertinoAudioTracksPane extends StatelessWidget {
               ),
             ]),
           ),
-        ),
-        SliverToBoxAdapter(
-          child: CupertinoPaneBackButton(onPressed: onBack),
         ),
       ],
     );
@@ -171,14 +131,13 @@ class CupertinoAudioTracksPane extends StatelessWidget {
     int index,
     PlayerAudioStreamInfo track,
   ) {
-    final bool isActive =
-        videoState.player.activeAudioTracks.contains(index);
+    final bool isActive = videoState.player.activeAudioTracks.contains(index);
     final Color activeColor =
-        CupertinoTheme.of(context).primaryColor.withOpacity(0.9);
+        CupertinoTheme.of(context).primaryColor.withValues(alpha: 0.9);
     final String title = _resolveTrackTitle(index, track);
     final String language = _resolveLanguage(track.language);
 
-    return CupertinoListTile(
+    return AdaptivePlayerMenuTile(
       padding: const EdgeInsets.symmetric(vertical: 8),
       title: Text(
         title,
@@ -199,9 +158,32 @@ class CupertinoAudioTracksPane extends StatelessWidget {
               color: activeColor,
             )
           : null,
-      onTap: () {
+      onTap: () async {
         if (isActive) return;
-        videoState.player.activeAudioTracks = [index];
+        final path = videoState.currentVideoPath ?? '';
+        final isEmby = path.startsWith('emby://');
+        final source = isEmby ? videoState.embyMediaSourceDescriptor() : null;
+        final preference = isEmby ? preferenceForEmbyNativeAudio(track) : null;
+        try {
+          await runMediaServerMenuSelection(
+            MediaServerMenuSurface.cupertinoAudio,
+            isEmby,
+            () async {
+              videoState.player.activeAudioTracks = [index];
+            },
+            () async {
+              if (source == null || preference == null) return false;
+              return videoState.persistCurrentEmbyManualPatch(
+                EmbyManualSelectionPatch(audio: preference),
+                currentSource: source,
+              );
+            },
+          );
+        } catch (error) {
+          if (context.mounted) {
+            BlurSnackBar.show(context, '切换音轨失败: $error');
+          }
+        }
       },
     );
   }
@@ -212,7 +194,7 @@ class CupertinoAudioTracksPane extends StatelessWidget {
     bool isActive,
   ) {
     final Color activeColor =
-        CupertinoTheme.of(context).primaryColor.withOpacity(0.9);
+        CupertinoTheme.of(context).primaryColor.withValues(alpha: 0.9);
     String title = track.title?.isNotEmpty == true
         ? track.title!
         : '轨道 ${track.index + 1}';
@@ -221,7 +203,7 @@ class CupertinoAudioTracksPane extends StatelessWidget {
     }
     final String language = _resolveLanguage(track.language);
 
-    return CupertinoListTile(
+    return AdaptivePlayerMenuTile(
       padding: const EdgeInsets.symmetric(vertical: 8),
       title: Text(
         title,
@@ -246,35 +228,70 @@ class CupertinoAudioTracksPane extends StatelessWidget {
         if (isActive) return;
         final path = videoState.currentVideoPath;
         if (path == null) return;
-        if (path.startsWith('jellyfin://')) {
-          final itemId = path.replaceFirst('jellyfin://', '');
-          final jellyfinProvider =
-              Provider.of<JellyfinTranscodeProvider>(context, listen: false);
-          await jellyfinProvider.initialize();
-          videoState.setJellyfinServerAudioSelection(itemId, track.index);
-          await videoState.reloadCurrentJellyfinStream(
-            quality: jellyfinProvider.currentVideoQuality,
-            serverSubtitleIndex:
-                videoState.getJellyfinServerSubtitleSelection(itemId),
-            burnInSubtitle: videoState.getJellyfinServerSubtitleBurnIn(itemId),
-            audioStreamIndex: track.index,
-          );
-          return;
-        }
-        if (path.startsWith('emby://')) {
-          final embyPath = path.replaceFirst('emby://', '');
-          final parts = embyPath.split('/');
-          final itemId = parts.isNotEmpty ? parts.last : embyPath;
-          final embyProvider =
-              Provider.of<EmbyTranscodeProvider>(context, listen: false);
-          await embyProvider.initialize();
-          videoState.setEmbyServerAudioSelection(itemId, track.index);
-          await videoState.reloadCurrentEmbyStream(
-            quality: embyProvider.currentVideoQuality,
-            serverSubtitleIndex: videoState.getEmbyServerSubtitleSelection(itemId),
-            burnInSubtitle: videoState.getEmbyServerSubtitleBurnIn(itemId),
-            audioStreamIndex: track.index,
-          );
+        try {
+          if (path.startsWith('jellyfin://')) {
+            final itemId = path.replaceFirst('jellyfin://', '');
+            final jellyfinProvider = Provider.of<JellyfinTranscodeProvider>(
+              context,
+              listen: false,
+            );
+            await jellyfinProvider.initialize();
+            await runMediaServerMenuSelection(
+              MediaServerMenuSurface.cupertinoAudio,
+              false,
+              () async {
+                videoState.setJellyfinServerAudioSelection(itemId, track.index);
+                await videoState.reloadCurrentJellyfinStream(
+                  quality: jellyfinProvider.currentVideoQuality,
+                  serverSubtitleIndex:
+                      videoState.getJellyfinServerSubtitleSelection(itemId),
+                  burnInSubtitle:
+                      videoState.getJellyfinServerSubtitleBurnIn(itemId),
+                  audioStreamIndex: track.index,
+                );
+              },
+              () async => false,
+            );
+            return;
+          }
+          if (path.startsWith('emby://')) {
+            final embyPath = path.replaceFirst('emby://', '');
+            final parts = embyPath.split('/');
+            final itemId = parts.isNotEmpty ? parts.last : embyPath;
+            final embyProvider = Provider.of<EmbyTranscodeProvider>(
+              context,
+              listen: false,
+            );
+            await embyProvider.initialize();
+            final source = videoState.embyMediaSourceDescriptor();
+            final preference = source == null
+                ? null
+                : preferenceForEmbyServerAudio(source, track.index);
+            if (source == null || preference == null) return;
+            await runMediaServerMenuSelection(
+              MediaServerMenuSurface.cupertinoAudio,
+              true,
+              () async {
+                await videoState.reloadCurrentEmbyStream(
+                  quality: embyProvider.currentVideoQuality,
+                  serverSubtitleIndex:
+                      videoState.getEmbyServerSubtitleSelection(itemId),
+                  burnInSubtitle:
+                      videoState.getEmbyServerSubtitleBurnIn(itemId),
+                  audioStreamIndex: track.index,
+                );
+                videoState.setEmbyServerAudioSelection(itemId, track.index);
+              },
+              () => videoState.persistCurrentEmbyManualPatch(
+                EmbyManualSelectionPatch(audio: preference),
+                currentSource: source,
+              ),
+            );
+          }
+        } catch (error) {
+          if (context.mounted) {
+            BlurSnackBar.show(context, '切换音轨失败: $error');
+          }
         }
       },
     );
@@ -291,9 +308,8 @@ class CupertinoAudioTracksPane extends StatelessWidget {
     for (final stream in streams) {
       if (stream['Type']?.toString() != 'Audio') continue;
       final index = stream['Index'];
-      final parsedIndex = index is int
-          ? index
-          : int.tryParse(index?.toString() ?? '');
+      final parsedIndex =
+          index is int ? index : int.tryParse(index?.toString() ?? '');
       if (parsedIndex == null) continue;
       tracks.add(
         _ServerAudioTrack(
@@ -325,29 +341,28 @@ class CupertinoAudioTracksPane extends StatelessWidget {
                 const SizedBox(height: 12),
                 Text(
                   '未检测到可切换的音频轨道',
-                  style: CupertinoTheme.of(context).textTheme.textStyle.copyWith(
-                        fontSize: 16,
-                        color: CupertinoColors.secondaryLabel.resolveFrom(
-                          context,
-                        ),
-                      ),
+                  style:
+                      CupertinoTheme.of(context).textTheme.textStyle.copyWith(
+                            fontSize: 16,
+                            color: CupertinoColors.secondaryLabel.resolveFrom(
+                              context,
+                            ),
+                          ),
                 ),
                 const SizedBox(height: 6),
                 Text(
                   '请确认当前视频包含多个音轨',
-                  style: CupertinoTheme.of(context).textTheme.textStyle.copyWith(
-                        fontSize: 13,
-                        color: CupertinoColors.tertiaryLabel.resolveFrom(
-                          context,
-                        ),
-                      ),
+                  style:
+                      CupertinoTheme.of(context).textTheme.textStyle.copyWith(
+                            fontSize: 13,
+                            color: CupertinoColors.tertiaryLabel.resolveFrom(
+                              context,
+                            ),
+                          ),
                 ),
               ],
             ),
           ),
-        ),
-        SliverToBoxAdapter(
-          child: CupertinoPaneBackButton(onPressed: onBack),
         ),
       ],
     );
@@ -370,8 +385,12 @@ class CupertinoAudioTracksPane extends StatelessWidget {
       final samplerateInfo = track.metadata['samplerate'] ?? '';
       final detailParts = <String>[];
       if (codecInfo.isNotEmpty) detailParts.add(codecInfo);
-      if (channelsInfo.isNotEmpty && channelsInfo != '0') detailParts.add(channelsInfo);
-      if (samplerateInfo.isNotEmpty && samplerateInfo != '0') detailParts.add('${samplerateInfo}Hz');
+      if (channelsInfo.isNotEmpty && channelsInfo != '0') {
+        detailParts.add(channelsInfo);
+      }
+      if (samplerateInfo.isNotEmpty && samplerateInfo != '0') {
+        detailParts.add('${samplerateInfo}Hz');
+      }
       if (detailParts.isNotEmpty && !baseTitle.contains(codecInfo)) {
         baseTitle += ' (${detailParts.join(', ')})';
       }

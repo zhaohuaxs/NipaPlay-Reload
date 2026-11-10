@@ -1,14 +1,71 @@
 import 'package:flutter/foundation.dart';
 import 'package:nipaplay/services/webdav_service.dart';
+import 'package:nipaplay/services/webdav_proxy_service.dart';
+import 'package:nipaplay/services/smb_service.dart';
+import 'package:nipaplay/services/smb_proxy_service.dart';
 
 class MediaSourceUtils {
   MediaSourceUtils._();
+
+  /// Decode a remote playback URL only for the error dialog. The media URL
+  /// used by the player remains encoded; credentials are omitted from the
+  /// displayed URL so decoding cannot reveal an encoded password.
+  static String playbackErrorForDisplay(String message, String? mediaPath) {
+    if (mediaPath == null ||
+        !(isNewWebDavPath(mediaPath) ||
+            isNewSmbPath(mediaPath) ||
+            isWebDavPath(mediaPath) ||
+            isSmbPath(mediaPath))) {
+      return message;
+    }
+
+    final urlPattern = RegExp(
+      r'''(?:https?|webdav|smb)://[^\s<>"'）)]+''',
+      caseSensitive: false,
+    );
+    return message.replaceAllMapped(urlPattern, (match) {
+      final rawUrl = match.group(0)!;
+      final authorityStart = rawUrl.indexOf('://') + 3;
+      final authorityEnd = rawUrl.indexOf(
+        RegExp(r'[/?#]'),
+        authorityStart,
+      );
+      final end = authorityEnd < 0 ? rawUrl.length : authorityEnd;
+      final userInfoEnd = rawUrl.lastIndexOf('@', end - 1);
+      final safeUrl = userInfoEnd < authorityStart
+          ? rawUrl
+          : rawUrl.substring(0, authorityStart) +
+              rawUrl.substring(userInfoEnd + 1);
+      try {
+        // This is display text, so decode encoded separators in an SMB
+        // proxy's `path` parameter as well as non-ASCII directory names.
+        return Uri.decodeComponent(safeUrl);
+      } on ArgumentError {
+        return safeUrl;
+      } on FormatException {
+        return safeUrl;
+      }
+    });
+  }
 
   static List<WebDAVConnection> _remoteWebDavConnections = const [];
 
   static void updateRemoteWebDavConnections(
       List<WebDAVConnection> connections) {
     _remoteWebDavConnections = List<WebDAVConnection>.unmodifiable(connections);
+  }
+
+  static bool isContentUri(String value) {
+    final uri = Uri.tryParse(value.trim());
+    return uri != null && uri.scheme.toLowerCase() == 'content';
+  }
+
+  /// Returns a credential-safe description for remote path resolution errors.
+  ///
+  /// In particular, [FormatException.toString] includes its source value,
+  /// which may be a WebDAV `username:password` user-info string.
+  static String safeRemotePathError(Object error) {
+    return error.runtimeType.toString();
   }
 
   static bool isSmbPath(String filePath) {
@@ -59,19 +116,23 @@ class MediaSourceUtils {
   static bool _matchesRemoteWebDavConnection(Uri fileUri) {
     final fileHost = fileUri.host.toLowerCase();
     for (final conn in _remoteWebDavConnections) {
-      final baseUri = Uri.tryParse(conn.url.trim());
-      if (baseUri == null || baseUri.scheme.isEmpty || baseUri.host.isEmpty) {
-        continue;
-      }
-      if (baseUri.scheme != fileUri.scheme) continue;
-      if (baseUri.host.toLowerCase() != fileHost) continue;
-      if (_effectivePort(baseUri) != _effectivePort(fileUri)) continue;
+      // 内网与公网地址都参与匹配。
+      for (final base in [conn.url, conn.wanUrl]) {
+        if (base.trim().isEmpty) continue;
+        final baseUri = Uri.tryParse(base.trim());
+        if (baseUri == null || baseUri.scheme.isEmpty || baseUri.host.isEmpty) {
+          continue;
+        }
+        if (baseUri.scheme != fileUri.scheme) continue;
+        if (baseUri.host.toLowerCase() != fileHost) continue;
+        if (_effectivePort(baseUri) != _effectivePort(fileUri)) continue;
 
-      final basePath = _normalizePath(baseUri.path);
-      final filePath = _normalizePath(fileUri.path, keepTrailingSlash: true);
-      if (filePath == basePath.substring(0, basePath.length - 1) ||
-          filePath.startsWith(basePath)) {
-        return true;
+        final basePath = _normalizePath(baseUri.path);
+        final filePath = _normalizePath(fileUri.path, keepTrailingSlash: true);
+        if (filePath == basePath.substring(0, basePath.length - 1) ||
+            filePath.startsWith(basePath)) {
+          return true;
+        }
       }
     }
     return false;
@@ -84,8 +145,7 @@ class MediaSourceUtils {
     return 0;
   }
 
-  static String _normalizePath(String path,
-      {bool keepTrailingSlash = false}) {
+  static String _normalizePath(String path, {bool keepTrailingSlash = false}) {
     var normalized = path.trim();
     if (normalized.isEmpty) {
       return '/';
@@ -101,5 +161,338 @@ class MediaSourceUtils {
       normalized += '/';
     }
     return normalized;
+  }
+
+  // ==================== 新路径格式工具方法 ====================
+
+  /// 判断路径是否为稳定 WebDAV 路径 (webdav://connectionId/path)
+  static bool isNewWebDavPath(String filePath) {
+    if (filePath.isEmpty) return false;
+    return filePath.toLowerCase().startsWith('webdav://');
+  }
+
+  /// 判断路径是否为稳定 SMB 路径 (smb://connectionId/path)
+  static bool isNewSmbPath(String filePath) {
+    if (filePath.isEmpty) return false;
+    return filePath.toLowerCase().startsWith('smb://');
+  }
+
+  /// 构建稳定 WebDAV 路径。旧数据中的连接名称仍可作为兼容引用。
+  static String buildWebDavPath(
+      String connectionReference, String relativePath) {
+    var path = relativePath;
+    if (!path.startsWith('/')) {
+      path = '/$path';
+    }
+    return 'webdav://$connectionReference$path';
+  }
+
+  /// 构建稳定 SMB 路径。旧数据中的连接名称仍可作为兼容引用。
+  static String buildSmbPath(String connectionReference, String relativePath) {
+    var path = relativePath;
+    if (!path.startsWith('/')) {
+      path = '/$path';
+    }
+    return 'smb://$connectionReference$path';
+  }
+
+  /// 解析新格式 WebDAV 路径，返回 (connectionName, relativePath)
+  /// 如果不是新格式路径返回 null
+  static ({String connectionName, String relativePath})? parseWebDavPath(
+      String filePath) {
+    if (!isNewWebDavPath(filePath)) return null;
+    // webdav://connectionName/path
+    final pathWithoutScheme = filePath.substring(9); // 去掉 'webdav://'
+    final firstSlashIndex = pathWithoutScheme.indexOf('/');
+    if (firstSlashIndex == -1) {
+      return (connectionName: pathWithoutScheme, relativePath: '/');
+    }
+    return (
+      connectionName: pathWithoutScheme.substring(0, firstSlashIndex),
+      relativePath: pathWithoutScheme.substring(firstSlashIndex),
+    );
+  }
+
+  /// 解析新格式 SMB 路径，返回 (connectionName, relativePath)
+  /// 如果不是新格式路径返回 null
+  static ({String connectionName, String relativePath})? parseSmbPath(
+      String filePath) {
+    if (!isNewSmbPath(filePath)) return null;
+    // smb://connectionName/path
+    final pathWithoutScheme = filePath.substring(6); // 去掉 'smb://'
+    final firstSlashIndex = pathWithoutScheme.indexOf('/');
+    if (firstSlashIndex == -1) {
+      return (connectionName: pathWithoutScheme, relativePath: '/');
+    }
+    return (
+      connectionName: pathWithoutScheme.substring(0, firstSlashIndex),
+      relativePath: pathWithoutScheme.substring(firstSlashIndex),
+    );
+  }
+
+  /// Parse either a stable SMB media path or the legacy local proxy URL.
+  static ({String connectionName, String relativePath})? parseSmbMediaPath(
+      String filePath) {
+    final stablePath = parseSmbPath(filePath);
+    if (stablePath != null &&
+        stablePath.connectionName.trim().isNotEmpty &&
+        stablePath.relativePath.isNotEmpty) {
+      return (
+        connectionName: stablePath.connectionName.trim(),
+        relativePath: stablePath.relativePath,
+      );
+    }
+
+    final uri = Uri.tryParse(filePath);
+    final connectionName = uri?.queryParameters['conn']?.trim();
+    final relativePath = uri?.queryParameters['path']?.trim();
+    if (uri?.path != '/smb/stream' ||
+        connectionName == null ||
+        connectionName.isEmpty ||
+        relativePath == null ||
+        relativePath.isEmpty) {
+      return null;
+    }
+    return (connectionName: connectionName, relativePath: relativePath);
+  }
+
+  /// 将旧的 WebDAV 完整 URL 转换为新格式
+  /// 旧格式: http://user:pass@host:port/path/to/file.mp4
+  /// 新格式: webdav://connectionName/path/to/file.mp4
+  static String? migrateWebDavPath(String oldPath) {
+    if (isNewWebDavPath(oldPath)) {
+      final resolved = WebDAVService.instance.resolveMediaPath(oldPath);
+      return resolved == null
+          ? oldPath
+          : buildWebDavPath(
+              resolved.connection.id,
+              resolved.relativePath,
+            );
+    }
+    if (!isWebDavPath(oldPath)) return null;
+
+    try {
+      // 1. 精确匹配：host/port 完全一致
+      final resolved = WebDAVService.instance.resolveFileUrl(oldPath);
+      if (resolved != null) {
+        return buildWebDavPath(resolved.connection.id, resolved.relativePath);
+      }
+
+      // 2. 降级匹配：地址已变更，通过 URL path 前缀和用户名来识别连接
+      final fileUri = Uri.tryParse(oldPath);
+      if (fileUri == null || fileUri.host.isEmpty) return null;
+
+      final connections = WebDAVService.instance.connections;
+      if (connections.isEmpty) return null;
+
+      // 如果只有一个 WebDAV 连接，直接用那个
+      if (connections.length == 1) {
+        final conn = connections.first;
+        final relativePath =
+            _extractRelativePathForConnection(fileUri.path, conn);
+        if (relativePath != null) {
+          return buildWebDavPath(conn.id, relativePath);
+        }
+      }
+
+      // 多个连接时，按 URL path 前缀 + username 匹配
+      WebDAVConnection? bestMatch;
+      int bestScore = -1;
+
+      for (final conn in connections) {
+        int score = 0;
+
+        // username 匹配加分
+        if (fileUri.userInfo.isNotEmpty) {
+          final fileUser = fileUri.userInfo.split(':').first;
+          if (fileUser == conn.username) {
+            score += 100;
+          }
+        }
+
+        // URL path 前缀匹配加分
+        final relativePath =
+            _extractRelativePathForConnection(fileUri.path, conn);
+        if (relativePath != null) {
+          score += 50;
+        }
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestMatch = conn;
+        }
+      }
+
+      if (bestMatch != null && bestScore >= 50) {
+        final relativePath =
+            _extractRelativePathForConnection(fileUri.path, bestMatch);
+        if (relativePath != null) {
+          return buildWebDavPath(bestMatch.id, relativePath);
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// 内网/公网地址都尝试，返回首个可提取的相对路径。
+  static String? _extractRelativePathForConnection(
+    String filePath,
+    WebDAVConnection conn,
+  ) {
+    final lan = _extractRelativePath(filePath, conn.url);
+    if (lan != null) return lan;
+    return _extractRelativePath(filePath, conn.wanUrl);
+  }
+
+  /// 从文件 URL path 中提取相对于连接 base URL 的路径
+  /// 返回 null 如果文件路径不是连接路径的子路径
+  static String? _extractRelativePath(String filePath, String baseUrl) {
+    final baseUri = Uri.tryParse(baseUrl);
+    if (baseUri == null) return null;
+
+    var basePath = baseUri.path.trim();
+    if (basePath.isEmpty) basePath = '/';
+    if (!basePath.endsWith('/')) basePath += '/';
+    // 去掉重复斜杠
+    basePath = basePath.replaceAll(RegExp(r'/+'), '/');
+    var normalizedFilePath = filePath.replaceAll(RegExp(r'/+'), '/');
+
+    if (normalizedFilePath.startsWith(basePath)) {
+      var relative = normalizedFilePath.substring(basePath.length);
+      if (!relative.startsWith('/')) relative = '/$relative';
+      return relative;
+    }
+
+    // 文件路径可能与 base path 相同（base 不含末尾 / 的情况）
+    final basePathNoTrailing = basePath.endsWith('/')
+        ? basePath.substring(0, basePath.length - 1)
+        : basePath;
+    if (normalizedFilePath == basePathNoTrailing) {
+      return '/';
+    }
+
+    return null;
+  }
+
+  /// 将旧的 SMB 代理 URL 转换为新格式
+  /// 旧格式: http://127.0.0.1:33221/smb/stream?conn=connectionName&path=/path
+  /// 新格式: smb://connectionName/path
+  static String? migrateSmbPath(String oldPath) {
+    if (isNewSmbPath(oldPath)) {
+      final parsed = parseSmbMediaPath(oldPath);
+      if (parsed == null) return oldPath;
+      final connection =
+          SMBService.instance.getConnectionByIdOrName(parsed.connectionName);
+      return connection == null
+          ? oldPath
+          : buildSmbPath(connection.id, parsed.relativePath);
+    }
+
+    // 检查是否是旧格式的 SMB 代理 URL
+    final uri = Uri.tryParse(oldPath);
+    if (uri == null) return null;
+    if (uri.path != '/smb/stream') return null;
+
+    final connName = uri.queryParameters['conn']?.trim();
+    final smbPath = uri.queryParameters['path']?.trim();
+    if (connName == null || connName.isEmpty || smbPath == null) return null;
+
+    final connection = SMBService.instance.getConnectionByIdOrName(connName);
+    return buildSmbPath(connection?.id ?? connName, smbPath);
+  }
+
+  /// 将任意旧格式路径迁移为新格式（如果适用）
+  /// 返回迁移后的路径，如果不适用则返回原始路径
+  static String migratePath(String filePath) {
+    if (filePath.isEmpty) return filePath;
+    // 尝试迁移 WebDAV 路径
+    final webdavMigrated = migrateWebDavPath(filePath);
+    if (webdavMigrated != null) return webdavMigrated;
+
+    // 尝试迁移 SMB 路径
+    final smbMigrated = migrateSmbPath(filePath);
+    if (smbMigrated != null) return smbMigrated;
+
+    return filePath;
+  }
+
+  /// 通常有凭证的连接使用认证代理；已检测且两侧均失败时，仍尝试配置直链。
+  /// 自检失败不代表媒体 GET 一定失败，且不能让旧代理地址遮蔽真实服务错误。
+  static bool webDavNeedsAuthProxy(WebDAVConnection connection) {
+    if (WebDAVService.instance.allAddressesUnreachable(connection.id)) {
+      return false;
+    }
+    return connection.username.trim().isNotEmpty ||
+        connection.password.isNotEmpty;
+  }
+
+  /// 将新格式 WebDAV 路径解析为可播放的 HTTP URL。
+  ///
+  /// 播放内核（MDK/Media Kit）无法完成 WebDAV 的 Digest 挑战协商，需要认证
+  /// 的连接走 WebDAVProxyService 由应用代持认证；匿名连接、代理未启动时
+  /// 仍返回直链，保持旧行为。返回 null 如果找不到对应连接。
+  static String? resolveWebDavPathToUrl(String filePath) {
+    final resolved = WebDAVService.instance.resolveMediaPath(filePath);
+    if (resolved == null) return null;
+
+    final proxy = WebDAVProxyService.instance;
+    if (proxy.isRunning && webDavNeedsAuthProxy(resolved.connection)) {
+      try {
+        return proxy.buildStreamUrl(
+          resolved.connection,
+          resolved.relativePath,
+        );
+      } catch (_) {
+        // 代理异常时回退直链。
+      }
+    }
+    return WebDAVService.instance.getFileUrl(
+      resolved.connection,
+      resolved.relativePath,
+    );
+  }
+
+  /// 同 [resolveWebDavPathToUrl]，但会先确保 WebDAV 连接配置已从本地存储加载，
+  /// 并在连接需要认证时启动本地认证代理。
+  ///
+  /// WebDAVService 的连接列表要等 initialize() 完成才有内容；调用链上若没有
+  /// 其它环节触发过初始化（例如播放器内的续播/下一话逻辑），同步版本会因为
+  /// 连接列表为空而返回 null，表现为"无法解析远程媒体路径"。
+  static Future<String?> resolveWebDavPathToUrlInitialized(String filePath) async {
+    await WebDAVService.instance.initialize();
+    final resolved = WebDAVService.instance.resolveMediaPath(filePath);
+    if (resolved != null && webDavNeedsAuthProxy(resolved.connection)) {
+      try {
+        await WebDAVProxyService.instance.initialize();
+      } catch (e) {
+        debugPrint('MediaSourceUtils: WebDAV 本地代理启动失败，回退直链: $e');
+      }
+    }
+    return resolveWebDavPathToUrl(filePath);
+  }
+
+  /// 将新格式 SMB 路径解析为可播放的代理 URL
+  /// 返回 null 如果找不到对应连接
+  static String? resolveSmbPathToUrl(String filePath) {
+    final parsed = parseSmbPath(filePath);
+    if (parsed == null) return null;
+
+    final connection =
+        SMBService.instance.getConnectionByIdOrName(parsed.connectionName);
+    if (connection == null) return null;
+
+    return SMBProxyService.instance
+        .buildStreamUrl(connection, parsed.relativePath);
+  }
+
+  /// Resolve stable remote-library paths while leaving regular URLs alone.
+  static String? resolveRemotePathToUrl(String filePath) {
+    if (isNewWebDavPath(filePath)) {
+      return resolveWebDavPathToUrl(filePath);
+    }
+    if (isNewSmbPath(filePath)) {
+      return resolveSmbPathToUrl(filePath);
+    }
+    return filePath;
   }
 }

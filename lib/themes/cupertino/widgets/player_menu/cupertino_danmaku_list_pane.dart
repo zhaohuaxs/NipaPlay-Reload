@@ -1,20 +1,18 @@
 import 'dart:async';
 
+import 'package:nipaplay/constants/danmaku/mode.dart';
 import 'package:nipaplay/themes/cupertino/cupertino_imports.dart';
-
 import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
-import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_pane_back_button.dart';
+import 'package:nipaplay/themes/cupertino/widgets/player_menu/adaptive_player_menu_primitives.dart';
 import 'package:nipaplay/utils/video_player_state.dart';
 
 class CupertinoDanmakuListPane extends StatefulWidget {
   const CupertinoDanmakuListPane({
     super.key,
     required this.videoState,
-    required this.onBack,
   });
 
   final VideoPlayerState videoState;
-  final VoidCallback onBack;
 
   @override
   State<CupertinoDanmakuListPane> createState() =>
@@ -103,9 +101,8 @@ class _CupertinoDanmakuListPaneState extends State<CupertinoDanmakuListPane> {
         return timeA.compareTo(timeB);
       });
 
-      _allDanmakus = _showFiltered
-          ? danmakus
-          : danmakus.where(_isDanmakuVisible).toList();
+      _allDanmakus =
+          _showFiltered ? danmakus : danmakus.where(_isDanmakuVisible).toList();
 
       setState(() {
         _isLoading = false;
@@ -165,8 +162,9 @@ class _CupertinoDanmakuListPaneState extends State<CupertinoDanmakuListPane> {
 
     setState(() => _isWindowLoading = true);
 
-    final int maxStart =
-        (_allDanmakus.length - _windowSize).clamp(0, _allDanmakus.length).toInt();
+    final int maxStart = (_allDanmakus.length - _windowSize)
+        .clamp(0, _allDanmakus.length)
+        .toInt();
     newStartIndex = newStartIndex.clamp(0, maxStart);
     final int newEnd =
         (newStartIndex + _windowSize).clamp(0, _allDanmakus.length);
@@ -238,36 +236,25 @@ class _CupertinoDanmakuListPaneState extends State<CupertinoDanmakuListPane> {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '弹幕列表',
-                      style: CupertinoTheme.of(context)
-                          .textTheme
-                          .navTitleTextStyle,
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      _visibleDanmakus.isEmpty
-                          ? '暂无可显示的弹幕'
-                          : '共 ${_visibleDanmakus.length} 条（当前视图）',
-                      style: CupertinoTheme.of(context)
-                          .textTheme
-                          .textStyle
-                          .copyWith(
-                            fontSize: 13,
-                            color: CupertinoColors.secondaryLabel
-                                .resolveFrom(context),
-                          ),
-                    ),
-                  ],
+                Expanded(
+                  child: Text(
+                    _visibleDanmakus.isEmpty
+                        ? '暂无可显示的弹幕'
+                        : '共 ${_visibleDanmakus.length} 条（当前视图）',
+                    style:
+                        CupertinoTheme.of(context).textTheme.textStyle.copyWith(
+                              fontSize: 13,
+                              color: CupertinoColors.secondaryLabel.resolveFrom(
+                                context,
+                              ),
+                            ),
+                  ),
                 ),
                 Row(
                   children: [
                     const Text('显示被屏蔽'),
                     const SizedBox(width: 6),
-                    CupertinoSwitch(
+                    AdaptivePlayerMenuSwitch(
                       value: _showFiltered,
                       onChanged: (value) {
                         setState(() => _showFiltered = value);
@@ -284,7 +271,7 @@ class _CupertinoDanmakuListPaneState extends State<CupertinoDanmakuListPane> {
           const SliverFillRemaining(
             hasScrollBody: false,
             child: Center(
-              child: CupertinoActivityIndicator(radius: 16),
+              child: AdaptivePlayerMenuProgressIndicator(size: 32),
             ),
           )
         else if (_errorMessage.isNotEmpty)
@@ -329,73 +316,77 @@ class _CupertinoDanmakuListPaneState extends State<CupertinoDanmakuListPane> {
                       int.tryParse(danmaku['type']?.toString() ?? '1') ?? 1;
                   final bool isFiltered = !_isDanmakuVisible(danmaku);
 
-                  return Padding(
-                    padding:
-                        const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
-                    child: GestureDetector(
-                      onTap: () => _seekToTime(timeMs),
-                      child: Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: isCurrent
-                              ? CupertinoTheme.of(context)
-                                  .primaryColor
-                                  .withOpacity(0.12)
-                              : CupertinoColors.systemGrey6
-                                  .resolveFrom(context),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
+                  return AdaptivePlayerMenuDanmakuListRow(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        vertical: 4,
+                        horizontal: 2,
+                      ),
+                      child: AdaptivePlayerMenuActionSurface(
+                        onTap: () => _seekToTime(timeMs),
+                        child: Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
                             color: isCurrent
-                                ? CupertinoTheme.of(context).primaryColor
-                                : CupertinoColors.separator
+                                ? CupertinoTheme.of(context)
+                                    .primaryColor
+                                    .withValues(alpha: 0.12)
+                                : CupertinoColors.systemGrey6
                                     .resolveFrom(context),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: isCurrent
+                                  ? CupertinoTheme.of(context).primaryColor
+                                  : CupertinoColors.separator
+                                      .resolveFrom(context),
+                            ),
                           ),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                const Icon(CupertinoIcons.clock, size: 14),
-                                const SizedBox(width: 4),
-                                Text(
-                                  _formatTime(timeMs),
-                                  style: TextStyle(
-                                    fontWeight: isCurrent
-                                        ? FontWeight.w600
-                                        : FontWeight.normal,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  const Icon(CupertinoIcons.clock, size: 14),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    _formatTime(timeMs),
+                                    style: TextStyle(
+                                      fontWeight: isCurrent
+                                          ? FontWeight.w600
+                                          : FontWeight.normal,
+                                    ),
                                   ),
-                                ),
-                                const SizedBox(width: 8),
-                                _buildTag(
-                                  context,
-                                  _danmakuTypeLabel(type),
-                                  color: _typeColor(type),
-                                ),
-                                if (isFiltered) ...[
-                                  const SizedBox(width: 6),
+                                  const SizedBox(width: 8),
                                   _buildTag(
                                     context,
-                                    '已屏蔽',
-                                    color: CupertinoColors.systemRed,
+                                    _danmakuTypeLabel(type),
+                                    color: _typeColor(type),
                                   ),
+                                  if (isFiltered) ...[
+                                    const SizedBox(width: 6),
+                                    _buildTag(
+                                      context,
+                                      '已屏蔽',
+                                      color: CupertinoColors.systemRed,
+                                    ),
+                                  ],
                                 ],
-                              ],
-                            ),
-                            const SizedBox(height: 6),
-                            Text(
-                              content,
-                              style: TextStyle(
-                                color: isFiltered
-                                    ? CupertinoColors.secondaryLabel
-                                        .resolveFrom(context)
-                                    : null,
-                                decoration: isFiltered
-                                    ? TextDecoration.lineThrough
-                                    : null,
                               ),
-                            ),
-                          ],
+                              const SizedBox(height: 6),
+                              Text(
+                                content,
+                                style: TextStyle(
+                                  color: isFiltered
+                                      ? CupertinoColors.secondaryLabel
+                                          .resolveFrom(context)
+                                      : null,
+                                  decoration: isFiltered
+                                      ? TextDecoration.lineThrough
+                                      : null,
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ),
@@ -410,13 +401,10 @@ class _CupertinoDanmakuListPaneState extends State<CupertinoDanmakuListPane> {
             child: Center(
               child: Padding(
                 padding: EdgeInsets.only(bottom: 8),
-                child: CupertinoActivityIndicator(radius: 10),
+                child: AdaptivePlayerMenuProgressIndicator(size: 20),
               ),
             ),
           ),
-        SliverToBoxAdapter(
-          child: CupertinoPaneBackButton(onPressed: widget.onBack),
-        ),
       ],
     );
   }
@@ -426,7 +414,7 @@ class _CupertinoDanmakuListPaneState extends State<CupertinoDanmakuListPane> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.15),
+        color: color.withValues(alpha: 0.15),
         borderRadius: BorderRadius.circular(6),
       ),
       child: Text(
@@ -441,10 +429,10 @@ class _CupertinoDanmakuListPaneState extends State<CupertinoDanmakuListPane> {
   }
 
   Color _typeColor(int type) {
-    switch (type) {
-      case 4:
+    switch (DanmakuMode.fromCode(type)) {
+      case DanmakuMode.bottom:
         return CupertinoColors.activeGreen;
-      case 5:
+      case DanmakuMode.top:
         return CupertinoColors.activeOrange;
       default:
         return CupertinoColors.activeBlue;
@@ -452,10 +440,10 @@ class _CupertinoDanmakuListPaneState extends State<CupertinoDanmakuListPane> {
   }
 
   String _danmakuTypeLabel(int type) {
-    switch (type) {
-      case 4:
+    switch (DanmakuMode.fromCode(type)) {
+      case DanmakuMode.bottom:
         return '底部';
-      case 5:
+      case DanmakuMode.top:
         return '顶部';
       default:
         return '滚动';

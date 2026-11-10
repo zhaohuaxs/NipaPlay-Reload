@@ -1,9 +1,9 @@
+import 'package:nipaplay/player_menu/player_quick_controls.dart';
 import 'package:flutter/material.dart';
 import 'package:nipaplay/utils/video_player_state.dart';
 import 'package:provider/provider.dart';
 import 'subtitle_tracks_menu.dart';
 import 'subtitle_settings_menu.dart';
-import 'control_bar_settings_menu.dart';
 import 'danmaku_settings_menu.dart';
 import 'audio_tracks_menu.dart';
 import 'danmaku_list_menu.dart';
@@ -20,6 +20,8 @@ import 'package:nipaplay/player_menu/player_menu_definition_builder.dart';
 import 'package:nipaplay/player_menu/player_menu_models.dart';
 import 'package:nipaplay/player_menu/player_menu_pane_controllers.dart';
 import 'base_settings_menu.dart';
+import 'player_menu_theme.dart';
+import 'package:nipaplay/widgets/desktop_transient_overlay_scope.dart';
 
 class VideoSettingsMenu extends StatefulWidget {
   final VoidCallback onClose;
@@ -28,6 +30,7 @@ class VideoSettingsMenu extends StatefulWidget {
   final GlobalKey? anchorKey;
   final PlayerMenuPaneId? initialPaneId;
   final bool hideBackButtonForInitialPane;
+  final bool standaloneWindow;
 
   const VideoSettingsMenu({
     super.key,
@@ -37,6 +40,7 @@ class VideoSettingsMenu extends StatefulWidget {
     this.anchorKey,
     this.initialPaneId,
     this.hideBackButtonForInitialPane = false,
+    this.standaloneWindow = false,
   });
 
   @override
@@ -50,7 +54,8 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
   late final PlayerKernelType _currentKernelType;
   static const double _menuWidth = 300;
   static const double _menuRightOffset = 20;
-  static const double _menuHeight = 420;
+  static const double _menuHeaderHeight = 44;
+  static const double _settingsItemHeight = 44;
   static const int _maxAnchorRefreshAttempts = 6;
   static const Duration _menuEnterDuration = Duration(milliseconds: 240);
   static const Duration _menuExitDuration = Duration(milliseconds: 170);
@@ -252,6 +257,7 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
   SettingsMenuScope _wrapMenu({
     required bool showBackItem,
     required Widget child,
+    required double height,
     bool forceShowHeader = false,
     bool? useBackButtonOverride,
   }) {
@@ -286,16 +292,83 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
       lockControlsVisible: true,
       anchorRect: resolvedAnchorRect,
       showPointer: resolvedAnchorRect != null,
-      height: _menuHeight,
+      height: height,
       requestClose: requestClose,
+      standaloneWindow: widget.standaloneWindow,
       child: child,
     );
+  }
+
+  double _heightForSettingsItemCount(
+    int itemCount, {
+    bool includeHeader = false,
+  }) {
+    final visibleItemCount = itemCount <= 0 ? 1 : itemCount;
+    return (includeHeader ? _menuHeaderHeight : 0) +
+        visibleItemCount * _settingsItemHeight;
+  }
+
+  double _heightForPane(PlayerMenuPaneId paneId) {
+    return _heightForSettingsItemCount(
+      _itemCountForPane(paneId),
+      includeHeader: true,
+    );
+  }
+
+  int _itemCountForPane(PlayerMenuPaneId paneId) {
+    switch (paneId) {
+      case PlayerMenuPaneId.subtitleSettings:
+        return videoState.player.getPlayerKernelName() == 'Media Kit' ? 11 : 1;
+      case PlayerMenuPaneId.subtitleTracks:
+        return _subtitleTrackItemCount();
+      case PlayerMenuPaneId.subtitleList:
+        return 8;
+      case PlayerMenuPaneId.audioTracks:
+        return _boundedListItemCount(
+          videoState.player.mediaInfo.audio?.length ?? 1,
+        );
+      case PlayerMenuPaneId.danmakuSettings:
+        return 7;
+      case PlayerMenuPaneId.danmakuTracks:
+        return _boundedListItemCount(videoState.danmakuTracks.length + 3);
+      case PlayerMenuPaneId.danmakuList:
+        return _boundedListItemCount(videoState.danmakuList.length);
+      case PlayerMenuPaneId.danmakuOffset:
+        return 8;
+      case PlayerMenuPaneId.playbackRate:
+        return 13;
+      case PlayerMenuPaneId.playlist:
+        return 8;
+      case PlayerMenuPaneId.jellyfinQuality:
+        return 9;
+      case PlayerMenuPaneId.playbackInfo:
+        return 8;
+      case PlayerMenuPaneId.seekStep:
+        return 18;
+    }
+  }
+
+  int _subtitleTrackItemCount() {
+    final embeddedCount = videoState.player.mediaInfo.subtitle?.length ?? 0;
+    final hasExternalSubtitle =
+        (videoState.currentExternalSubtitlePath?.isNotEmpty ?? false);
+    return _boundedListItemCount(
+      2 + embeddedCount + (hasExternalSubtitle ? 1 : 0),
+    );
+  }
+
+  int _boundedListItemCount(int itemCount) {
+    if (itemCount <= 0) {
+      return 1;
+    }
+    return itemCount;
   }
 
   Widget _buildPane(
     PlayerMenuPaneId paneId, {
     required VoidCallback onPaneClose,
     required bool showBackButton,
+    required double height,
   }) {
     late final Widget child;
     switch (paneId) {
@@ -352,13 +425,6 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
           onHoverChanged: widget.onHoverChanged,
         );
         break;
-      case PlayerMenuPaneId.controlBarSettings:
-        child = ControlBarSettingsMenu(
-          onClose: onPaneClose,
-          videoState: videoState,
-          onHoverChanged: widget.onHoverChanged,
-        );
-        break;
       case PlayerMenuPaneId.playbackRate:
         child = ChangeNotifierProvider(
           create: (_) => PlaybackRatePaneController(videoState: videoState),
@@ -399,6 +465,7 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
 
     return _wrapMenu(
       showBackItem: showBackButton,
+      height: height,
       forceShowHeader: !showBackButton,
       useBackButtonOverride: showBackButton,
       child: child,
@@ -433,6 +500,11 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
             .build()
             .where((item) => item.paneId != PlayerMenuPaneId.playlist)
             .toList();
+        final showQuickControls =
+            videoState.showPlayerMenuQuickControls && videoState.hasVideo;
+        final double menuHeight = _heightForSettingsItemCount(
+          menuItems.length + (showQuickControls ? 4 : 1),
+        );
         final bool hideBackForStandaloneInitialPane =
             widget.hideBackButtonForInitialPane &&
                 widget.initialPaneId != null &&
@@ -445,6 +517,7 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
         final Widget menuContent = _activePaneId == null
             ? _wrapMenu(
                 showBackItem: false,
+                height: menuHeight,
                 child: BaseSettingsMenu(
                   title: '设置',
                   width: _menuWidth,
@@ -452,9 +525,11 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
                   onHoverChanged: widget.onHoverChanged,
                   content: Column(
                     mainAxisSize: MainAxisSize.min,
-                    children: menuItems
-                        .map((item) => _buildSettingsItem(item))
-                        .toList(),
+                    children: [
+                      if (showQuickControls)
+                        const PlayerQuickControls(),
+                      ...menuItems.map((item) => _buildSettingsItem(item)),
+                    ],
                   ),
                 ),
               )
@@ -462,21 +537,35 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
                 _activePaneId!,
                 onPaneClose: paneCloseCallback,
                 showBackButton: !hideBackForStandaloneInitialPane,
+                height: hideBackForStandaloneInitialPane
+                    ? _heightForPane(_activePaneId!)
+                    : menuHeight,
               );
-        final Widget animatedMenuContent = FadeTransition(
-          opacity: _menuFadeAnimation,
-          child: SlideTransition(
-            position: slideAnimation,
-            child: ScaleTransition(
-              alignment: scaleAlignment,
-              scale: _menuScaleAnimation,
-              child: Theme(
-                data: Theme.of(context).copyWith(brightness: Brightness.dark),
+        // Close the owning popup/OverlayEntry, rather than only returning
+        // from a pane to this menu, before presenting a navigator dialog.
+        final Widget animatedMenuContent = DesktopTransientOverlayScope(
+          close: widget.onClose,
+          child: FadeTransition(
+            opacity: _menuFadeAnimation,
+            child: SlideTransition(
+              position: slideAnimation,
+              child: ScaleTransition(
+                alignment: scaleAlignment,
+                scale: _menuScaleAnimation,
                 child: menuContent,
               ),
             ),
           ),
         );
+        if (widget.standaloneWindow) {
+          return Material(
+            type: MaterialType.transparency,
+            child: IgnorePointer(
+              ignoring: _isClosing,
+              child: animatedMenuContent,
+            ),
+          );
+        }
         return Material(
           type: MaterialType.transparency,
           child: SizedBox(
@@ -508,9 +597,12 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
 
   Widget _buildSettingsItem(PlayerMenuItemDefinition item) {
     final bool isActive = _activePaneId == item.paneId;
+    final menuColors = PlayerMenuTheme.colorsOf(context);
+    final foregroundColor =
+        isActive ? menuColors.selectedForeground : menuColors.foreground;
 
     return Material(
-      color: isActive ? Colors.white.withOpacity(0.15) : Colors.transparent,
+      color: isActive ? menuColors.selectedBackground : Colors.transparent,
       child: InkWell(
         onTap: () => _handleItemTap(item.paneId),
         child: Container(
@@ -521,7 +613,7 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
           decoration: BoxDecoration(
             border: Border(
               bottom: BorderSide(
-                color: Colors.white.withOpacity(0.2),
+                color: menuColors.divider,
                 width: 0.5,
               ),
             ),
@@ -530,15 +622,16 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
             children: [
               Icon(
                 _resolveIcon(item.icon),
-                color: Colors.white,
+                color: foregroundColor,
                 size: 20,
               ),
               const SizedBox(width: 12),
               Text(
                 item.title,
-                style: const TextStyle(
-                  color: Colors.white,
+                style: TextStyle(
+                  color: foregroundColor,
                   fontSize: 14,
+                  fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
                 ),
               ),
               const Spacer(),
@@ -546,7 +639,9 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
                 isActive
                     ? Icons.chevron_left_rounded
                     : Icons.chevron_right_rounded,
-                color: Colors.white.withOpacity(0.7),
+                color: isActive
+                    ? menuColors.selectedForeground
+                    : menuColors.secondaryForeground,
                 size: 20,
               ),
             ],
@@ -574,8 +669,6 @@ class VideoSettingsMenuState extends State<VideoSettingsMenu>
         return Icons.list_alt_outlined;
       case PlayerMenuIconToken.danmakuOffset:
         return Icons.schedule;
-      case PlayerMenuIconToken.controlBarSettings:
-        return Icons.height;
       case PlayerMenuIconToken.playbackRate:
         return Icons.speed;
       case PlayerMenuIconToken.playlist:

@@ -1,6 +1,7 @@
 name: Build Linux
 
 on:
+  workflow_dispatch:
   workflow_call:
     outputs:
       version:
@@ -14,6 +15,7 @@ jobs:
   build:
     name: Build Linux Packages (amd64)
     runs-on: ubuntu-24.04
+    timeout-minutes: 180
     outputs:
       version: ${{ steps.setup.outputs.version }}
       artifact-name: release-Linux-amd64
@@ -27,10 +29,18 @@ jobs:
           token: ${{ github.token }}
           fetch-depth: 0
           submodules: recursive
+
+      - name: Read Linux Flutter version
+        id: linux-flutter
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .flutter-version-linux)" >> "$GITHUB_OUTPUT"
       
       - name: Setup Flutter Environment
         id: setup
         uses: ./.github/actions/setup-flutter
+        with:
+          flutter-version: ${{ steps.linux-flutter.outputs.version }}
+          dependency-profile: linux
 
       - name: Generate build info json
         shell: bash
@@ -51,9 +61,18 @@ jobs:
           name: release-Linux-amd64
           path: build/linux/
 
+      - name: Upload Dart debug symbols amd64 (for de-obfuscating crash stacks)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dart-symbols-Linux-amd64
+          path: build/symbols-linux/
+          if-no-files-found: warn
+
   build-arm64:
     name: Build Linux Packages (arm64)
     runs-on: ubuntu-22.04-arm
+    timeout-minutes: 180
     env:
       FVP_DEPS_URL: https://github.com/wang-bin/mdk-sdk/releases/latest/download/
       FVP_DEPS_LATEST: 1
@@ -64,10 +83,18 @@ jobs:
           token: ${{ github.token }}
           fetch-depth: 0
           submodules: recursive
+
+      - name: Read Linux Flutter version
+        id: linux-flutter
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .flutter-version-linux)" >> "$GITHUB_OUTPUT"
       
       - name: Setup Flutter Environment
         id: setup
         uses: ./.github/actions/setup-flutter
+        with:
+          flutter-version: ${{ steps.linux-flutter.outputs.version }}
+          dependency-profile: linux
 
       - name: Generate build info json
         shell: bash
@@ -87,3 +114,11 @@ jobs:
         with:
           name: release-Linux-arm64
           path: build/linux/
+
+      - name: Upload Dart debug symbols arm64 (for de-obfuscating crash stacks)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dart-symbols-Linux-arm64
+          path: build/symbols-linux/
+          if-no-files-found: warn

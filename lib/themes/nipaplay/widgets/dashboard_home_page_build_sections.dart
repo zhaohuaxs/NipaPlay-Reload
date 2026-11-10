@@ -24,35 +24,40 @@ extension DashboardHomePageSectionsBuild on _DashboardHomePageState {
 
     for (final entry in _recentJellyfinItemsByLibrary.entries) {
       addSection(
-        _buildRecentSection(
-          title: 'Jellyfin - 新增${entry.key}',
-          items: entry.value,
-          scrollController: _getJellyfinLibraryScrollController(entry.key),
-          onItemTap: (item) => _onJellyfinItemTap(item as JellyfinMediaItem),
-        ),
+        Builder(
+            builder: (_) => _buildRecentSection(
+                  title: 'Jellyfin - 新增${entry.key}',
+                  items: entry.value,
+                  scrollController:
+                      _getJellyfinLibraryScrollController(entry.key),
+                  onItemTap: (item) =>
+                      _onJellyfinItemTap(item as JellyfinMediaItem),
+                )),
       );
     }
 
     for (final entry in _recentEmbyItemsByLibrary.entries) {
       addSection(
-        _buildRecentSection(
-          title: 'Emby - 新增${entry.key}',
-          items: entry.value,
-          scrollController: _getEmbyLibraryScrollController(entry.key),
-          onItemTap: (item) => _onEmbyItemTap(item as EmbyMediaItem),
-        ),
+        Builder(
+            builder: (_) => _buildRecentSection(
+                  title: 'Emby - 新增${entry.key}',
+                  items: entry.value,
+                  scrollController: _getEmbyLibraryScrollController(entry.key),
+                  onItemTap: (item) => _onEmbyItemTap(item as EmbyMediaItem),
+                )),
       );
     }
 
     if (_recentDandanplayGroups.isNotEmpty) {
       addSection(
-        _buildRecentSection(
-          title: '弹弹play - 最近添加',
-          items: _recentDandanplayGroups,
-          scrollController: _getDandanplayLibraryScrollController(),
-          onItemTap: (item) =>
-              _onDandanplayGroupTap(item as DandanplayRemoteAnimeGroup),
-        ),
+        Builder(
+            builder: (_) => _buildRecentSection(
+                  title: '弹弹play - 最近添加',
+                  items: _recentDandanplayGroups,
+                  scrollController: _getDandanplayLibraryScrollController(),
+                  onItemTap: (item) =>
+                      _onDandanplayGroupTap(item as DandanplayRemoteAnimeGroup),
+                )),
       );
     }
 
@@ -79,46 +84,56 @@ extension DashboardHomePageSectionsBuild on _DashboardHomePageState {
       lastSection = type;
     }
 
-    for (final section in sectionsProvider.orderedSections) {
-      if (!sectionsProvider.isSectionEnabled(section)) {
-        continue;
-      }
-      switch (section) {
-        case HomeSectionType.todaySeries:
-          if (_todayAnimes.isEmpty && !_isLoadingTodayAnimes) {
-            continue;
-          }
-          addSectionWidgets(section, [_buildTodaySeriesSection()]);
+    for (final component in _buildHomeComponents(sectionsProvider)) {
+      final section = component.sectionType;
+      if (section == null) continue;
+      switch (component.type) {
+        case UnifiedHomeComponentType.hero:
           break;
-        case HomeSectionType.randomRecommendations:
-          if (_randomRecommendations.isEmpty &&
-              !_isLoadingRandomRecommendations) {
-            continue;
-          }
-          addSectionWidgets(section, [_buildRandomRecommendationsSection()]);
+        case UnifiedHomeComponentType.todaySeries:
+          addSectionWidgets(section, [
+            Builder(
+                key: const ValueKey('home-today'),
+                builder: (_) => _buildTodaySeriesSection())
+          ]);
           break;
-        case HomeSectionType.continueWatching:
-          addSectionWidgets(
-              section, [_buildContinueWatching(isPhone: isPhone)]);
+        case UnifiedHomeComponentType.trending:
+          addSectionWidgets(section, [
+            Builder(
+                key: const ValueKey('home-trending'),
+                builder: (_) => _buildTrendingSection())
+          ]);
           break;
-        case HomeSectionType.remoteLibraries:
+        case UnifiedHomeComponentType.randomRecommendations:
+          addSectionWidgets(section, [
+            Builder(
+                key: const ValueKey('home-random'),
+                builder: (_) => _buildRandomRecommendationsSection())
+          ]);
+          break;
+        case UnifiedHomeComponentType.continueWatching:
+          addSectionWidgets(section, [
+            Builder(
+                key: const ValueKey('home-continue'),
+                builder: (_) => _buildContinueWatching(isPhone: isPhone))
+          ]);
+          break;
+        case UnifiedHomeComponentType.remoteLibraries:
           final remoteSections = _buildRemoteLibrarySections(isPhone: isPhone);
           addSectionWidgets(section, remoteSections);
           break;
-        case HomeSectionType.localLibrary:
-          if (_localAnimeItems.isEmpty) {
-            continue;
-          }
+        case UnifiedHomeComponentType.localLibrary:
           addSectionWidgets(
             section,
             [
-              _buildRecentSection(
-                title: '本地媒体库 - 最近添加',
-                items: _localAnimeItems,
-                scrollController: _getLocalLibraryScrollController(),
-                onItemTap: (item) =>
-                    _onLocalAnimeItemTap(item as LocalAnimeItem),
-              ),
+              Builder(
+                  builder: (_) => _buildRecentSection(
+                        title: '本地媒体库 - 最近添加',
+                        items: _localAnimeItems,
+                        scrollController: _getLocalLibraryScrollController(),
+                        onItemTap: (item) =>
+                            _onLocalAnimeItemTap(item as LocalAnimeItem),
+                      )),
             ],
           );
           break;
@@ -278,18 +293,24 @@ extension DashboardHomePageSectionsBuild on _DashboardHomePageState {
     return _wrapLargeScreenFocusable(child: card, onActivate: onTap);
   }
 
-  void _showWatchHistoryDialog() {
-    final screenSize = MediaQuery.of(context).size;
-    final shortestSide = math.min(screenSize.width, screenSize.height);
-    final isPhone = shortestSide < 600;
+  Future<void> _showWatchHistoryDialog() async {
+    if (AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone) {
+      await CupertinoBottomSheet.show<void>(
+        context: context,
+        title: '观看记录',
+        floatingTitle: true,
+        child: const WatchHistoryPage(phoneLayout: true),
+      );
+      return;
+    }
 
-    NipaplayWindow.show(
+    await NipaplayWindow.show<void>(
       context: context,
       child: NipaplayWindowScaffold(
         backgroundImageUrl: null,
         blurBackground: true, // 内部已固定为 40 模糊
-        maxWidth: isPhone ? screenSize.width * 0.95 : 800,
-        maxHeightFactor: isPhone ? 0.85 : 0.7,
+        maxWidth: 800,
+        maxHeightFactor: 0.7,
         onClose: () => Navigator.of(context).pop(),
         child: Column(
           children: [
@@ -299,6 +320,10 @@ extension DashboardHomePageSectionsBuild on _DashboardHomePageState {
                 onPanUpdate: (details) {
                   NipaplayWindowPositionProvider.of(innerContext)
                       ?.onMove(details.delta);
+                },
+                onDoubleTap: () {
+                  NipaplayWindowPositionProvider.of(innerContext)
+                      ?.onToggleDisplayMode();
                 },
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
@@ -326,7 +351,9 @@ extension DashboardHomePageSectionsBuild on _DashboardHomePageState {
 
   Widget _buildWatchHistoryButton() {
     final button = _HoverScaleButton(
-      onTap: _isLargeScreenModeActive ? null : _showWatchHistoryDialog,
+      onTap: _isLargeScreenModeActive
+          ? null
+          : () => unawaited(_showWatchHistoryDialog()),
       child: Icon(
         Icons.history_rounded,
         size: 24,
@@ -336,7 +363,7 @@ extension DashboardHomePageSectionsBuild on _DashboardHomePageState {
       message: '观看记录',
       child: _wrapLargeScreenFocusable(
         child: button,
-        onActivate: _showWatchHistoryDialog,
+        onActivate: () => unawaited(_showWatchHistoryDialog()),
         borderRadius: BorderRadius.circular(8),
         padding: const EdgeInsets.all(4),
       ),
@@ -587,7 +614,7 @@ extension DashboardHomePageSectionsBuild on _DashboardHomePageState {
       sourceLabel = '本地';
       // 观看历史如果有animeId也可以尝试获取简介
       if (_isValidAnimeId(item.animeId)) {
-        detailFuture = BangumiService.instance.getAnimeDetails(item.animeId!);
+        detailFuture = _animeDetailsFuture(item.animeId!);
       }
     } else if (item is LocalAnimeItem) {
       name = item.animeName;
@@ -600,7 +627,7 @@ extension DashboardHomePageSectionsBuild on _DashboardHomePageState {
       sourceLabel = '本地';
 
       if (_isValidAnimeId(item.animeId)) {
-        detailFuture = BangumiService.instance.getAnimeDetails(item.animeId!);
+        detailFuture = _animeDetailsFuture(item.animeId!);
       }
     } else if (item is DandanplayRemoteAnimeGroup) {
       name = item.title;
@@ -610,7 +637,7 @@ extension DashboardHomePageSectionsBuild on _DashboardHomePageState {
       sourceLabel = '弹弹play';
       rating = null;
       if (_isValidAnimeId(item.animeId)) {
-        detailFuture = BangumiService.instance.getAnimeDetails(item.animeId!);
+        detailFuture = _animeDetailsFuture(item.animeId!);
       }
     } else if (item is BangumiAnime) {
       name = item.nameCn.isNotEmpty ? item.nameCn : item.name;
@@ -619,7 +646,7 @@ extension DashboardHomePageSectionsBuild on _DashboardHomePageState {
       sourceLabel = 'Bangumi';
       rating = item.rating;
       // 动画详情通常需要异步获取更详细的简介
-      detailFuture = BangumiService.instance.getAnimeDetails(item.id);
+      detailFuture = _animeDetailsFuture(item.id);
     }
 
     final bool showSummary =
@@ -880,7 +907,7 @@ extension DashboardHomePageSectionsBuild on _DashboardHomePageState {
     if (thumbnailPath != null && thumbnailPath.isNotEmpty) {
       final lowerPath = thumbnailPath.toLowerCase();
       if (lowerPath.startsWith('http://') || lowerPath.startsWith('https://')) {
-        return CachedNetworkImage(
+        return MediaServerAwareCachedNetworkImage(
           imageUrl: thumbnailPath,
           fit: BoxFit.cover,
           width: double.infinity,
@@ -968,7 +995,7 @@ extension DashboardHomePageSectionsBuild on _DashboardHomePageState {
             Container(color: Colors.white),
             ImageFiltered(
               imageFilter: ImageFilter.blur(sigmaX: 40, sigmaY: 40),
-              child: CachedNetworkImage(
+              child: MediaServerAwareCachedNetworkImage(
                 imageUrl: imageUrl,
                 fit: BoxFit.cover,
                 width: double.infinity,

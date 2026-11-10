@@ -1,18 +1,29 @@
+import 'package:nipaplay/playback/player_ui_snapshot.dart';
 import 'dart:async';
 
+import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:nipaplay/danmaku_abstraction/danmaku_kernel_factory.dart';
 import 'package:nipaplay/services/system_share_service.dart';
+import 'package:nipaplay/services/photo_library_service.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
+import 'package:nipaplay/utils/media_source_utils.dart';
 import 'package:nipaplay/utils/platform_utils.dart';
 import 'package:nipaplay/utils/video_player_state.dart';
+import 'package:nipaplay/widgets/video_surface_layout.dart';
 import 'package:nipaplay/widgets/context_menu/context_menu.dart';
 import 'package:nipaplay/widgets/danmaku_overlay.dart';
 import 'package:nipaplay/widgets/external_subtitle_overlay.dart';
+import 'package:nipaplay/widgets/embedded_subtitle_overlay.dart';
 import 'package:nipaplay/widgets/macos_native_video_view.dart';
+import 'package:nipaplay/widgets/desktop_transient_overlay.dart';
+import 'package:nipaplay/widgets/desktop_picture_in_picture_scope.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/themed_anime_detail.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_mode_scope.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_player_menu_scope.dart';
 import 'package:provider/provider.dart';
 import 'brightness_gesture_area.dart';
 import 'volume_gesture_area.dart';
@@ -27,14 +38,48 @@ import 'loading_overlay.dart';
 import 'macos_hdr_probe_overlay.dart';
 import 'vertical_indicator.dart';
 import 'video_upload_ui.dart';
+import 'base_settings_menu.dart';
 import 'playback_info_menu.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 
+/// HarmonyOS may mirror a touch as pointer activity before delivering its tap.
+/// Keep the existing pointer-driven controls behavior on every other platform.
+@visibleForTesting
+bool shouldHandleDesktopPointerActivity({
+  required bool isHarmonyOS,
+}) {
+  return !isHarmonyOS;
+}
+
+@visibleForTesting
+bool shouldDelegateLargeScreenPlayerKeyToControls({
+  required bool isLargeScreen,
+  required bool controlsVisible,
+  required LogicalKeyboardKey key,
+}) {
+  if (!isLargeScreen || !controlsVisible) {
+    return false;
+  }
+  return key == LogicalKeyboardKey.arrowLeft ||
+      key == LogicalKeyboardKey.arrowRight ||
+      key == LogicalKeyboardKey.arrowUp ||
+      key == LogicalKeyboardKey.arrowDown ||
+      key == LogicalKeyboardKey.enter ||
+      key == LogicalKeyboardKey.numpadEnter ||
+      key == LogicalKeyboardKey.select ||
+      key == LogicalKeyboardKey.gameButtonA;
+}
+
 class VideoPlayerUI extends StatefulWidget {
   final Widget? emptyPlaceholder;
+  final double danmakuScale;
 
-  const VideoPlayerUI({super.key, this.emptyPlaceholder});
+  const VideoPlayerUI({
+    super.key,
+    this.emptyPlaceholder,
+    this.danmakuScale = 1.0,
+  });
 
   @override
   State<VideoPlayerUI> createState() => _VideoPlayerUIState();
@@ -55,6 +100,7 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
   Timer? _doubleTapTimer;
   Timer? _mouseMoveTimer;
   OverlayEntry? _playbackInfoOverlay;
+  DesktopTransientOverlay? _playbackInfoPopup;
   int _tapCount = 0;
   static const _phoneDoubleTapTimeout = Duration(milliseconds: 360);
   static const _desktopDoubleTapTimeout = Duration(milliseconds: 220);
@@ -72,9 +118,12 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
   bool _hasStartedSeekDrag = false;
   final OverlayContextMenuController _contextMenuController =
       OverlayContextMenuController();
+  int _windowsNativeOverlayPointerLogCount = 0;
+  int _lastPointerActivityMs = 0;
 
   // <<< ADDED: Hold a reference to VideoPlayerState for managing the callback
   VideoPlayerState? _videoPlayerStateInstance;
+  StreamSubscription<void>? _pluginRendererChangeSubscription;
   int? _macosNativeVideoViewId;
 
   bool _isRepeatableShortcut(LogicalKeyboardKey key) {
@@ -92,8 +141,10 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
   }
 
   Widget _buildDanmakuOverlay(VideoPlayerState videoState) {
-    final isNextKernel = DanmakuKernelFactory.getKernelType() ==
-        DanmakuRenderEngine.nipaplayNext;
+    final isStableKernel = videoState.isNativeDanmakuActive ||
+        DanmakuKernelFactory.activePluginRenderer != null ||
+        DanmakuKernelFactory.getKernelType() ==
+            DanmakuRenderEngine.nipaplayNext;
     return ValueListenableBuilder<double>(
       valueListenable: videoState.playbackTimeMs,
       child: DanmakuOverlay(
@@ -103,12 +154,13 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
         currentPosition: videoState.playbackTimeMs.value,
         videoDuration: videoState.videoDuration.inMilliseconds.toDouble(),
         isPlaying: videoState.status == PlayerStatus.playing,
-        fontSize: getFontSize(videoState),
-        isVisible: videoState.danmakuVisible,
+        fontSize: getFontSize(videoState) * widget.danmakuScale,
+        isVisible: videoState.danmakuVisible &&
+            !videoState.shouldHideDanmakuForScreenshot,
         opacity: videoState.mappedDanmakuOpacity,
       ),
       builder: (context, posMs, child) {
-        if (isNextKernel && child != null) {
+        if ((isStableKernel || !videoState.danmakuVisible) && child != null) {
           return child;
         }
         return DanmakuOverlay(
@@ -118,8 +170,9 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
           currentPosition: posMs,
           videoDuration: videoState.videoDuration.inMilliseconds.toDouble(),
           isPlaying: videoState.status == PlayerStatus.playing,
-          fontSize: getFontSize(videoState),
-          isVisible: videoState.danmakuVisible,
+          fontSize: getFontSize(videoState) * widget.danmakuScale,
+          isVisible: videoState.danmakuVisible &&
+              !videoState.shouldHideDanmakuForScreenshot,
           opacity: videoState.mappedDanmakuOpacity,
         );
       },
@@ -158,12 +211,38 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
       return KeyEventResult.ignored;
     }
 
+    final isLargeScreen = NipaplayLargeScreenModeScope.isActiveOf(context);
+    if (shouldDelegateLargeScreenPlayerKeyToControls(
+      isLargeScreen: isLargeScreen,
+      controlsVisible: videoState.showControls,
+      key: key,
+    )) {
+      return KeyEventResult.ignored;
+    }
+
     switch (key) {
       case LogicalKeyboardKey.space:
+      case LogicalKeyboardKey.mediaPlayPause:
         videoState.togglePlayPause();
+        return KeyEventResult.handled;
+      case LogicalKeyboardKey.mediaPlay:
+        if (videoState.status != PlayerStatus.playing) {
+          videoState.togglePlayPause();
+        }
+        return KeyEventResult.handled;
+      case LogicalKeyboardKey.mediaPause:
+        if (videoState.status == PlayerStatus.playing) {
+          videoState.togglePlayPause();
+        }
         return KeyEventResult.handled;
       case LogicalKeyboardKey.enter:
       case LogicalKeyboardKey.numpadEnter:
+      case LogicalKeyboardKey.select:
+      case LogicalKeyboardKey.gameButtonA:
+        if (isLargeScreen) {
+          videoState.togglePlayPause();
+          return KeyEventResult.handled;
+        }
         unawaited(videoState.toggleFullscreen());
         return KeyEventResult.handled;
       case LogicalKeyboardKey.arrowLeft:
@@ -196,6 +275,21 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
         unawaited(videoState.showSendDanmakuDialog());
         return KeyEventResult.handled;
       case LogicalKeyboardKey.escape:
+        if (isLargeScreen) {
+          if (defaultTargetPlatform == TargetPlatform.android) {
+            return NipaplayLargeScreenPlayerMenuScope.maybeHandleBackPress(
+              context,
+            )
+                ? KeyEventResult.handled
+                : KeyEventResult.ignored;
+          }
+          if (!NipaplayLargeScreenPlayerMenuScope.maybeHandleMenuPress(
+            context,
+          )) {
+            videoState.revealLargeScreenControls();
+          }
+          return KeyEventResult.handled;
+        }
         if (videoState.isFullscreen) {
           unawaited(videoState.toggleFullscreen());
           return KeyEventResult.handled;
@@ -207,22 +301,51 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
   }
 
   bool get _isMacOSHdrVideoOnlyEnabled {
-    return _macosHdrVideoOnly ||
-        Platform.environment['NIPAPLAY_MACOS_HDR_VIDEO_ONLY'] == '1';
+    return !kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.macOS ||
+            defaultTargetPlatform == TargetPlatform.windows) &&
+        (_macosHdrVideoOnly ||
+            Platform.environment['NIPAPLAY_MACOS_HDR_VIDEO_ONLY'] == '1' ||
+            Platform.environment['NIPAPLAY_WINDOWS_HDR_VIDEO_ONLY'] == '1');
   }
 
   bool get _shouldUseMacOSWindowHostedVideoOverlay {
-    return !kIsWeb &&
-        defaultTargetPlatform == TargetPlatform.macOS &&
-        Platform.environment['NIPAPLAY_MACOS_HDR_USE_APPKIT_VIEW'] != '1' &&
-        Platform.environment['NIPAPLAY_DISABLE_MACOS_WINDOW_OVERLAY'] != '1';
+    if (kIsWeb) {
+      return false;
+    }
+    if (defaultTargetPlatform == TargetPlatform.macOS) {
+      return Platform.environment['NIPAPLAY_MACOS_HDR_USE_APPKIT_VIEW'] !=
+              '1' &&
+          Platform.environment['NIPAPLAY_DISABLE_MACOS_WINDOW_OVERLAY'] != '1';
+    }
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      return Platform.environment['NIPAPLAY_DISABLE_WINDOWS_WINDOW_OVERLAY'] !=
+          '1';
+    }
+    return false;
+  }
+
+  bool _shouldUseWindowHostedVideoOverlay(VideoPlayerState videoState) {
+    return !videoState.supportsVideoAspectModes;
   }
 
   double getFontSize(VideoPlayerState videoState) {
     return videoState.actualDanmakuFontSize;
   }
 
+  /// 渲染层出口统一包 ValueKey(playerSurfaceGeneration)：内核热切换时代数
+  /// 变化 → Flutter 销毁并重建整棵 surface 子树（Texture 解除旧纹理绑定、
+  /// PlatformView 重建平台视图），杜绝旧内核的渲染状态残留在新内核上。
   Widget _buildVideoSurface(VideoPlayerState videoState, int? textureId) {
+    return KeyedSubtree(
+      key: ValueKey<int>(
+        Object.hash(videoState.playerSurfaceGeneration, 'player-surface'),
+      ),
+      child: _buildVideoSurfaceInner(videoState, textureId),
+    );
+  }
+
+  Widget _buildVideoSurfaceInner(VideoPlayerState videoState, int? textureId) {
     if (kIsWeb) {
       final controller = videoState.player.videoPlayerController;
       if (controller == null) {
@@ -245,18 +368,41 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
           debugLabel: videoState.currentVideoPath?.split('/').last,
           onPlatformViewIdChanged: _updateMacOSNativeVideoViewId,
           onFrameRectChanged: _handleMacOSWindowHostedVideoRectChanged,
+          onPointerActivity: _handleWindowsNativeOverlayPointerActivity,
         );
       }
-      return MacOSNativeVideoView(
-        player: videoState.player,
-        debugLabel: videoState.currentVideoPath?.split('/').last,
-        onPlatformViewIdChanged: _updateMacOSNativeVideoViewId,
-      );
+      if (defaultTargetPlatform == TargetPlatform.macOS) {
+        return MacOSNativeVideoView(
+          player: videoState.player,
+          debugLabel: videoState.currentVideoPath?.split('/').last,
+          onPlatformViewIdChanged: _updateMacOSNativeVideoViewId,
+        );
+      }
+      return const SizedBox.shrink();
     }
     if (textureId == null || textureId < 0) {
       return const SizedBox.shrink();
     }
     return Texture(textureId: textureId, filterQuality: FilterQuality.medium);
+  }
+
+  Widget _buildVideoSurfaceWithAspectMode(
+      VideoPlayerState videoState, int? textureId) {
+    final videoTracks = videoState.player.mediaInfo.video;
+    Size? naturalSize;
+    if (videoTracks != null && videoTracks.isNotEmpty) {
+      final codec = videoTracks.first.codec;
+      if (codec.width > 0 && codec.height > 0) {
+        naturalSize = Size(codec.width.toDouble(), codec.height.toDouble());
+      }
+    }
+    return VideoSurfaceLayout(
+      mode: videoState.videoAspectMode,
+      sourceAspect: videoState.aspectRatio,
+      naturalSize: naturalSize,
+      handlesAspectFit: videoState.player.handlesVideoAspectFit,
+      child: _buildVideoSurface(videoState, textureId),
+    );
   }
 
   void _updateMacOSNativeVideoViewId(int? viewId) {
@@ -277,21 +423,40 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
     if (!mounted) {
       return;
     }
-    _videoPlayerStateInstance?.setMacOSWindowHostedVideoRect(rect);
+    // Rects are local to their FlutterView. The global VideoPlayerState value
+    // is consumed only by the main window background, so publishing a
+    // detached-window rect would punch a same-sized hole in the main window.
+    final isDetachedView = DesktopMultiWindow.isSecondaryWindow(context);
+    _videoPlayerStateInstance?.setWindowHostedVideoRect(
+      isDetachedView ? null : rect,
+    );
   }
 
   Widget _buildVideoSurfaceStage(VideoPlayerState videoState, int? textureId) {
-    if (videoState.player.prefersPlatformVideoSurface &&
-        _shouldUseMacOSWindowHostedVideoOverlay) {
+    if (_shouldUseWindowHostedVideoOverlay(videoState)) {
+      // iOS only: the window-overlay plane mirrors this Flutter rect, so keep
+      // it sized to the video aspect ratio and centered. This preserves the
+      // iPhone notch-safe path and keeps iPad video from anchoring at the
+      // top-left of a full-bleed native plane.
+      //
+      // macOS keeps the full-bleed surface: Erika letterboxes natively into
+      // the reserved plane. Flutter must NOT shrink the plane or paint around
+      // it, or the app UI behind shows through the transparent bars.
+      final useLegacyIosAspectSurface = !kIsWeb &&
+          defaultTargetPlatform == TargetPlatform.iOS &&
+          Platform.environment['NIPAPLAY_IOS_ERIKA_ASPECT_SURFACE'] == '1';
+      if (useLegacyIosAspectSurface) {
+        return Center(
+          child: AspectRatio(
+            aspectRatio: videoState.aspectRatio,
+            child: _buildVideoSurface(videoState, textureId),
+          ),
+        );
+      }
       return _buildVideoSurface(videoState, textureId);
     }
 
-    final surface = Center(
-      child: AspectRatio(
-        aspectRatio: videoState.aspectRatio,
-        child: _buildVideoSurface(videoState, textureId),
-      ),
-    );
+    final surface = _buildVideoSurfaceWithAspectMode(videoState, textureId);
     return ColoredBox(color: Colors.black, child: surface);
   }
 
@@ -305,10 +470,8 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
         _macosNativeVideoViewId != null;
   }
 
-  bool _shouldKeepMacOSNativeVideoSurface(VideoPlayerState videoState) {
-    return !kIsWeb &&
-        defaultTargetPlatform == TargetPlatform.macOS &&
-        videoState.player.prefersPlatformVideoSurface &&
+  bool _shouldKeepWindowHostedVideoSurface(VideoPlayerState videoState) {
+    return _shouldUseWindowHostedVideoOverlay(videoState) &&
         videoState.currentVideoPath != null &&
         videoState.status != PlayerStatus.idle &&
         videoState.status != PlayerStatus.error &&
@@ -319,6 +482,11 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _pluginRendererChangeSubscription =
+        DanmakuKernelFactory.onRendererChanged.listen((_) {
+      _videoPlayerStateInstance?.handleDanmakuRendererChanged();
+      if (mounted) setState(() {});
+    });
     // 移除键盘事件处理
     // _focusNode.onKey = _handleKeyEvent;
 
@@ -341,21 +509,24 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
             () async {
           if (mounted && _videoPlayerStateInstance != null) {
             // 获取当前的错误信息用于显示
-            final String errorMessage =
-                _videoPlayerStateInstance!.error ?? "发生未知播放错误，已停止播放。";
+            final videoState = _videoPlayerStateInstance!;
+            final errorMessage = MediaSourceUtils.playbackErrorForDisplay(
+              videoState.error ?? "发生未知播放错误，已停止播放。",
+              videoState.currentVideoPath,
+            );
 
             // 显示 BlurDialog
             BlurDialog.show<void>(
               context: context, // 使用 VideoPlayerUI 的 context
               title: '播放错误',
               content: errorMessage,
-              actions: [
+              actionsBuilder: (dialogContext) => [
                 HoverScaleTextButton(
                   child: const Text('确定'),
                   onPressed: () {
                     // 1. Pop the dialog
-                    //    这里的 context 是 BlurDialog.show 内部创建的用于对话框的 context
-                    Navigator.of(context).pop();
+                    //    使用弹窗路由内部的 context 关闭弹窗。
+                    Navigator.of(dialogContext).pop();
 
                     // 2. Reset the player state.
                     //    这将导致 VideoPlayerUI 重建并因 hasVideo 为 false 而显示 VideoUploadUI。
@@ -388,6 +559,19 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
       context,
       listen: false,
     );
+    _videoPlayerStateInstance?.setDanmakuPresentationScale(
+      widget.danmakuScale,
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant VideoPlayerUI oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.danmakuScale != widget.danmakuScale) {
+      _videoPlayerStateInstance?.setDanmakuPresentationScale(
+        widget.danmakuScale,
+      );
+    }
   }
 
   // 使用单独的方法进行安全初始化
@@ -506,6 +690,10 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
 
   // 添加长按手势处理方法
   void _handleLongPressStart(VideoPlayerState videoState) {
+    // 字幕编辑框可见/字幕拖动中不启动长按倍速
+    if (videoState.subtitleEditBoxVisible || videoState.subtitleDragActive) {
+      return;
+    }
     if (!globals.isMobilePlatform || !videoState.hasVideo) return;
 
     // 开始倍速播放
@@ -525,16 +713,31 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
     HapticFeedback.lightImpact();
   }
 
-  void _handleMouseMove(PointerEvent event) {
+  bool _handlePointerActivity() {
+    if (!mounted ||
+        !shouldHandleDesktopPointerActivity(
+          isHarmonyOS: globals.isHarmonyOS,
+        )) {
+      return false;
+    }
     final videoState = Provider.of<VideoPlayerState>(context, listen: false);
-    if (!videoState.hasVideo) return;
+    if (!videoState.hasVideo) return false;
+
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final controlsAlreadyVisible = videoState.showControls && _isMouseVisible;
+    if (controlsAlreadyVisible && nowMs - _lastPointerActivityMs < 150) {
+      return false;
+    }
+    _lastPointerActivityMs = nowMs;
 
     if (!_isMouseVisible) {
       setState(() {
         _isMouseVisible = true;
       });
     }
-    videoState.setShowControls(true);
+    if (!videoState.showControls) {
+      videoState.setShowControls(true);
+    }
 
     _mouseMoveTimer?.cancel();
     final hideDelay = videoState.instantHidePlayerUiEnabled
@@ -548,6 +751,35 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
         videoState.setShowControls(false);
       }
     });
+    return true;
+  }
+
+  void _handleWindowsNativeOverlayPointerActivity(PointerEvent event) {
+    if (!mounted) {
+      return;
+    }
+    final videoState = Provider.of<VideoPlayerState>(context, listen: false);
+    final showControlsBefore = videoState.showControls;
+    final mouseVisibleBefore = _isMouseVisible;
+    final processed = _handlePointerActivity();
+    if (!kReleaseMode &&
+        processed &&
+        _windowsNativeOverlayPointerLogCount < 16) {
+      _windowsNativeOverlayPointerLogCount += 1;
+      debugPrint(
+        '[VideoPlayerUI] WINDOWS_NATIVE_OVERLAY_POINTER_ACTIVITY '
+        'type=${event.runtimeType} hasVideo=${videoState.hasVideo} '
+        'processed=$processed '
+        'showControlsBefore=$showControlsBefore '
+        'showControlsAfter=${videoState.showControls} '
+        'mouseVisibleBefore=$mouseVisibleBefore '
+        'mouseVisibleAfter=$_isMouseVisible',
+      );
+    }
+  }
+
+  void _handleMouseMove(PointerEvent event) {
+    _handlePointerActivity();
   }
 
   void _handleMouseExit(PointerExitEvent event) {
@@ -616,6 +848,12 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _pluginRendererChangeSubscription?.cancel();
+    // The window-hosted video surface punches a transparent hole through the
+    // Flutter background. Always restore it before this route is removed, even
+    // if the native overlay's asynchronous detach races with player disposal.
+    _videoPlayerStateInstance?.setWindowHostedVideoRect(null);
+    _videoPlayerStateInstance?.setDanmakuPresentationScale(1.0);
     // <<< ADDED: Clear the callback to prevent memory leaks
     _videoPlayerStateInstance?.onSeriousPlaybackErrorAndShouldPop = null;
     _contextMenuController.dispose();
@@ -636,7 +874,7 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
     if (!SystemShareService.isSupported) return;
 
     final currentVideoPath = videoState.currentVideoPath;
-    final currentActualUrl = videoState.currentActualPlayUrl;
+    final currentActualUrl = videoState.currentResolvedMediaSource;
 
     String? filePath;
     String? url;
@@ -649,7 +887,7 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
       } else if (scheme == 'jellyfin' || scheme == 'emby') {
         url = currentActualUrl;
       } else if (scheme == 'smb' || scheme == 'webdav' || scheme == 'dav') {
-        url = currentVideoPath;
+        url = currentActualUrl;
       } else {
         filePath = currentVideoPath;
       }
@@ -686,7 +924,31 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
   }
 
   void _showPlaybackInfoOverlay() {
-    if (_playbackInfoOverlay != null) return;
+    if (_playbackInfoOverlay != null || _playbackInfoPopup != null) return;
+
+    if (DesktopMultiWindow.isSecondaryWindow(context)) {
+      final viewSize = MediaQuery.sizeOf(context);
+      final popup = DesktopTransientOverlay.showPopup(
+        context: context,
+        anchorRect: Rect.fromLTWH(
+          viewSize.width - 40,
+          viewSize.height - 72,
+          1,
+          1,
+        ),
+        size: const Size(360, 600),
+        placement: DesktopTransientWindowPlacement.above,
+        contentBuilder: (_, close) => SettingsMenuScope(
+          standaloneWindow: true,
+          child: PlaybackInfoMenu(onClose: close),
+        ),
+        onClosed: () => _playbackInfoPopup = null,
+      );
+      if (popup != null) {
+        _playbackInfoPopup = popup;
+        return;
+      }
+    }
 
     final overlay = Overlay.maybeOf(context);
     if (overlay == null) return;
@@ -710,16 +972,35 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
   }
 
   void _hidePlaybackInfoOverlay() {
+    _playbackInfoPopup?.close();
+    _playbackInfoPopup = null;
     _playbackInfoOverlay?.remove();
     _playbackInfoOverlay = null;
   }
 
   Future<void> _captureScreenshot(VideoPlayerState videoState) async {
     try {
-      final path = await videoState.captureScreenshot();
+      final isIos = !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
+      final isAndroid =
+          !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+      final path = await videoState.captureScreenshot(
+        temporary: isIos || isAndroid,
+      );
       if (!mounted) return;
       if (path == null || path.isEmpty) {
         BlurSnackBar.show(context, '截图失败');
+        return;
+      }
+      if (isAndroid) {
+        await PhotoLibraryService.saveTemporaryFileToPhotos(
+          path,
+          mimeType: 'image/jpeg',
+        );
+        if (mounted) BlurSnackBar.show(context, '截图已保存到相册');
+        return;
+      }
+      if (isIos) {
+        await SystemShareService.exportFile(path, mimeType: 'image/jpeg');
         return;
       }
       final isMac = !kIsWeb && defaultTargetPlatform == TargetPlatform.macOS;
@@ -747,6 +1028,22 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
     }
   }
 
+  Future<void> _showAnimeDetail(VideoPlayerState videoState) async {
+    final detailContext = videoState.animeDetailContext;
+    if (detailContext == null) return;
+
+    try {
+      await ThemedAnimeDetail.show(
+        context,
+        detailContext.animeId ?? 0,
+        playbackDetailContext: detailContext,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      BlurSnackBar.show(context, '打开番剧详情失败: $e');
+    }
+  }
+
   List<ContextMenuAction> _buildContextMenuActions(
     VideoPlayerState videoState,
   ) {
@@ -763,6 +1060,12 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
         enabled: videoState.canPlayNextEpisode,
         onPressed: () => unawaited(videoState.playNextEpisode()),
       ),
+      if (videoState.animeDetailContext != null)
+        ContextMenuAction(
+          icon: Icons.movie_outlined,
+          label: '番剧详情',
+          onPressed: () => unawaited(_showAnimeDetail(videoState)),
+        ),
       ContextMenuAction(
         icon: Icons.fast_forward_rounded,
         label: '快进 ${videoState.seekStepDisplayLabel}',
@@ -831,8 +1134,12 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<VideoPlayerState>(
-      builder: (context, videoState, child) {
+    final isPictureInPicture =
+        DesktopPictureInPictureScope.isEnabledOf(context);
+    return Selector<VideoPlayerState, List<Object?>>(
+      selector: (_, state) => playerUiSnapshot(state),
+      builder: (context, snapshot, child) {
+        final videoState = context.read<VideoPlayerState>();
         return ValueListenableBuilder<int?>(
           valueListenable: videoState.player.textureId,
           builder: (context, textureId, _) {
@@ -840,11 +1147,13 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
                 videoState.player.prefersPlatformVideoSurface ||
                 (textureId != null && textureId >= 0);
 
-            final shouldKeepNativeSurface = _shouldKeepMacOSNativeVideoSurface(
+            final shouldKeepNativeSurface = _shouldKeepWindowHostedVideoSurface(
               videoState,
             );
 
-            if (!videoState.hasVideo && !shouldKeepNativeSurface) {
+            if (!videoState.hasVideo &&
+                !videoState.isDfmStartupGatePending &&
+                !shouldKeepNativeSurface) {
               final placeholder =
                   widget.emptyPlaceholder ?? const VideoUploadUI();
               return Stack(
@@ -860,6 +1169,7 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
                       episodeTitle: videoState.episodeTitle,
                       fileName: videoState.currentVideoPath?.split('/').last,
                       animeId: videoState.animeId,
+                      coverImageUrl: videoState.loadingCoverImageUrl,
                     ),
                 ],
               );
@@ -870,7 +1180,6 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
             }
 
             if (_isMacOSHdrVideoOnlyEnabled &&
-                defaultTargetPlatform == TargetPlatform.macOS &&
                 videoState.player.prefersPlatformVideoSurface) {
               return _buildVideoSurfaceStage(videoState, textureId);
             }
@@ -888,7 +1197,8 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
                     GestureDetector(
                       behavior: HitTestBehavior.opaque,
                       onTap: _handleTap,
-                      onSecondaryTapDown: globals.isDesktop
+                      onSecondaryTapDown: globals.isDesktop &&
+                              !isPictureInPicture
                           ? (details) {
                               if (!videoState.hasVideo) return;
                               _hidePlaybackInfoOverlay();
@@ -920,7 +1230,6 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
                               _handleHorizontalDragEnd(context, details)
                           : null,
                       child: FocusScope(
-                        node: FocusScopeNode(),
                         child: globals.isMobilePlatform
                             ? RepaintBoundary(
                                 key: videoState.screenshotBoundaryKey,
@@ -935,35 +1244,47 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
                                         ),
                                       ),
                                     ),
-                                    if (videoState.hasVideo &&
-                                        videoState.danmakuVisible)
+                                    if (videoState.hasVideo ||
+                                        videoState.isDfmStartupGatePending)
                                       Positioned.fill(
-                                        child: IgnorePointer(
-                                          ignoring: true,
-                                          child: Consumer<VideoPlayerState>(
-                                            builder: (context, videoState, _) {
-                                              return _buildDanmakuOverlay(
-                                                videoState,
-                                              );
-                                            },
+                                        // RepaintBoundary isolates the danmaku layer: sibling
+                                        // subtitle overlays repainting must not drag the danmaku
+                                        // layer into recompositing (danmaku flicker).
+                                        child: RepaintBoundary(
+                                          child: IgnorePointer(
+                                            ignoring: true,
+                                            child: Selector<VideoPlayerState,
+                                                List<Object?>>(
+                                              selector: (_, state) =>
+                                                  danmakuUiSnapshot(state),
+                                              builder: (context, snapshot, _) {
+                                                return _buildDanmakuOverlay(
+                                                  context
+                                                      .read<VideoPlayerState>(),
+                                                );
+                                              },
+                                            ),
                                           ),
                                         ),
                                       ),
                                     if (videoState.hasVideo)
                                       Positioned.fill(
-                                        child: Consumer<VideoPlayerState>(
-                                          builder: (context, videoState, _) {
-                                            return ValueListenableBuilder<
-                                                double>(
-                                              valueListenable:
-                                                  videoState.playbackTimeMs,
-                                              builder: (context, posMs, __) {
-                                                return ExternalSubtitleOverlay(
-                                                  currentPositionMs: posMs,
-                                                );
-                                              },
-                                            );
-                                          },
+                                        // RepaintBoundary: the SRT overlay repaints per
+                                        // frame; isolating it keeps the danmaku layer
+                                        // out of that recompositing cost.
+                                        child: const RepaintBoundary(
+                                          child: ExternalSubtitleOverlay(),
+                                        ),
+                                      ),
+                                    // 内嵌字幕整块移动模式：sub-text 驱动的
+                                    // App 层渲染（双语整块、行距不收拢）。
+                                    if (videoState.hasVideo)
+                                      const Positioned.fill(
+                                        child: IgnorePointer(
+                                          ignoring: true,
+                                          child: RepaintBoundary(
+                                            child: EmbeddedSubtitleOverlay(),
+                                          ),
                                         ),
                                       ),
                                     if (videoState.status ==
@@ -982,6 +1303,8 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
                                               ?.split('/')
                                               .last,
                                           animeId: videoState.animeId,
+                                          coverImageUrl:
+                                              videoState.loadingCoverImageUrl,
                                         ),
                                       ),
                                     if (videoState.hasVideo)
@@ -994,8 +1317,10 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
                                       const BrightnessGestureArea(),
                                     if (videoState.hasVideo)
                                       const VolumeGestureArea(),
-                                    const MinimalProgressBar(),
-                                    const DanmakuDensityBar(),
+                                    if (!isPictureInPicture) ...[
+                                      const MinimalProgressBar(),
+                                      const DanmakuDensityBar(),
+                                    ],
                                   ],
                                 ),
                               )
@@ -1017,36 +1342,47 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
                                           ),
                                         ),
                                       ),
-                                      if (videoState.hasVideo &&
-                                          videoState.danmakuVisible)
+                                      if (videoState.hasVideo ||
+                                          videoState.isDfmStartupGatePending)
                                         Positioned.fill(
-                                          child: IgnorePointer(
-                                            ignoring: true,
-                                            child: Consumer<VideoPlayerState>(
-                                              builder:
-                                                  (context, videoState, _) {
-                                                return _buildDanmakuOverlay(
-                                                  videoState,
-                                                );
-                                              },
+                                          // RepaintBoundary isolates the danmaku layer: sibling
+                                          // subtitle overlays repainting must not drag the danmaku
+                                          // layer into recompositing (danmaku flicker).
+                                          child: RepaintBoundary(
+                                            child: IgnorePointer(
+                                              ignoring: true,
+                                              child: Selector<VideoPlayerState,
+                                                  List<Object?>>(
+                                                selector: (_, state) =>
+                                                    danmakuUiSnapshot(state),
+                                                builder:
+                                                    (context, snapshot, _) {
+                                                  return _buildDanmakuOverlay(
+                                                    context.read<
+                                                        VideoPlayerState>(),
+                                                  );
+                                                },
+                                              ),
                                             ),
                                           ),
                                         ),
                                       if (videoState.hasVideo)
                                         Positioned.fill(
-                                          child: Consumer<VideoPlayerState>(
-                                            builder: (context, videoState, _) {
-                                              return ValueListenableBuilder<
-                                                  double>(
-                                                valueListenable:
-                                                    videoState.playbackTimeMs,
-                                                builder: (context, posMs, __) {
-                                                  return ExternalSubtitleOverlay(
-                                                    currentPositionMs: posMs,
-                                                  );
-                                                },
-                                              );
-                                            },
+                                          // RepaintBoundary: the SRT overlay repaints per
+                                          // frame; isolating it keeps the danmaku layer
+                                          // out of that recompositing cost.
+                                          child: const RepaintBoundary(
+                                            child: ExternalSubtitleOverlay(),
+                                          ),
+                                        ),
+                                      // 内嵌字幕整块移动模式（第二处布局分支）
+                                      if (videoState.hasVideo)
+                                        const Positioned.fill(
+                                          child: IgnorePointer(
+                                            ignoring: true,
+                                            child: RepaintBoundary(
+                                              child: EmbeddedSubtitleOverlay(),
+                                            ),
                                           ),
                                         ),
                                       if (videoState.status ==
@@ -1067,6 +1403,8 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
                                                 ?.split('/')
                                                 .last,
                                             animeId: videoState.animeId,
+                                            coverImageUrl:
+                                                videoState.loadingCoverImageUrl,
                                           ),
                                         ),
                                       if (videoState.hasVideo)
@@ -1084,11 +1422,14 @@ class _VideoPlayerUIState extends State<VideoPlayerUI>
                                                 _macosNativeVideoViewId!,
                                           ),
                                         ),
-                                      if (videoState
-                                          .desktopHoverSettingsMenuEnabled)
+                                      if (!isPictureInPicture &&
+                                          videoState
+                                              .desktopHoverSettingsMenuEnabled)
                                         const RightEdgeHoverMenu(),
-                                      const MinimalProgressBar(),
-                                      const DanmakuDensityBar(),
+                                      if (!isPictureInPicture) ...[
+                                        const MinimalProgressBar(),
+                                        const DanmakuDensityBar(),
+                                      ],
                                     ],
                                   ),
                                 ),

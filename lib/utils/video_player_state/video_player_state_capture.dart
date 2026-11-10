@@ -1,17 +1,5 @@
 part of video_player_state;
 
-class _RawFrameSpec {
-  final int width;
-  final int height;
-  final int? rowStride;
-
-  const _RawFrameSpec({
-    required this.width,
-    required this.height,
-    this.rowStride,
-  });
-}
-
 class _ThumbnailTargetSize {
   final int width;
   final int height;
@@ -22,130 +10,43 @@ class _ThumbnailTargetSize {
   });
 }
 
-const int _thumbnailMaxHeight = 240;
-const int _thumbnailMaxWidth = 480;
-const int _thumbnailJpegQuality = 70;
-
 extension VideoPlayerStateCapture on VideoPlayerState {
-  bool _isPngBytes(Uint8List bytes) {
-    return bytes.length >= 8 &&
-        bytes[0] == 0x89 &&
-        bytes[1] == 0x50 &&
-        bytes[2] == 0x4E &&
-        bytes[3] == 0x47 &&
-        bytes[4] == 0x0D &&
-        bytes[5] == 0x0A &&
-        bytes[6] == 0x1A &&
-        bytes[7] == 0x0A;
-  }
-
-  bool _isJpegBytes(Uint8List bytes) {
-    return bytes.length >= 3 &&
-        bytes[0] == 0xFF &&
-        bytes[1] == 0xD8 &&
-        bytes[2] == 0xFF;
-  }
-
-  img.Image _forceOpaqueImage(img.Image image) {
-    if (!image.hasAlpha) {
-      return image.convert(
-        numChannels: 4,
-        alpha: image.maxChannelValue,
-      );
-    }
-    final alpha = image.maxChannelValue;
-    for (final pixel in image) {
-      pixel.a = alpha;
-    }
-    return image;
-  }
-
-  img.Image? _decodeFrameToImage(PlayerFrame frame) {
-    final frameBytes = frame.bytes;
-    final isPng = _isPngBytes(frameBytes);
-    final isJpeg = _isJpegBytes(frameBytes);
-
-    img.Image? decoded;
-    if (isPng || isJpeg) {
-      try {
-        decoded = img.decodeImage(frameBytes);
-      } catch (_) {}
-      if (decoded != null) {
-        return _forceOpaqueImage(decoded);
-      }
-    } else {
-      try {
-        decoded = img.decodeImage(frameBytes);
-      } catch (_) {}
-      if (decoded != null) {
-        return _forceOpaqueImage(decoded);
-      }
-    }
-
-    final rawSpec = _matchRawFrameSpec(frame);
-    if (rawSpec == null) {
-      return null;
-    }
-
-    final expectedLength = rawSpec.width * rawSpec.height * 4;
-    if (frameBytes.length < expectedLength ||
-        (frameBytes.length != expectedLength && rawSpec.rowStride == null)) {
-      return null;
-    }
-
-    final channelOrder = player.getPlayerKernelName() == 'Media Kit'
-        ? img.ChannelOrder.bgra
-        : img.ChannelOrder.rgba;
-    final rawCopy = Uint8List.fromList(frameBytes);
-    final rowStride = rawSpec.rowStride ?? rawSpec.width * 4;
-    for (int y = 0; y < rawSpec.height; y++) {
-      final rowStart = y * rowStride;
-      final rowEnd = rowStart + rawSpec.width * 4;
-      for (int i = rowStart + 3; i < rowEnd && i < rawCopy.length; i += 4) {
-        rawCopy[i] = 0xFF;
-      }
-    }
-
-    final image = img.Image.fromBytes(
-      width: rawSpec.width,
-      height: rawSpec.height,
-      bytes: rawCopy.buffer,
-      numChannels: 4,
-      rowStride: rawSpec.rowStride,
-      order: channelOrder,
+  VideoFrameImageRequest _frameImageRequest(PlayerFrame frame) {
+    final tracks = player.mediaInfo.video;
+    final codec =
+        tracks != null && tracks.isNotEmpty ? tracks.first.codec : null;
+    return VideoFrameImageRequest(
+      bytes: frame.bytes,
+      width: frame.width,
+      height: frame.height,
+      sourceWidth: codec?.width ?? 0,
+      sourceHeight: codec?.height ?? 0,
+      bgra: player.getPlayerKernelName() == 'Media Kit',
     );
-
-    return _forceOpaqueImage(image);
   }
 
-  img.Image _resizeThumbnailImage(img.Image image) {
-    if (image.width <= _thumbnailMaxWidth &&
-        image.height <= _thumbnailMaxHeight) {
-      return image;
-    }
+  img.Image? _decodeFrameToImage(PlayerFrame frame) =>
+      decodeVideoFrameImage(_frameImageRequest(frame));
 
-    final widthRatio = image.width / _thumbnailMaxWidth;
-    final heightRatio = image.height / _thumbnailMaxHeight;
-    if (widthRatio >= heightRatio) {
-      return img.copyResize(image, width: _thumbnailMaxWidth);
-    }
-    return img.copyResize(image, height: _thumbnailMaxHeight);
-  }
+  Future<Uint8List?> _encodeFrameToThumbnailBytes(PlayerFrame frame) =>
+      compute(encodeVideoThumbnail, _frameImageRequest(frame),
+          debugLabel: 'video-thumbnail');
 
-  Uint8List? _encodeFrameToThumbnailBytes(PlayerFrame frame) {
+  Uint8List? _encodeFrameToScreenshotBytes(
+      PlayerFrame frame, ScreenshotFormat format) {
     final decoded = _decodeFrameToImage(frame);
     if (decoded == null) {
       return null;
     }
-    final resized = _resizeThumbnailImage(decoded);
     return Uint8List.fromList(
-      img.encodeJpg(resized, quality: _thumbnailJpegQuality),
+      encodeScreenshotImage(decoded,
+          format: format, jpegQuality: _screenshotQuality.jpegQuality),
     );
   }
 
   _ThumbnailTargetSize _resolveThumbnailTargetSize() {
-    int targetHeight = _thumbnailMaxHeight;
-    int targetWidth = (_thumbnailMaxHeight * 16 / 9).round();
+    int targetHeight = thumbnailMaxHeight;
+    int targetWidth = (thumbnailMaxHeight * 16 / 9).round();
 
     final videoTracks = player.mediaInfo.video;
     if (videoTracks != null && videoTracks.isNotEmpty) {
@@ -153,61 +54,30 @@ extension VideoPlayerStateCapture on VideoPlayerState {
       if (codec.width > 0 && codec.height > 0) {
         final aspectRatio = codec.width / codec.height;
         targetWidth = (targetHeight * aspectRatio).round();
-        if (targetWidth > _thumbnailMaxWidth) {
-          targetWidth = _thumbnailMaxWidth;
+        if (targetWidth > thumbnailMaxWidth) {
+          targetWidth = thumbnailMaxWidth;
           targetHeight = (targetWidth / aspectRatio)
               .round()
-              .clamp(1, _thumbnailMaxHeight)
+              .clamp(1, thumbnailMaxHeight)
               .toInt();
         }
       }
     }
 
-    targetWidth = targetWidth.clamp(1, _thumbnailMaxWidth).toInt();
-    targetHeight = targetHeight.clamp(1, _thumbnailMaxHeight).toInt();
+    targetWidth = targetWidth.clamp(1, thumbnailMaxWidth).toInt();
+    targetHeight = targetHeight.clamp(1, thumbnailMaxHeight).toInt();
     return _ThumbnailTargetSize(width: targetWidth, height: targetHeight);
   }
 
-  _RawFrameSpec? _matchRawFrameSpec(PlayerFrame frame) {
-    final byteLength = frame.bytes.length;
-    final candidates = <_RawFrameSpec>[];
-
-    void addCandidate(int width, int height) {
-      if (width > 0 && height > 0) {
-        candidates.add(_RawFrameSpec(width: width, height: height));
-      }
-    }
-
-    addCandidate(frame.width, frame.height);
-
+  _ThumbnailTargetSize _resolveScreenshotTargetSize() {
     final videoTracks = player.mediaInfo.video;
     if (videoTracks != null && videoTracks.isNotEmpty) {
       final codec = videoTracks.first.codec;
-      addCandidate(codec.width, codec.height);
-    }
-
-    for (final candidate in candidates) {
-      final expected = candidate.width * candidate.height * 4;
-      if (byteLength == expected) {
-        return candidate;
+      if (codec.width > 0 && codec.height > 0) {
+        return _ThumbnailTargetSize(width: codec.width, height: codec.height);
       }
     }
-
-    for (final candidate in candidates) {
-      if (byteLength % candidate.height != 0) {
-        continue;
-      }
-      final stride = byteLength ~/ candidate.height;
-      if (stride >= candidate.width * 4) {
-        return _RawFrameSpec(
-          width: candidate.width,
-          height: candidate.height,
-          rowStride: stride,
-        );
-      }
-    }
-
-    return null;
+    return _resolveThumbnailTargetSize();
   }
 
   // 触发图片缓存刷新，使新缩略图可见
@@ -286,7 +156,7 @@ extension VideoPlayerStateCapture on VideoPlayerState {
       final legacyPngPath = '${thumbnailDir.path}/$videoFileHash.png';
       final thumbnailFile = File(thumbnailPath);
 
-      final jpegBytes = _encodeFrameToThumbnailBytes(videoFrame);
+      final jpegBytes = await _encodeFrameToThumbnailBytes(videoFrame);
       if (jpegBytes == null || jpegBytes.isEmpty) {
         debugPrint('无法转换截图数据，跳过保存');
         return null;
@@ -350,7 +220,7 @@ extension VideoPlayerStateCapture on VideoPlayerState {
       }
 
       try {
-        final jpegBytes = _encodeFrameToThumbnailBytes(videoFrame);
+        final jpegBytes = await _encodeFrameToThumbnailBytes(videoFrame);
         if (jpegBytes == null || jpegBytes.isEmpty) {
           // 恢复播放状态
           if (isPlaying) {
@@ -413,13 +283,27 @@ extension VideoPlayerStateCapture on VideoPlayerState {
     }
   }
 
-  Future<String?> captureScreenshot() async {
-    final bytes = await _captureScreenshotPngBytes();
+  Future<String?> captureScreenshot({
+    ScreenshotFormat? format,
+    bool? includeDanmaku,
+    bool? includeSubtitles,
+    bool temporary = false,
+  }) async {
+    if (kIsWeb || !hasVideo) return null;
+    format ??= _screenshotFormat;
+    final bytes = await _captureScreenshotBytes(
+      format: format,
+      // 未显式传参时回退到截图设置页的开关
+      includeDanmaku: includeDanmaku ?? _screenshotCaptureIncludesDanmaku,
+      includeSubtitles: includeSubtitles ?? _screenshotCaptureIncludesSubtitles,
+    );
     if (bytes == null || bytes.isEmpty) return null;
 
     try {
-      final directoryPath = await _resolveScreenshotSaveDirectoryPath();
-      final fileName = _buildScreenshotFileName();
+      final directoryPath = temporary
+          ? (await path_provider.getTemporaryDirectory()).path
+          : await _resolveScreenshotSaveDirectoryPath();
+      final fileName = _buildScreenshotFileName(format);
       final file = File(p.join(directoryPath, fileName));
       await file.writeAsBytes(bytes, flush: true);
       return file.path;
@@ -429,24 +313,69 @@ extension VideoPlayerStateCapture on VideoPlayerState {
     }
   }
 
-  Future<bool> captureScreenshotToPhotos() async {
+  Future<bool> captureScreenshotToPhotos({
+    bool? includeDanmaku,
+    bool? includeSubtitles,
+  }) async {
+    includeDanmaku ??= _screenshotCaptureIncludesDanmaku;
+    includeSubtitles ??= _screenshotCaptureIncludesSubtitles;
     if (kIsWeb) return false;
     if (!Platform.isIOS) return false;
     if (!hasVideo) return false;
 
-    final bytes = await _captureScreenshotPngBytes();
+    final bytes = await _captureScreenshotBytes(
+      format: _screenshotFormat,
+      includeDanmaku: includeDanmaku,
+      includeSubtitles: includeSubtitles,
+    );
     if (bytes == null || bytes.isEmpty) return false;
 
     await PhotoLibraryService.saveImageToPhotos(bytes);
     return true;
   }
 
-  Future<Uint8List?> _captureScreenshotPngBytes() async {
+  Future<Uint8List?> captureScreenshotPreview({
+    bool includeDanmaku = true,
+    bool includeSubtitles = true,
+  }) {
+    return _captureScreenshotBytes(
+      includeDanmaku: includeDanmaku,
+      includeSubtitles: includeSubtitles,
+    );
+  }
+
+  Future<Uint8List?> _captureScreenshotBytes({
+    ScreenshotFormat? format,
+    required bool includeDanmaku,
+    required bool includeSubtitles,
+  }) async {
     if (kIsWeb) return null;
     if (!hasVideo) return null;
+    format ??= _screenshotFormat;
 
     if (_isCapturingScreenshot) {
       return null;
+    }
+
+    if (player.getPlayerKernelName() == 'Erika') {
+      try {
+        final targetSize = _resolveScreenshotTargetSize();
+        final frame = await player.snapshot(
+          width: targetSize.width,
+          height: targetSize.height,
+        );
+        if (frame != null) {
+          final bytes = _encodeFrameToScreenshotBytes(frame, format);
+          if (bytes != null && bytes.isNotEmpty) {
+            return bytes;
+          }
+        }
+        debugPrint('Erika截图失败: native snapshot 未返回可编码帧');
+        return null;
+      } catch (e) {
+        debugPrint('Erika截图失败: $e');
+        return null;
+      }
     }
 
     final boundaryContext = screenshotBoundaryKey.currentContext;
@@ -462,9 +391,27 @@ extension VideoPlayerStateCapture on VideoPlayerState {
     }
 
     _isCapturingScreenshot = true;
+    final previousIncludeDanmaku = _screenshotCaptureIncludesDanmaku;
+    final previousIncludeSubtitles = _screenshotCaptureIncludesSubtitles;
+    final previousSubtitleTracks = List<int>.from(player.activeSubtitleTracks);
+    _screenshotCaptureIncludesDanmaku = includeDanmaku;
+    _screenshotCaptureIncludesSubtitles = includeSubtitles;
+    if (!includeSubtitles && previousSubtitleTracks.isNotEmpty) {
+      // Native player subtitles are rendered into the video surface rather
+      // than ExternalSubtitleOverlay. Disable the actual subtitle track for
+      // the captured frame, then restore the selection in finally.
+      player.activeSubtitleTracks = const <int>[];
+    }
+    _notifyListeners();
     try {
       // 确保当前帧已渲染完成
       await SchedulerBinding.instance.endOfFrame;
+      if (!includeSubtitles && previousSubtitleTracks.isNotEmpty) {
+        // Track changes may cross an asynchronous player bridge. Give the
+        // texture one additional frame to present without subtitles.
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        await SchedulerBinding.instance.endOfFrame;
+      }
 
       final devicePixelRatio =
           MediaQuery.maybeOf(boundaryContext)?.devicePixelRatio ?? 1.0;
@@ -472,20 +419,83 @@ extension VideoPlayerStateCapture on VideoPlayerState {
       final pixelRatio = devicePixelRatio.clamp(1.0, 2.0);
 
       final image = await renderObject.toImage(pixelRatio: pixelRatio);
-      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      // 先读取原始 RGBA，再按用户选择编码 PNG 或指定质量的 JPEG。
+      final rgbaData =
+          await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+      final imageWidth = image.width;
+      final imageHeight = image.height;
       image.dispose();
 
-      if (byteData == null) {
+      if (rgbaData == null) {
         debugPrint('截图失败: image.toByteData 返回 null');
         return null;
       }
 
-      return byteData.buffer.asUint8List();
+      final rgba = rgbaData.buffer.asUint8List();
+      final decoded = img.Image.fromBytes(
+        width: imageWidth,
+        height: imageHeight,
+        bytes: rgba.buffer,
+        numChannels: 4,
+      );
+      // Use the same placement as the player. Cover/fill have no outer bars;
+      // forced ratios and original-size modes may have a different visible rect.
+      if (_screenshotCropLetterbox &&
+          _aspectRatio > 0 &&
+          !renderObject.size.isEmpty) {
+        final viewport = renderObject.size;
+        final videoTracks = player.mediaInfo.video;
+        Size? naturalSize;
+        if (videoTracks != null && videoTracks.isNotEmpty) {
+          final codec = videoTracks.first.codec;
+          if (codec.width > 0 && codec.height > 0) {
+            naturalSize = Size(codec.width.toDouble(), codec.height.toDouble());
+          }
+        }
+        final visibleRect = VideoAspectGeometry.visibleVideoRect(
+          mode: _videoAspectMode,
+          viewport: viewport,
+          sourceAspect: _aspectRatio,
+          naturalSize: naturalSize,
+        );
+        final scaleX = imageWidth / viewport.width;
+        final scaleY = imageHeight / viewport.height;
+        final x =
+            (visibleRect.left * scaleX).round().clamp(0, imageWidth).toInt();
+        final y =
+            (visibleRect.top * scaleY).round().clamp(0, imageHeight).toInt();
+        final right =
+            (visibleRect.right * scaleX).round().clamp(x, imageWidth).toInt();
+        final bottom =
+            (visibleRect.bottom * scaleY).round().clamp(y, imageHeight).toInt();
+        final cw = right - x;
+        final ch = bottom - y;
+        if (cw > 0 && ch > 0 && (cw < imageWidth || ch < imageHeight)) {
+          debugPrint('[Screenshot] 裁剪黑边 x=$x y=$y w=$cw h=$ch '
+              '(原始 ${imageWidth}x$imageHeight)');
+          final cropped =
+              img.copyCrop(decoded, x: x, y: y, width: cw, height: ch);
+          final jpegBytes =
+              encodeScreenshotImage(cropped,
+                  format: format, jpegQuality: _screenshotQuality.jpegQuality);
+          return Uint8List.fromList(jpegBytes);
+        }
+      }
+      final jpegBytes =
+          encodeScreenshotImage(decoded,
+              format: format, jpegQuality: _screenshotQuality.jpegQuality);
+      return Uint8List.fromList(jpegBytes);
     } catch (e) {
       debugPrint('截图失败: $e');
       return null;
     } finally {
+      if (!includeSubtitles && previousSubtitleTracks.isNotEmpty) {
+        player.activeSubtitleTracks = previousSubtitleTracks;
+      }
+      _screenshotCaptureIncludesDanmaku = previousIncludeDanmaku;
+      _screenshotCaptureIncludesSubtitles = previousIncludeSubtitles;
       _isCapturingScreenshot = false;
+      _notifyListeners();
     }
   }
 
@@ -506,12 +516,20 @@ extension VideoPlayerStateCapture on VideoPlayerState {
 
     final directory = Directory(path);
     if (!await directory.exists()) {
-      await directory.create(recursive: true);
+      try {
+        await directory.create(recursive: true);
+      } catch (_) {
+        // 目标路径不可创建（如 iOS 沙盒根 Operation not permitted）：
+        // 回退并缓存默认目录，避免每次截图都重复尝试失败路径。
+        final fallback = (await _getDefaultScreenshotSaveDirectory()).path;
+        _screenshotSaveDirectory = fallback;
+        return fallback;
+      }
     }
     return directory.path;
   }
 
-  String _buildScreenshotFileName() {
+  String _buildScreenshotFileName(ScreenshotFormat format) {
     String baseName;
 
     final titleParts = <String>[
@@ -531,7 +549,7 @@ extension VideoPlayerStateCapture on VideoPlayerState {
 
     final now = DateTime.now();
     final timestamp = _formatTimestamp(now);
-    return '${baseName}_$timestamp.png';
+    return '${baseName}_$timestamp.${format.extension}';
   }
 
   String _formatTimestamp(DateTime time) {
@@ -552,6 +570,8 @@ extension VideoPlayerStateCapture on VideoPlayerState {
     }
     // 避免文件名过长导致某些文件系统写入失败
     const maxLength = 80;
-    return sanitized.length > maxLength ? sanitized.substring(0, maxLength) : sanitized;
+    return sanitized.length > maxLength
+        ? sanitized.substring(0, maxLength)
+        : sanitized;
   }
 }

@@ -8,6 +8,7 @@ import 'package:http/io_client.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:nipaplay/services/remote_control_settings.dart';
+import 'package:nipaplay/services/process_memory_cache.dart';
 import 'package:nipaplay/services/web_remote_access_service.dart';
 import 'package:nipaplay/services/webdav_service.dart';
 import 'package:nipaplay/services/smb_service.dart';
@@ -16,6 +17,12 @@ import 'package:nipaplay/utils/media_source_utils.dart';
 import 'package:nipaplay/models/playable_item.dart';
 import 'package:nipaplay/models/shared_remote_library.dart';
 import 'package:nipaplay/models/watch_history_model.dart';
+
+typedef _RemoteDirectoryCacheKey = ({
+  String hostId,
+  String connectionName,
+  String path,
+});
 
 class SharedRemoteLibraryProvider extends ChangeNotifier {
   static const String _hostsPrefsKey = 'shared_remote_hosts';
@@ -39,10 +46,13 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
     '.wav',
   };
 
-  SharedRemoteLibraryProvider() {
+  SharedRemoteLibraryProvider({http.Client Function(Uri uri)? clientFactory})
+      : _clientFactory = clientFactory {
     _loadPersistedHosts();
   }
 
+  // Each request owns and closes the client returned by this factory.
+  final http.Client Function(Uri uri)? _clientFactory;
   final List<SharedRemoteHost> _hosts = [];
   String? _activeHostId;
   List<SharedRemoteAnimeSummary> _animeSummaries = [];
@@ -50,12 +60,22 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
   bool _isLoading = false;
   String? _errorMessage;
   bool _isInitializing = true;
-  bool _autoRefreshPaused = false;
-  DateTime? _lastRefreshFailureAt;
+  Timer? _libraryRetryTimer;
+  int _libraryRetryAttempt = 0;
+  int _libraryRequestId = 0;
+  Future<void>? _libraryRefreshFuture;
+  ({String hostId, String baseUrl})? _libraryRefreshTarget;
+  bool _disposed = false;
 
   List<SharedRemoteScannedFolder> _scannedFolders = [];
   List<WebDAVConnection> _webdavConnections = [];
   List<SMBConnection> _smbConnections = [];
+  static final ProcessMemoryListCache<_RemoteDirectoryCacheKey, WebDAVFile>
+      _webdavDirectoryCache =
+      ProcessMemoryListCache<_RemoteDirectoryCacheKey, WebDAVFile>();
+  static final ProcessMemoryListCache<_RemoteDirectoryCacheKey, SMBFileEntry>
+      _smbDirectoryCache =
+      ProcessMemoryListCache<_RemoteDirectoryCacheKey, SMBFileEntry>();
 
   SharedRemoteScanStatus? _scanStatus;
   bool _isManagementLoading = false;
@@ -138,12 +158,14 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
       _errorMessage = '加载远程媒体库配置失败: $e';
     } finally {
       _isInitializing = false;
-      if (_activeHostId != null) {
+      if (!_disposed && _activeHostId != null) {
         await _syncActiveHostToRemoteControl();
       }
-      notifyListeners();
-      if (_activeHostId != null) {
-        refreshLibrary();
+      if (!_disposed) {
+        notifyListeners();
+        if (_activeHostId != null) {
+          refreshLibrary();
+        }
       }
     }
   }
@@ -167,12 +189,13 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
     final host = SharedRemoteHost(
         id: id, displayName: displayName, baseUrl: normalizedUrl);
     _hosts.add(host);
+    _invalidateLibraryRequest();
     _activeHostId = id;
     await _persistHosts();
     await _syncHostToRemoteControl(host);
     notifyListeners();
     await refreshLibrary(userInitiated: true);
-    return host;
+    return _hosts.firstWhere((current) => current.id == id);
   }
 
   Future<SharedRemoteHost> connectOrActivateHost({
@@ -197,11 +220,22 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
         await _persistHosts();
         notifyListeners();
       }
-      await setActiveHost(_hosts[i].id);
-      return _hosts[i];
+      final hostId = _hosts[i].id;
+      await setActiveHost(hostId);
+      return _requireConnectedHost(hostId);
     }
 
-    return addHost(displayName: displayName, baseUrl: normalizedUrl);
+    final host =
+        await addHost(displayName: displayName, baseUrl: normalizedUrl);
+    return _requireConnectedHost(host.id);
+  }
+
+  SharedRemoteHost _requireConnectedHost(String hostId) {
+    final host = _hosts.firstWhere((current) => current.id == hostId);
+    if (!host.isOnline) {
+      throw Exception(_errorMessage ?? host.lastError ?? '无法加载共享媒体库');
+    }
+    return host;
   }
 
   Future<void> removeHost(String hostId) async {
@@ -214,7 +248,9 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
     }
 
     _hosts.removeWhere((host) => host.id == hostId);
+    _clearRemoteDirectoryCaches(hostId: hostId);
     if (_activeHostId == hostId) {
+      _invalidateLibraryRequest();
       _activeHostId = _hosts.isNotEmpty ? _hosts.first.id : null;
       _animeSummaries = [];
       _episodeCache.clear();
@@ -240,10 +276,14 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
   Future<void> setActiveHost(String hostId) async {
     if (_activeHostId == hostId) {
       await _syncActiveHostToRemoteControl();
+      // Reconnecting the selected host must immediately retry a failed refresh.
+      await refreshLibrary(userInitiated: true);
       return;
     }
     if (!_hosts.any((host) => host.id == hostId)) return;
+    _invalidateLibraryRequest();
     _activeHostId = hostId;
+    _clearRemoteDirectoryCaches();
     _animeSummaries = [];
     _episodeCache.clear();
     _scannedFolders = [];
@@ -255,23 +295,26 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
     await refreshLibrary(userInitiated: true);
   }
 
-  Future<void> refreshLibrary({bool userInitiated = false}) async {
+  Future<void> refreshLibrary({bool userInitiated = false}) {
     final host = activeHost;
-    if (host == null) {
-      return;
+    if (_disposed || host == null) {
+      return Future<void>.value();
     }
 
-    if (userInitiated) {
-      _autoRefreshPaused = false;
-      _lastRefreshFailureAt = null;
-    } else if (_autoRefreshPaused) {
-      final message = _lastRefreshFailureAt != null
-          ? '⏳ [共享媒体] 自动刷新已暂停（上次失败 ${_lastRefreshFailureAt!.toLocal()}），等待手动刷新'
-          : '⏳ [共享媒体] 自动刷新已暂停，等待手动刷新';
-      debugPrint(message);
-      return;
+    _cancelLibraryRetry(resetAttempts: userInitiated);
+    final target = (hostId: host.id, baseUrl: host.baseUrl);
+    final pending = _libraryRefreshFuture;
+    if (pending != null && _libraryRefreshTarget == target) {
+      return pending;
     }
 
+    final requestId = ++_libraryRequestId;
+    _libraryRefreshTarget = target;
+    return _libraryRefreshFuture = _refreshLibraryForHost(host, requestId);
+  }
+
+  Future<void> _refreshLibraryForHost(
+      SharedRemoteHost host, int requestId) async {
     _isLoading = true;
     _errorMessage = null;
     notifyListeners();
@@ -283,6 +326,7 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
 
       final response =
           await _sendGetRequest(uri, timeout: const Duration(seconds: 10));
+      if (!_isCurrentLibraryRequest(host, requestId)) return;
 
       debugPrint('📡 [共享媒体] 响应状态码: ${response.statusCode}');
 
@@ -299,27 +343,35 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
 
       debugPrint('✅ [共享媒体] 成功获取 ${items.length} 个番剧');
 
-      _animeSummaries = items
-          .map((item) =>
-              SharedRemoteAnimeSummary.fromJson(item as Map<String, dynamic>))
-          .toList();
+      _animeSummaries = items.map((item) {
+        final data = Map<String, dynamic>.from(item as Map<String, dynamic>);
+        if (!kIsWeb) {
+          data['imageUrl'] = _resolveRemoteImageUrl(
+            host.baseUrl,
+            data['imageUrl'],
+          );
+        }
+        return SharedRemoteAnimeSummary.fromJson(data);
+      }).toList();
       _animeSummaries
           .sort((a, b) => b.lastWatchTime.compareTo(a.lastWatchTime));
       _episodeCache.clear();
       _updateHostStatus(host.id, isOnline: true, lastError: null);
-      _autoRefreshPaused = false;
-      _lastRefreshFailureAt = null;
+      _cancelLibraryRetry(resetAttempts: true);
     } catch (e, stackTrace) {
+      if (!_isCurrentLibraryRequest(host, requestId)) return;
       debugPrint('❌ [共享媒体] 请求失败: $e');
       debugPrint('❌ [共享媒体] 错误类型: ${e.runtimeType}');
       if (e is TimeoutException) {
-        debugPrint('ℹ️ [共享媒体] 请求超时，已暂停自动刷新等待手动重试');
+        debugPrint('ℹ️ [共享媒体] 请求超时，将自动重试');
       } else {
         debugPrint('❌ [共享媒体] 堆栈跟踪:\n$stackTrace');
       }
 
       String friendlyError;
-      if (e.toString().contains('SocketException') ||
+      if (e is TimeoutException) {
+        friendlyError = '连接超时，请检查网络或主机是否在线';
+      } else if (e.toString().contains('SocketException') ||
           e.toString().contains('Connection')) {
         if (e.toString().contains('No route to host') ||
             e.toString().contains('errno = 65')) {
@@ -350,17 +402,78 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
       }
       _animeSummaries = [];
       _episodeCache.clear();
-      _errorMessage = friendlyError;
       _updateHostStatus(host.id, isOnline: false, lastError: e.toString());
-      if (!userInitiated) {
-        _autoRefreshPaused = true;
-        _lastRefreshFailureAt = DateTime.now();
-      }
+      final retryDelay = _scheduleLibraryRetry(host);
+      _errorMessage = '$friendlyError\n将在 ${retryDelay.inSeconds} 秒后自动重试';
     } finally {
-      _isLoading = false;
-      notifyListeners();
-      await _persistHosts();
+      if (_isCurrentLibraryRequest(host, requestId)) {
+        _isLoading = false;
+        _libraryRefreshFuture = null;
+        _libraryRefreshTarget = null;
+        notifyListeners();
+        await _persistHosts();
+      }
     }
+  }
+
+  bool _isCurrentLibraryRequest(SharedRemoteHost host, int requestId) {
+    return !_disposed &&
+        requestId == _libraryRequestId &&
+        activeHost?.id == host.id &&
+        activeHost?.baseUrl == host.baseUrl;
+  }
+
+  void _cancelLibraryRetry({bool resetAttempts = false}) {
+    _libraryRetryTimer?.cancel();
+    _libraryRetryTimer = null;
+    if (resetAttempts) _libraryRetryAttempt = 0;
+  }
+
+  void _invalidateLibraryRequest() {
+    _cancelLibraryRetry(resetAttempts: true);
+    _libraryRequestId++;
+    _libraryRefreshFuture = null;
+    _libraryRefreshTarget = null;
+    _isLoading = false;
+  }
+
+  Duration _scheduleLibraryRetry(SharedRemoteHost host) {
+    _cancelLibraryRetry();
+    const delays = [1, 2, 4, 8, 16, 30];
+    final delay = Duration(seconds: delays[_libraryRetryAttempt]);
+    if (_libraryRetryAttempt < delays.length - 1) _libraryRetryAttempt++;
+    debugPrint('⏳ [共享媒体] ${delay.inSeconds} 秒后自动重试: ${host.baseUrl}');
+    _libraryRetryTimer = Timer(delay, () {
+      _libraryRetryTimer = null;
+      if (!_disposed &&
+          activeHost?.id == host.id &&
+          activeHost?.baseUrl == host.baseUrl) {
+        unawaited(refreshLibrary());
+      }
+    });
+    return delay;
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _invalidateLibraryRequest();
+    super.dispose();
+  }
+
+  String? _resolveRemoteImageUrl(String baseUrl, dynamic rawImageUrl) {
+    final imageUrl = rawImageUrl?.toString().trim() ?? '';
+    if (imageUrl.isEmpty) return null;
+    if (imageUrl.startsWith('http://') ||
+        imageUrl.startsWith('https://') ||
+        imageUrl.startsWith('data:') ||
+        imageUrl.startsWith('blob:')) {
+      return imageUrl;
+    }
+
+    final encoded = base64Url.encode(utf8.encode(imageUrl));
+    return '${_normalizeBaseUrl(baseUrl)}/api/image_proxy?url='
+        '${Uri.encodeQueryComponent(encoded)}';
   }
 
   Future<List<SharedRemoteEpisode>> loadAnimeEpisodes(int animeId,
@@ -565,6 +678,8 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
   }
 
   http.Client _createClient(Uri uri) {
+    final clientFactory = _clientFactory;
+    if (clientFactory != null) return clientFactory(uri);
     if (kIsWeb) {
       return http.Client();
     }
@@ -698,6 +813,7 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
     final index = _hosts.indexWhere((host) => host.id == hostId);
     if (index == -1) return;
     final normalized = _normalizeBaseUrl(newUrl);
+    if (_activeHostId == hostId) _invalidateLibraryRequest();
     _hosts[index] = _hosts[index].copyWith(baseUrl: normalized);
     await _persistHosts();
     if (_activeHostId == hostId) {
@@ -1054,6 +1170,7 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
   Future<List<WebDAVFile>> listRemoteWebDAVDirectory({
     required String name,
     required String path,
+    bool forceRefresh = false,
   }) async {
     final host = activeHost;
     if (host == null) {
@@ -1065,10 +1182,37 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
       throw Exception('WebDAV 连接名称为空');
     }
 
+    final key = (
+      hostId: host.id,
+      connectionName: sanitizedName,
+      path: _normalizeRemoteDirectoryPath(path),
+    );
+    return _webdavDirectoryCache.getOrLoad(
+      key,
+      () => _fetchRemoteWebDAVDirectory(
+        host: host,
+        name: sanitizedName,
+        path: path,
+        forceRefresh: forceRefresh,
+      ),
+      forceRefresh: forceRefresh,
+    );
+  }
+
+  Future<List<WebDAVFile>> _fetchRemoteWebDAVDirectory({
+    required SharedRemoteHost host,
+    required String name,
+    required String path,
+    required bool forceRefresh,
+  }) async {
     try {
       final uri =
           Uri.parse('${host.baseUrl}/api/media/local/manage/webdav/list')
-              .replace(queryParameters: {'name': sanitizedName, 'path': path});
+              .replace(queryParameters: {
+        'name': name,
+        'path': path,
+        if (forceRefresh) 'refresh': 'true',
+      });
       final response =
           await _sendGetRequest(uri, timeout: const Duration(seconds: 15));
 
@@ -1150,7 +1294,9 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
       final rawMessage = e.toString();
       final friendly = existing != null && existing.trim().isNotEmpty
           ? existing
-          : _buildManagementFriendlyError(e, host);
+          : (rawMessage.contains(_managementUnsupportedMessage)
+              ? _managementUnsupportedMessage
+              : _buildManagementFriendlyError(e, host));
       _managementErrorMessage = friendly;
       notifyListeners();
       rethrow;
@@ -1303,6 +1449,7 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
   Future<List<SMBFileEntry>> listRemoteSMBDirectory({
     required String name,
     required String path,
+    bool forceRefresh = false,
   }) async {
     final host = activeHost;
     if (host == null) {
@@ -1314,9 +1461,36 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
       throw Exception('SMB 连接名称为空');
     }
 
+    final key = (
+      hostId: host.id,
+      connectionName: sanitizedName,
+      path: _normalizeRemoteDirectoryPath(path),
+    );
+    return _smbDirectoryCache.getOrLoad(
+      key,
+      () => _fetchRemoteSMBDirectory(
+        host: host,
+        name: sanitizedName,
+        path: path,
+        forceRefresh: forceRefresh,
+      ),
+      forceRefresh: forceRefresh,
+    );
+  }
+
+  Future<List<SMBFileEntry>> _fetchRemoteSMBDirectory({
+    required SharedRemoteHost host,
+    required String name,
+    required String path,
+    required bool forceRefresh,
+  }) async {
     try {
       final uri = Uri.parse('${host.baseUrl}/api/media/local/manage/smb/list')
-          .replace(queryParameters: {'name': sanitizedName, 'path': path});
+          .replace(queryParameters: {
+        'name': name,
+        'path': path,
+        if (forceRefresh) 'refresh': 'true',
+      });
       final response =
           await _sendGetRequest(uri, timeout: const Duration(seconds: 15));
 
@@ -1818,6 +1992,10 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
         throw Exception(body['message'] ?? 'Failed to add WebDAV');
       }
 
+      _clearRemoteDirectoryCaches(
+        hostId: host.id,
+        connectionName: connection.name,
+      );
       await refreshManagement(userInitiated: true);
     } catch (e) {
       _managementErrorMessage = e.toString();
@@ -1844,6 +2022,10 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
         throw Exception(body['message'] ?? 'Failed to remove WebDAV');
       }
 
+      _clearRemoteDirectoryCaches(
+        hostId: host.id,
+        connectionName: name,
+      );
       await refreshManagement(userInitiated: true);
     } catch (e) {
       _managementErrorMessage = e.toString();
@@ -1872,6 +2054,10 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
         throw Exception(body['message'] ?? 'Failed to add SMB');
       }
 
+      _clearRemoteDirectoryCaches(
+        hostId: host.id,
+        connectionName: connection.name,
+      );
       await refreshManagement(userInitiated: true);
     } catch (e) {
       _managementErrorMessage = e.toString();
@@ -1898,6 +2084,10 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
         throw Exception(body['message'] ?? 'Failed to remove SMB');
       }
 
+      _clearRemoteDirectoryCaches(
+        hostId: host.id,
+        connectionName: name,
+      );
       await refreshManagement(userInitiated: true);
     } catch (e) {
       _managementErrorMessage = e.toString();
@@ -1933,6 +2123,34 @@ class SharedRemoteLibraryProvider extends ChangeNotifier {
     }
 
     return '同步失败: $e';
+  }
+
+  String _normalizeRemoteDirectoryPath(String path) {
+    var normalized = path.trim().replaceAll('\\', '/');
+    if (normalized.isEmpty) return '/';
+    if (!normalized.startsWith('/')) normalized = '/$normalized';
+    normalized = normalized.replaceAll(RegExp(r'/{2,}'), '/');
+    if (normalized.length > 1 && normalized.endsWith('/')) {
+      normalized = normalized.substring(0, normalized.length - 1);
+    }
+    return normalized;
+  }
+
+  void _clearRemoteDirectoryCaches({
+    String? hostId,
+    String? connectionName,
+  }) {
+    bool matches(_RemoteDirectoryCacheKey key) {
+      if (hostId != null && key.hostId != hostId) return false;
+      if (connectionName != null &&
+          key.connectionName != connectionName.trim()) {
+        return false;
+      }
+      return true;
+    }
+
+    _webdavDirectoryCache.removeWhere(matches);
+    _smbDirectoryCache.removeWhere(matches);
   }
 
   void clearManagementError() {

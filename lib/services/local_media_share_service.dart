@@ -6,6 +6,7 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:shelf/shelf.dart';
 
 import 'package:nipaplay/models/bangumi_model.dart';
@@ -14,6 +15,7 @@ import 'package:nipaplay/providers/service_provider.dart';
 import 'package:nipaplay/services/bangumi_service.dart';
 import 'package:nipaplay/constants/media_extensions.dart';
 import 'package:nipaplay/utils/storage_service.dart';
+import 'package:nipaplay/utils/subtitle_file_utils.dart';
 
 class SharedEpisodeInfo {
   SharedEpisodeInfo({
@@ -105,12 +107,15 @@ class LocalMediaShareService {
   }
 
   static final LocalMediaShareService instance = LocalMediaShareService._internal();
+  static const String _mediaLibraryImagePrefsKeyPrefix =
+      'media_library_image_url_';
   static const Map<String, int> _subtitleExtensionPriority = {
     '.ass': 0,
     '.ssa': 1,
     '.srt': 2,
     '.sub': 3,
     '.sup': 4,
+    '.idx': 4,
   };
 
   final Map<String, SharedEpisodeInfo> _shareEpisodeMap = {};
@@ -192,21 +197,30 @@ class LocalMediaShareService {
     final bundles = _animeBundleMap.values.toList()
       ..sort((a, b) => b.latestWatchTime.compareTo(a.latestWatchTime));
 
-    // 预取部分番剧详情（异步，不阻塞 API），避免一次性触发过多请求
-    for (final bundle in bundles.take(24)) {
+    // BangumiService 已在应用启动时将持久化详情载入内存。先复用这些
+    // 缓存，再为确实缺失的条目后台补齐，避免首次共享时整页灰色封面。
+    for (final bundle in bundles) {
       _prefetchAnimeDetail(bundle.animeId);
     }
 
+    final prefs = await SharedPreferences.getInstance();
     final List<Map<String, dynamic>> summaries = [];
     for (final bundle in bundles) {
       final detail = _peekAnimeDetail(bundle.animeId);
       final fallbackName = bundle.episodes.first.historyItem.animeName;
+      final persistedImageUrl = prefs.getString(
+        '$_mediaLibraryImagePrefsKeyPrefix${bundle.animeId}',
+      );
       summaries.add({
         'animeId': bundle.animeId,
         'name': detail?.name ?? fallbackName,
         'nameCn': detail?.nameCn ?? fallbackName,
         'summary': detail?.summary ?? '',
-        'imageUrl': detail?.imageUrl,
+        'imageUrl': _firstNonEmptyString([
+          detail?.imageUrl,
+          persistedImageUrl,
+          bundle.episodes.first.historyItem.thumbnailPath,
+        ]),
         'tags': detail?.tags ?? const <dynamic>[],
         'totalEpisodes': detail?.totalEpisodes,
         'lastWatchTime': bundle.latestWatchTime.toIso8601String(),
@@ -266,14 +280,16 @@ class LocalMediaShareService {
     final episodes = _shareEpisodeMap.values.toList()
       ..sort((a, b) => b.historyItem.lastWatchTime.compareTo(a.historyItem.lastWatchTime));
 
-    // 预取部分番剧详情（异步，不阻塞 API）
-    for (final entry in episodes.take(sanitizedLimit).take(24)) {
+    // 与番剧摘要保持一致，预取本次返回范围内的全部详情，避免观看历史
+    // 超过 24 项后封面永久停留在占位图。
+    for (final entry in episodes.take(sanitizedLimit)) {
       final animeId = entry.historyItem.animeId;
       if (animeId != null) {
         _prefetchAnimeDetail(animeId);
       }
     }
 
+    final prefs = await SharedPreferences.getInstance();
     final List<Map<String, dynamic>> items = [];
     for (final entry in episodes.take(sanitizedLimit)) {
       final baseJson = await entry.toJson();
@@ -287,7 +303,13 @@ class LocalMediaShareService {
       items.add({
         ...baseJson,
         'animeName': resolvedName,
-        'imageUrl': detail?.imageUrl ?? entry.historyItem.thumbnailPath,
+        'imageUrl': _firstNonEmptyString([
+          detail?.imageUrl,
+          animeId == null
+              ? null
+              : prefs.getString('$_mediaLibraryImagePrefsKeyPrefix$animeId'),
+          entry.historyItem.thumbnailPath,
+        ]),
       });
     }
 
@@ -299,12 +321,29 @@ class LocalMediaShareService {
   }
 
   BangumiAnime? _peekAnimeDetail(int animeId) {
-    if (!_animeDetailCache.containsKey(animeId)) return null;
-    return _animeDetailCache[animeId];
+    if (_animeDetailCache.containsKey(animeId)) {
+      return _animeDetailCache[animeId];
+    }
+
+    final sharedDetail =
+        BangumiService.instance.getAnimeDetailsFromMemory(animeId);
+    if (sharedDetail != null) {
+      _animeDetailCache[animeId] = sharedDetail;
+    }
+    return sharedDetail;
+  }
+
+  String? _firstNonEmptyString(Iterable<String?> values) {
+    for (final value in values) {
+      final normalized = value?.trim() ?? '';
+      if (normalized.isNotEmpty) return normalized;
+    }
+    return null;
   }
 
   void _prefetchAnimeDetail(int animeId) {
-    if (_animeDetailCache.containsKey(animeId)) {
+    if (_peekAnimeDetail(animeId) != null ||
+        _animeDetailCache.containsKey(animeId)) {
       return;
     }
     if (_animeDetailFetching.contains(animeId)) {
@@ -449,16 +488,28 @@ class LocalMediaShareService {
     final String videoBaseName = p.basenameWithoutExtension(videoPath).toLowerCase();
     final List<Map<String, dynamic>> items = <Map<String, dynamic>>[];
 
+    final dirEntries = <File>[];
     await for (final entry in videoDir.list(followLinks: false)) {
       if (entry is! File) continue;
-
-      final filePath = entry.path;
-      if (p.normalize(filePath) == p.normalize(videoPath)) {
+      if (p.normalize(entry.path) == p.normalize(videoPath)) {
         continue;
       }
+      dirEntries.add(entry);
+    }
+
+    final dirNames = dirEntries
+        .map((entry) => p.basename(entry.path).toLowerCase())
+        .toSet();
+
+    for (final entry in dirEntries) {
+      final filePath = entry.path;
 
       final ext = p.extension(filePath).toLowerCase();
       if (!subtitleExtensions.contains(ext)) {
+        continue;
+      }
+      // .idx 无独立播放语义：目录中无同名 .sub 的孤立 IDX 不作为候选
+      if (!isVobSubPairCompleteInNames(p.basename(filePath), dirNames)) {
         continue;
       }
 
@@ -473,8 +524,7 @@ class LocalMediaShareService {
       }
 
       final subtitleBaseName = p.basenameWithoutExtension(filePath).toLowerCase();
-      final bool isLikelyMatch =
-          subtitleBaseName == videoBaseName || subtitleBaseName.contains(videoBaseName);
+      final isLikelyMatch = subtitleMatchesVideo(videoBaseName, subtitleBaseName);
 
       items.add({
         'name': p.basename(filePath),
@@ -1071,6 +1121,11 @@ class LocalMediaShareService {
     final resolvedPath = p.join(videoFile.parent.path, sanitizedName);
     final resolvedFile = File(resolvedPath);
     if (!await resolvedFile.exists()) {
+      return null;
+    }
+
+    // .idx 请求需要同名 .sub 配对才有效
+    if (!isVobSubPairComplete(resolvedPath)) {
       return null;
     }
 

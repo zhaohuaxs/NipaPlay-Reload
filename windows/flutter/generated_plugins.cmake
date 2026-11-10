@@ -4,10 +4,10 @@
 
 list(APPEND FLUTTER_PLUGIN_LIST
   battery_plus
-  charset_converter
+  dart_ipc
   desktop_drop
-  desktop_multi_window
   dynamic_color
+  erika_flutter
   file_selector_windows
   flutter_js
   fvp

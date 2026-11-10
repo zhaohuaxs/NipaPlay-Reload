@@ -12,8 +12,12 @@ import 'package:nipaplay/services/smb2_native_service.dart';
 import 'package:nipaplay/services/smb_service.dart';
 import 'package:nipaplay/services/webdav_service.dart';
 import 'package:nipaplay/services/dandanplay_remote_service.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:nipaplay/utils/player_event_log.dart';
 import 'package:nipaplay/utils/media_source_utils.dart';
+import 'package:nipaplay/utils/webdav_http_auth.dart';
 import 'package:nipaplay/utils/storage_service.dart';
+import 'package:nipaplay/utils/subtitle_file_utils.dart';
 
 sealed class RemoteSubtitleCandidate {
   const RemoteSubtitleCandidate();
@@ -21,6 +25,9 @@ sealed class RemoteSubtitleCandidate {
   String get name;
   String get extension;
   String get sourceLabel;
+
+  /// 服务端声明的文件大小（若已知），用于检测远程字幕是否已变化。
+  int? get fileSize => null;
 }
 
 class WebDavRemoteSubtitleCandidate extends RemoteSubtitleCandidate {
@@ -75,11 +82,15 @@ class DandanplayRemoteSubtitleCandidate extends RemoteSubtitleCandidate {
   @override
   final String extension;
 
+  @override
+  final int? fileSize;
+
   const DandanplayRemoteSubtitleCandidate({
     required this.entryId,
     required this.fileName,
     required this.name,
     required this.extension,
+    this.fileSize,
   });
 
   @override
@@ -99,6 +110,9 @@ class SharedRemoteSubtitleCandidate extends RemoteSubtitleCandidate {
   @override
   final String extension;
 
+  @override
+  final int? fileSize;
+
   const SharedRemoteSubtitleCandidate({
     required this.shareId,
     required this.fileName,
@@ -107,6 +121,7 @@ class SharedRemoteSubtitleCandidate extends RemoteSubtitleCandidate {
     required this.isLikelyMatch,
     required this.name,
     required this.extension,
+    this.fileSize,
   });
 
   @override
@@ -186,16 +201,28 @@ class RemoteSubtitleService {
       String videoPath) async {
     if (kIsWeb || videoPath.isEmpty) return const [];
 
+    List<RemoteSubtitleCandidate> candidates;
     final managedStream = _parseManagedLibraryStreamUrl(videoPath);
     if (managedStream != null) {
-      return _listManagedLibraryCandidates(managedStream);
+      candidates = await _listManagedLibraryCandidates(managedStream);
+    } else {
+      final sharedStream = _parseSharedRemoteStreamUrl(videoPath);
+      if (sharedStream != null) {
+        candidates = await _listSharedRemoteCandidates(sharedStream);
+      } else {
+        candidates = await _listCandidatesForResolvedPath(videoPath);
+      }
     }
 
-    final sharedStream = _parseSharedRemoteStreamUrl(videoPath);
-    if (sharedStream != null) {
-      return _listSharedRemoteCandidates(sharedStream);
-    }
+    logPlayerEvent(
+      'Subtitle',
+      '远程字幕候选列表: ${candidates.length} 个（${videoPath}）',
+    );
+    return candidates;
+  }
 
+  Future<List<RemoteSubtitleCandidate>> _listCandidatesForResolvedPath(
+      String videoPath) async {
     final resolvedPath = _resolveManagedStreamPath(videoPath);
 
     if (DandanplayRemoteService.instance.isDandanplayStreamUrl(resolvedPath)) {
@@ -208,6 +235,10 @@ class RemoteSubtitleService {
         return _listSmbCandidatesFromUri(uri);
       }
       return _listSmbCandidates(resolvedPath);
+    }
+
+    if (MediaSourceUtils.isNewWebDavPath(resolvedPath)) {
+      return _listWebDavCandidates(resolvedPath);
     }
 
     final uri = Uri.tryParse(resolvedPath);
@@ -227,7 +258,219 @@ class RemoteSubtitleService {
     return const [];
   }
 
-  Future<String> ensureSubtitleCached(RemoteSubtitleCandidate candidate,
+  /// 清除全部远程字幕缓存（remote_subtitles 目录）。
+  /// 多字幕组/字幕更新后缓存可能命中旧文件，调用后下次加载会重新下载。
+  Future<void> clearSubtitleCache() async {
+    if (kIsWeb) return;
+    try {
+      final baseDir = await StorageService.getAppStorageDirectory();
+      final cacheDir = Directory(p.join(baseDir.path, 'remote_subtitles'));
+      if (await cacheDir.exists()) {
+        await cacheDir.delete(recursive: true);
+      }
+    } catch (e) {
+      debugPrint('RemoteSubtitleService: 清除字幕缓存失败: $e');
+    }
+  }
+
+  String _sourceKey(RemoteSubtitleCandidate candidate) => switch (candidate) {
+        WebDavRemoteSubtitleCandidate() =>
+          'webdav:${candidate.connection.id}:${candidate.remotePath}',
+        SmbRemoteSubtitleCandidate() =>
+          'smb:${candidate.connection.id}:${candidate.smbPath}',
+        DandanplayRemoteSubtitleCandidate() =>
+          'dandanplay:${candidate.entryId}:${candidate.fileName}',
+        SharedRemoteSubtitleCandidate() =>
+          'shared:${candidate.subtitleUri.replace(userInfo: '', fragment: '')}',
+      };
+
+  String _sourceDirectory(RemoteSubtitleCandidate candidate) =>
+      switch (candidate) {
+        WebDavRemoteSubtitleCandidate() =>
+          'webdav:${candidate.connection.id}:${p.dirname(candidate.remotePath)}',
+        SmbRemoteSubtitleCandidate() =>
+          'smb:${candidate.connection.id}:${p.dirname(candidate.smbPath)}',
+        DandanplayRemoteSubtitleCandidate() =>
+          'dandanplay:${candidate.entryId}',
+        SharedRemoteSubtitleCandidate() =>
+          'shared:${candidate.shareId}:${candidate.subtitleUri.origin}:${p.dirname(candidate.subtitleUri.path)}',
+      };
+
+  RemoteSubtitleCandidate? _findPair(RemoteSubtitleCandidate candidate,
+      List<RemoteSubtitleCandidate> candidates, String extension) {
+    final name = p.setExtension(candidate.name, extension).toLowerCase();
+    for (final other in candidates) {
+      if (other.name.toLowerCase() == name &&
+          _sourceDirectory(candidate) == _sourceDirectory(other)) return other;
+    }
+    return null;
+  }
+
+  final Map<String, Future<String>> _pairDownloads = {};
+
+  final Map<String, Future<String>> _subtitleDownloads = {};
+
+  Future<String> ensureSubtitleCached(
+    RemoteSubtitleCandidate candidate, {
+    bool forceRefresh = false,
+    List<RemoteSubtitleCandidate> allCandidates = const [],
+  }) async {
+    final key = _sourceKey(candidate);
+    final pending = _subtitleDownloads[key];
+    if (pending != null) {
+      if (!forceRefresh) return pending;
+      try {
+        await pending;
+      } catch (_) {}
+      return ensureSubtitleCached(candidate,
+          forceRefresh: true, allCandidates: allCandidates);
+    }
+    final operation = _resolveSubtitleCache(candidate,
+        forceRefresh: forceRefresh, allCandidates: allCandidates);
+    _subtitleDownloads[key] = operation;
+    try {
+      return await operation;
+    } finally {
+      if (identical(_subtitleDownloads[key], operation))
+        _subtitleDownloads.remove(key);
+    }
+  }
+
+  Future<String> _resolveSubtitleCache(
+    RemoteSubtitleCandidate candidate, {
+    bool forceRefresh = false,
+    List<RemoteSubtitleCandidate> allCandidates = const [],
+  }) async {
+    final extension = candidate.extension.toLowerCase();
+    if (extension == '.idx') {
+      final sub = _findPair(candidate, allCandidates, '.sub');
+      if (sub == null) throw StateError('VobSub 索引缺少同名 .sub 文件');
+      return _ensurePairCached(candidate, sub, forceRefresh: forceRefresh);
+    }
+    final path = await _ensureSingleSubtitleCached(candidate,
+        forceRefresh: forceRefresh);
+    if (extension != '.sub' || !isVobSubBinaryFile(path)) return path;
+    final idx = _findPair(candidate, allCandidates, '.idx');
+    if (idx == null) throw StateError('VobSub 位图字幕缺少同名 .idx 文件');
+    return _ensurePairCached(idx, candidate,
+        forceRefresh: forceRefresh, cachedSub: File(path));
+  }
+
+  Future<String> _ensurePairCached(
+      RemoteSubtitleCandidate idx, RemoteSubtitleCandidate sub,
+      {required bool forceRefresh, File? cachedSub}) async {
+    final key = _sourceKey(idx);
+    // Both entry points (.sub and .idx) share the same publication transaction.
+    final pending = _pairDownloads[key];
+    if (pending != null) {
+      if (!forceRefresh) return pending;
+      try {
+        await pending;
+      } catch (_) {}
+      return _ensurePairCached(idx, sub,
+          forceRefresh: true, cachedSub: cachedSub);
+    }
+    final operation = _downloadPair(idx, sub,
+        forceRefresh: forceRefresh, cachedSub: cachedSub);
+    _pairDownloads[key] = operation;
+    try {
+      return await operation;
+    } finally {
+      if (identical(_pairDownloads[key], operation)) _pairDownloads.remove(key);
+    }
+  }
+
+  Future<String> _downloadPair(
+      RemoteSubtitleCandidate idx, RemoteSubtitleCandidate sub,
+      {required bool forceRefresh, File? cachedSub}) async {
+    final storage = await StorageService.getAppStorageDirectory();
+    final hash = sha1.convert(utf8.encode(_sourceKey(idx))).toString();
+    final readable = _readableCacheFileName(idx.name, hash, '');
+    final root =
+        Directory(p.join(storage.path, 'remote_subtitles', '$readable-vobsub'));
+    await root.create(recursive: true);
+    final manifest = File(p.join(root.path, 'current'));
+    Future<String> pairDigest(File index, File bitmap) async {
+      final indexHash = await sha1.bind(index.openRead()).first;
+      final bitmapHash = await sha1.bind(bitmap.openRead()).first;
+      return sha1.convert(utf8.encode('$indexHash:$bitmapHash')).toString();
+    }
+
+    Future<String?> readCompletePair({bool checkSize = true}) async {
+      if (!await manifest.exists()) return null;
+      final generation = (await manifest.readAsString()).trim();
+      if (!RegExp(r'^[0-9a-f]{40}$').hasMatch(generation)) return null;
+      final index = File(p.join(root.path, generation, 'subtitle.idx'));
+      final bitmap = File(p.setExtension(index.path, '.sub'));
+      if (!await index.exists() || !await bitmap.exists()) return null;
+      final indexSize = await index.length(),
+          bitmapSize = await bitmap.length();
+      if (indexSize == 0 || bitmapSize == 0 || !isVobSubBinaryFile(bitmap.path))
+        return null;
+      if (checkSize &&
+          (idx.fileSize != null && idx.fileSize != indexSize ||
+              sub.fileSize != null && sub.fileSize != bitmapSize)) return null;
+      if (await pairDigest(index, bitmap) != generation) return null;
+      await registerRemoteSubtitleDisplayName(index.path, idx.name);
+      return index.path;
+    }
+
+    if (!forceRefresh) {
+      final cached = await readCompletePair();
+      if (cached != null) return cached;
+    }
+    final staging = await root.createTemp('download-');
+    try {
+      final index = File(p.join(staging.path, 'subtitle.idx'));
+      final bitmap = File(p.join(staging.path, 'subtitle.sub'));
+      await _downloadToFile(idx, index);
+      if (cachedSub != null) {
+        await cachedSub.copy(bitmap.path);
+      } else {
+        await _downloadToFile(sub, bitmap);
+      }
+      final indexSize = await index.length(),
+          bitmapSize = await bitmap.length();
+      if (indexSize == 0 ||
+          !isVobSubBinaryFile(bitmap.path) ||
+          (idx.fileSize != null && idx.fileSize != indexSize) ||
+          (sub.fileSize != null && sub.fileSize != bitmapSize)) {
+        throw StateError('VobSub 字幕对不完整或格式无效');
+      }
+      // Publish an immutable directory only after both downloads succeed.
+      // Existing video mappings keep their complete old pair during refresh.
+      final digest = await pairDigest(index, bitmap);
+      final destination = Directory(p.join(root.path, digest));
+      if (await destination.exists()) {
+        final existingIndex = File(p.join(destination.path, 'subtitle.idx'));
+        final existingSub = File(p.join(destination.path, 'subtitle.sub'));
+        if (!await existingIndex.exists() ||
+            !await existingSub.exists() ||
+            await existingIndex.length() == 0 ||
+            !isVobSubBinaryFile(existingSub.path) ||
+            await pairDigest(existingIndex, existingSub) != digest) {
+          await destination.delete(recursive: true);
+        }
+      }
+      if (!await destination.exists()) await staging.rename(destination.path);
+      final next = File('${manifest.path}.next');
+      await next.writeAsString(digest, flush: true);
+      await next.rename(manifest.path);
+      final path = p.join(destination.path, 'subtitle.idx');
+      await registerRemoteSubtitleDisplayName(path, idx.name);
+      return path;
+    } catch (_) {
+      if (!forceRefresh) {
+        final fallback = await readCompletePair(checkSize: false);
+        if (fallback != null) return fallback;
+      }
+      rethrow;
+    } finally {
+      if (await staging.exists()) await staging.delete(recursive: true);
+    }
+  }
+
+  Future<String> _ensureSingleSubtitleCached(RemoteSubtitleCandidate candidate,
       {bool forceRefresh = false}) async {
     if (kIsWeb) {
       throw UnsupportedError('Web 平台不支持缓存远程字幕');
@@ -239,13 +482,17 @@ class RemoteSubtitleService {
       await cacheDir.create(recursive: true);
     }
 
-    final extension =
-        candidate.extension.isNotEmpty ? candidate.extension : '.srt';
+    final extension = candidate.extension.isNotEmpty
+        ? candidate.extension.toLowerCase()
+        : '.srt';
+    // 缓存键不包含 fileSize：dandanplay 等服务端对同一文件两次列表请求可能
+    // 返回不同/缺失的 size，size 参与哈希会导致同一字幕每次落到不同缓存名，
+    // 配合下载失败就表现为“挂载选中永远无效”。内容变化由下面的 size 比对处理。
     final cacheKey = switch (candidate) {
       WebDavRemoteSubtitleCandidate() =>
-        'webdav:${candidate.connection.name}:${candidate.remotePath}',
+        'webdav:${candidate.connection.id}:${candidate.remotePath}',
       SmbRemoteSubtitleCandidate() =>
-        'smb:${candidate.connection.name}:${candidate.smbPath}',
+        'smb:${candidate.connection.id}:${candidate.smbPath}',
       DandanplayRemoteSubtitleCandidate() =>
         'dandanplay:${candidate.entryId}:${candidate.fileName}',
       SharedRemoteSubtitleCandidate() =>
@@ -253,12 +500,29 @@ class RemoteSubtitleService {
     };
 
     final hash = sha1.convert(utf8.encode(cacheKey)).toString();
-    final target = File(p.join(cacheDir.path, '$hash$extension'));
+    // Source identity belongs in the path; equal filenames from different
+    // directories must never overwrite a saved video's subtitle mapping.
+    final target = File(p.join(
+      cacheDir.path,
+      _readableCacheFileName(candidate.name, hash, extension),
+    ));
 
     if (!forceRefresh && await target.exists()) {
       final size = await target.length();
       if (size > 0) {
-        return target.path;
+        // 服务端声明了大小且与缓存不一致 -> 远程字幕可能已变化，尝试刷新
+        final declared = candidate.fileSize;
+        if (declared == null || declared == size) {
+          logPlayerEvent(
+            'Subtitle',
+            '远程字幕命中缓存: ${candidate.name}（${candidate.sourceLabel}）',
+          );
+          await registerRemoteSubtitleDisplayName(target.path, candidate.name);
+          return target.path;
+        }
+        debugPrint(
+          'RemoteSubtitleService: 远程字幕大小变化($size -> $declared)，尝试刷新缓存',
+        );
       }
     }
 
@@ -268,17 +532,102 @@ class RemoteSubtitleService {
     }
 
     try {
+      logPlayerEvent(
+        'Subtitle',
+        '开始下载远程字幕: ${candidate.name}（${candidate.sourceLabel}）',
+      );
       await _downloadToFile(candidate, tmp);
+      // 先下载成功再替换旧缓存；下载失败时旧缓存保持可用（下方回退）。
       if (await target.exists()) {
         await target.delete();
       }
       await tmp.rename(target.path);
+      await registerRemoteSubtitleDisplayName(target.path, candidate.name);
+      logPlayerEvent(
+        'Subtitle',
+        '远程字幕下载完成: ${candidate.name} -> ${target.path}',
+      );
       return target.path;
     } catch (e) {
       if (await tmp.exists()) {
         await tmp.delete();
       }
+      // 刷新失败但本地已有可用缓存（移除字幕后的重新挂载场景）：回退缓存，
+      // 不要让一次网络/服务端错误把挂载彻底打断。
+      if (!forceRefresh && await target.exists() && await target.length() > 0) {
+        debugPrint(
+          'RemoteSubtitleService: 刷新远程字幕失败($e)，回退使用本地缓存 ${target.path}',
+        );
+        logPlayerEvent(
+          'Subtitle',
+          '远程字幕下载失败（$e），回退使用本地缓存: ${candidate.name}',
+          level: 'WARN',
+        );
+        return target.path;
+      }
+      logPlayerEvent(
+        'Subtitle',
+        '远程字幕缓存失败: ${candidate.name}（${candidate.sourceLabel}）: $e',
+        level: 'ERROR',
+      );
       rethrow;
+    }
+  }
+
+  static const String _displayNamePrefsKey = 'remote_subtitle_display_names_v1';
+
+  /// 可读缓存文件名：原名清洗文件系统非法字符并截断，短哈希保证不同源
+  /// 同名不冲突（完整哈希仍是缓存键）。iOS「文件」App 直接展示该物理名，
+  /// 纯哈希名对用户毫无可读性（用户反馈）。
+  String _readableCacheFileName(
+      String originalName, String hash, String extension) {
+    var base = p.setExtension(originalName, '').trim();
+    base = base.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1f]'), '_').trim();
+    if (base.isEmpty) base = 'subtitle';
+    if (base.length > 80) base = base.substring(0, 80);
+    final shortHash = hash.length >= 8 ? hash.substring(0, 8) : hash;
+    return '$base-$shortHash$extension';
+  }
+
+  /// 远程字幕缓存路径 → 原始文件名 的持久化注册表。
+  /// 缓存文件名是哈希，跨进程/跨平台（iOS/Windows）读取列表时都要用
+  /// 原名展示；下载完成即登记，任何端随时可查。
+  Future<void> registerRemoteSubtitleDisplayName(
+      String cachedPath, String originalName) async {
+    try {
+      if (cachedPath.isEmpty || originalName.isEmpty) return;
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_displayNamePrefsKey);
+      final Map<String, dynamic> table = raw != null && raw.isNotEmpty
+          ? (json.decode(raw) as Map).cast<String, dynamic>()
+          : <String, dynamic>{};
+      table[cachedPath] = originalName;
+      // 上限保护：注册表只增不减会无限膨胀，超量时丢弃最早写入的一半
+      if (table.length > 200) {
+        final keys = table.keys.toList();
+        for (final key in keys.take(table.length - 100)) {
+          table.remove(key);
+        }
+      }
+      await prefs.setString(_displayNamePrefsKey, json.encode(table));
+    } catch (e) {
+      debugPrint('RemoteSubtitleService: 登记字幕显示名失败: $e');
+    }
+  }
+
+  /// 查询远程字幕缓存路径的原始文件名；未登记（或条目仍是哈希名）返回 null。
+  /// 异步版查询：读持久化注册表，未命中返回 null。
+  Future<String?> lookupDisplayName(String cachedPath) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_displayNamePrefsKey);
+      if (raw == null || raw.isEmpty) return null;
+      final table = (json.decode(raw) as Map).cast<String, dynamic>();
+      final name = table[cachedPath]?.toString();
+      if (name == null || name.isEmpty) return null;
+      return name;
+    } catch (_) {
+      return null;
     }
   }
 
@@ -416,10 +765,13 @@ class RemoteSubtitleService {
 
     final baseDir = await StorageService.getAppStorageDirectory();
     final cacheDir = Directory(p.join(baseDir.path, 'subtitle_fonts'));
-    if (kDebugMode) debugPrint('[FONT_DEBUG] ensureFontCached: baseDir=${baseDir.path}, subtitle_fonts=${cacheDir.path}, exists=${await cacheDir.exists()}');
+    if (kDebugMode)
+      debugPrint(
+          '[FONT_DEBUG] ensureFontCached: baseDir=${baseDir.path}, subtitle_fonts=${cacheDir.path}, exists=${await cacheDir.exists()}');
     if (!await cacheDir.exists()) {
       await cacheDir.create(recursive: true);
-      if (kDebugMode) debugPrint('[FONT_DEBUG] ensureFontCached: 创建了 subtitle_fonts 目录');
+      if (kDebugMode)
+        debugPrint('[FONT_DEBUG] ensureFontCached: 创建了 subtitle_fonts 目录');
     }
 
     // 异步清理缓存（不阻塞当前下载）
@@ -431,12 +783,15 @@ class RemoteSubtitleService {
         'shared:${candidate.fontUri.replace(userInfo: '', fragment: '').toString()}';
     final hash = sha1.convert(utf8.encode(cacheKey)).toString();
     final target = File(p.join(cacheDir.path, '$hash$extension'));
-    if (kDebugMode) debugPrint('[FONT_DEBUG] ensureFontCached: candidate=${candidate.name}, hash=$hash, target=${target.path}');
+    if (kDebugMode)
+      debugPrint(
+          '[FONT_DEBUG] ensureFontCached: candidate=${candidate.name}, hash=$hash, target=${target.path}');
 
     if (!forceRefresh && await target.exists()) {
       final size = await target.length();
       if (size > 0) {
-        if (kDebugMode) debugPrint('[FONT_DEBUG] ensureFontCached: 字体已缓存, size=$size, 跳过下载');
+        if (kDebugMode)
+          debugPrint('[FONT_DEBUG] ensureFontCached: 字体已缓存, size=$size, 跳过下载');
         return target.path;
       }
     }
@@ -452,7 +807,9 @@ class RemoteSubtitleService {
         await target.delete();
       }
       await tmp.rename(target.path);
-      if (kDebugMode) debugPrint('[FONT_DEBUG] ensureFontCached: 下载完成, 最终路径=${target.path}, size=${await target.length()}');
+      if (kDebugMode)
+        debugPrint(
+            '[FONT_DEBUG] ensureFontCached: 下载完成, 最终路径=${target.path}, size=${await target.length()}');
       return target.path;
     } catch (e) {
       if (kDebugMode) debugPrint('[FONT_DEBUG] ensureFontCached: 下载失败: $e');
@@ -495,18 +852,23 @@ class RemoteSubtitleService {
     final subtitles =
         await DandanplayRemoteService.instance.getSubtitleList(entryId);
 
+    final candidateNames =
+        subtitles.map((item) => item.fileName.trim().toLowerCase()).toSet();
+
     final candidates = <RemoteSubtitleCandidate>[];
     for (final item in subtitles) {
       final name = item.fileName.trim();
       if (name.isEmpty) continue;
       final ext = p.extension(name).toLowerCase();
       if (!subtitleExtensions.contains(ext)) continue;
+      if (!isVobSubPairCompleteInNames(name, candidateNames)) continue;
       candidates.add(
         DandanplayRemoteSubtitleCandidate(
           entryId: entryId,
           fileName: name,
           name: name,
           extension: ext,
+          fileSize: item.fileSize,
         ),
       );
     }
@@ -636,6 +998,10 @@ class RemoteSubtitleService {
     }
 
     final candidates = <RemoteSubtitleCandidate>[];
+    final managedNames = rawItems
+        .whereType<Map>()
+        .map((item) => (item['name']?.toString() ?? '').trim().toLowerCase())
+        .toSet();
     for (final item in rawItems) {
       if (item is! Map) continue;
       final map = item.cast<String, dynamic>();
@@ -643,6 +1009,7 @@ class RemoteSubtitleService {
       if (name.isEmpty) continue;
       final ext = p.extension(name).toLowerCase();
       if (!subtitleExtensions.contains(ext)) continue;
+      if (!isVobSubPairCompleteInNames(name, managedNames)) continue;
 
       final subtitleUri = info.streamUri.replace(
         path: '/api/media/local/manage/subtitle',
@@ -662,12 +1029,21 @@ class RemoteSubtitleService {
           isLikelyMatch: map['isLikelyMatch'] == true,
           name: name,
           extension: ext,
+          fileSize: _parseItemFileSize(map),
         ),
       );
     }
 
     candidates.sort((a, b) => a.name.compareTo(b.name));
     return candidates;
+  }
+
+  /// 从字幕 item map 中解析服务端声明的文件大小（jellyfin 等可能返回 size/bytes）。
+  int? _parseItemFileSize(Map<String, dynamic> map) {
+    final raw = map['size'] ?? map['fileSize'] ?? map['bytes'];
+    if (raw is int) return raw;
+    if (raw is String) return int.tryParse(raw.trim());
+    return null;
   }
 
   Future<List<RemoteSubtitleCandidate>> _listSharedRemoteCandidates(
@@ -737,6 +1113,10 @@ class RemoteSubtitleService {
     }
 
     final candidates = <RemoteSubtitleCandidate>[];
+    final sharedNames = rawItems
+        .whereType<Map>()
+        .map((item) => (item['name']?.toString() ?? '').trim().toLowerCase())
+        .toSet();
     for (final item in rawItems) {
       if (item is! Map) continue;
       final map = item.cast<String, dynamic>();
@@ -744,6 +1124,7 @@ class RemoteSubtitleService {
       if (name.isEmpty) continue;
       final ext = p.extension(name).toLowerCase();
       if (!subtitleExtensions.contains(ext)) continue;
+      if (!isVobSubPairCompleteInNames(name, sharedNames)) continue;
 
       final subtitleUri = info.streamUri.replace(
         path: info.subtitlePath,
@@ -760,6 +1141,7 @@ class RemoteSubtitleService {
           isLikelyMatch: map['isLikelyMatch'] == true,
           name: name,
           extension: ext,
+          fileSize: _parseItemFileSize(map),
         ),
       );
     }
@@ -780,7 +1162,9 @@ class RemoteSubtitleService {
       fragment: '',
     );
 
-    if (kDebugMode) debugPrint('[MKA_DEBUG] _listSharedRemoteAudioCandidates: requestUri=$requestUri, audioPath=${info.audioPath}, audioFilePath=${info.audioFilePath}');
+    if (kDebugMode)
+      debugPrint(
+          '[MKA_DEBUG] _listSharedRemoteAudioCandidates: requestUri=$requestUri, audioPath=${info.audioPath}, audioFilePath=${info.audioFilePath}');
 
     final headers = <String, String>{
       'accept': 'application/json',
@@ -805,12 +1189,16 @@ class RemoteSubtitleService {
     try {
       response = await dio.get<String>(requestUri.toString());
     } catch (e) {
-      if (kDebugMode) debugPrint('[MKA_DEBUG] _listSharedRemoteAudioCandidates: HTTP请求失败: $e');
+      if (kDebugMode)
+        debugPrint(
+            '[MKA_DEBUG] _listSharedRemoteAudioCandidates: HTTP请求失败: $e');
       return const [];
     }
 
     final status = response.statusCode ?? 0;
-    if (kDebugMode) debugPrint('[MKA_DEBUG] _listSharedRemoteAudioCandidates: HTTP status=$status, body length=${response.data?.length ?? 0}');
+    if (kDebugMode)
+      debugPrint(
+          '[MKA_DEBUG] _listSharedRemoteAudioCandidates: HTTP status=$status, body length=${response.data?.length ?? 0}');
     if (status != 200) {
       return const [];
     }
@@ -827,7 +1215,9 @@ class RemoteSubtitleService {
           ? decoded
           : (decoded is Map ? decoded.cast<String, dynamic>() : const {});
     } catch (e) {
-      if (kDebugMode) debugPrint('[MKA_DEBUG] _listSharedRemoteAudioCandidates: JSON解析失败: $e');
+      if (kDebugMode)
+        debugPrint(
+            '[MKA_DEBUG] _listSharedRemoteAudioCandidates: JSON解析失败: $e');
       return const [];
     }
     if (payload.isEmpty) {
@@ -836,11 +1226,15 @@ class RemoteSubtitleService {
 
     final rawItems = payload['items'];
     if (rawItems is! List) {
-      if (kDebugMode) debugPrint('[MKA_DEBUG] _listSharedRemoteAudioCandidates: payload中无items, keys=${payload.keys.toList()}');
+      if (kDebugMode)
+        debugPrint(
+            '[MKA_DEBUG] _listSharedRemoteAudioCandidates: payload中无items, keys=${payload.keys.toList()}');
       return const [];
     }
 
-    if (kDebugMode) debugPrint('[MKA_DEBUG] _listSharedRemoteAudioCandidates: rawItems count=${rawItems.length}');
+    if (kDebugMode)
+      debugPrint(
+          '[MKA_DEBUG] _listSharedRemoteAudioCandidates: rawItems count=${rawItems.length}');
 
     final candidates = <RemoteAudioCandidate>[];
     for (final item in rawItems) {
@@ -886,7 +1280,9 @@ class RemoteSubtitleService {
       fragment: '',
     );
 
-    if (kDebugMode) debugPrint('[FONT_DEBUG] _listSharedRemoteFontCandidates: requestUri=$requestUri, shareId=${info.shareId}, fontsPath=${info.fontsPath}, fontPath=${info.fontPath}');
+    if (kDebugMode)
+      debugPrint(
+          '[FONT_DEBUG] _listSharedRemoteFontCandidates: requestUri=$requestUri, shareId=${info.shareId}, fontsPath=${info.fontsPath}, fontPath=${info.fontPath}');
 
     final headers = <String, String>{
       'accept': 'application/json',
@@ -911,12 +1307,16 @@ class RemoteSubtitleService {
     try {
       response = await dio.get<String>(requestUri.toString());
     } catch (e) {
-      if (kDebugMode) debugPrint('[FONT_DEBUG] _listSharedRemoteFontCandidates: HTTP请求失败: $e');
+      if (kDebugMode)
+        debugPrint(
+            '[FONT_DEBUG] _listSharedRemoteFontCandidates: HTTP请求失败: $e');
       return const [];
     }
 
     final status = response.statusCode ?? 0;
-    if (kDebugMode) debugPrint('[FONT_DEBUG] _listSharedRemoteFontCandidates: HTTP status=$status, body length=${response.data?.length ?? 0}');
+    if (kDebugMode)
+      debugPrint(
+          '[FONT_DEBUG] _listSharedRemoteFontCandidates: HTTP status=$status, body length=${response.data?.length ?? 0}');
     if (status != 200) {
       return const [];
     }
@@ -933,7 +1333,9 @@ class RemoteSubtitleService {
           ? decoded
           : (decoded is Map ? decoded.cast<String, dynamic>() : const {});
     } catch (e) {
-      if (kDebugMode) debugPrint('[FONT_DEBUG] _listSharedRemoteFontCandidates: JSON解析失败: $e');
+      if (kDebugMode)
+        debugPrint(
+            '[FONT_DEBUG] _listSharedRemoteFontCandidates: JSON解析失败: $e');
       return const [];
     }
     if (payload.isEmpty) {
@@ -942,11 +1344,15 @@ class RemoteSubtitleService {
 
     final rawItems = payload['items'];
     if (rawItems is! List) {
-      if (kDebugMode) debugPrint('[FONT_DEBUG] _listSharedRemoteFontCandidates: payload中无items字段, keys=${payload.keys.toList()}');
+      if (kDebugMode)
+        debugPrint(
+            '[FONT_DEBUG] _listSharedRemoteFontCandidates: payload中无items字段, keys=${payload.keys.toList()}');
       return const [];
     }
 
-    if (kDebugMode) debugPrint('[FONT_DEBUG] _listSharedRemoteFontCandidates: rawItems count=${rawItems.length}');
+    if (kDebugMode)
+      debugPrint(
+          '[FONT_DEBUG] _listSharedRemoteFontCandidates: rawItems count=${rawItems.length}');
 
     final candidates = <RemoteFontCandidate>[];
     for (final item in rawItems) {
@@ -977,7 +1383,9 @@ class RemoteSubtitleService {
     }
 
     candidates.sort((a, b) => a.name.compareTo(b.name));
-    if (kDebugMode) debugPrint('[FONT_DEBUG] _listSharedRemoteFontCandidates: 最终候选数=${candidates.length}');
+    if (kDebugMode)
+      debugPrint(
+          '[FONT_DEBUG] _listSharedRemoteFontCandidates: 最终候选数=${candidates.length}');
     return candidates;
   }
 
@@ -993,7 +1401,9 @@ class RemoteSubtitleService {
     }
 
     final requestUri = candidate.audioUri.replace(userInfo: '');
-    if (kDebugMode) debugPrint('[MKA_DEBUG] _downloadSharedRemoteAudio: 开始流式下载, uri=$requestUri');
+    if (kDebugMode)
+      debugPrint(
+          '[MKA_DEBUG] _downloadSharedRemoteAudio: 开始流式下载, uri=$requestUri');
 
     // MKA/FLAC 文件通常很大（几十到几百MB），使用 ResponseType.stream 流式下载
     // 避免将整个文件缓冲到内存导致 OOM 或连接超时
@@ -1027,12 +1437,16 @@ class RemoteSubtitleService {
       }
       await sink.close();
     } catch (e) {
-      try { await sink.close(); } catch (_) {}
+      try {
+        await sink.close();
+      } catch (_) {}
       rethrow;
     }
 
     final size = await destination.length();
-    if (kDebugMode) debugPrint('[MKA_DEBUG] _downloadSharedRemoteAudio: 下载完成, size=$size bytes');
+    if (kDebugMode)
+      debugPrint(
+          '[MKA_DEBUG] _downloadSharedRemoteAudio: 下载完成, size=$size bytes');
     if (size == 0) {
       throw Exception('共享媒体外挂音轨下载结果为空文件');
     }
@@ -1050,7 +1464,9 @@ class RemoteSubtitleService {
     }
 
     final requestUri = candidate.fontUri.replace(userInfo: '');
-    if (kDebugMode) debugPrint('[FONT_DEBUG] _downloadSharedRemoteFont: 请求字体 ${candidate.name}, uri=$requestUri');
+    if (kDebugMode)
+      debugPrint(
+          '[FONT_DEBUG] _downloadSharedRemoteFont: 请求字体 ${candidate.name}, uri=$requestUri');
     // CJK 字体可达 10–20MB+，使用流式下载避免 OOM，与音频下载保持一致
     final dio = Dio(
       BaseOptions(
@@ -1081,12 +1497,16 @@ class RemoteSubtitleService {
       }
       await sink.close();
     } catch (e) {
-      try { await sink.close(); } catch (_) {}
+      try {
+        await sink.close();
+      } catch (_) {}
       rethrow;
     }
 
     final size = await destination.length();
-    if (kDebugMode) debugPrint('[FONT_DEBUG] _downloadSharedRemoteFont: 下载完成, size=$size bytes');
+    if (kDebugMode)
+      debugPrint(
+          '[FONT_DEBUG] _downloadSharedRemoteFont: 下载完成, size=$size bytes');
     if (size == 0) {
       throw Exception('共享媒体字体下载结果为空文件');
     }
@@ -1097,35 +1517,26 @@ class RemoteSubtitleService {
     await WebDAVService.instance.initialize();
 
     WebDAVResolvedFile? resolved =
-        WebDAVService.instance.resolveFileUrl(videoUrl);
+        WebDAVService.instance.resolveMediaPath(videoUrl);
     resolved ??= _tryResolveWebDavFromUrl(videoUrl);
     if (resolved == null) return const [];
 
-    // 计算相对于连接基础URL的路径
-    final connectionUri = Uri.parse(resolved.connection.url);
-    final basePath = connectionUri.path.isEmpty ? '/' : connectionUri.path;
-    final normalizedBasePath = basePath.endsWith('/') ? basePath : '$basePath/';
-    final filePath = resolved.relativePath.startsWith('/')
-        ? resolved.relativePath
-        : '/${resolved.relativePath}';
-
-    String directory;
-    if (filePath.length > normalizedBasePath.length &&
-        filePath.startsWith(normalizedBasePath)) {
-      directory = filePath.substring(normalizedBasePath.length);
-      directory = _posixDirname(directory);
-    } else {
-      directory = _posixDirname(resolved.relativePath);
-    }
+    final directory = _posixDirname(resolved.relativePath);
 
     final entries = await WebDAVService.instance
         .listDirectoryAll(resolved.connection, directory);
+
+    final webdavNames = entries
+        .where((entry) => !entry.isDirectory)
+        .map((entry) => entry.name.toLowerCase())
+        .toSet();
 
     final candidates = <RemoteSubtitleCandidate>[];
     for (final entry in entries) {
       if (entry.isDirectory) continue;
       final ext = p.extension(entry.name).toLowerCase();
       if (!subtitleExtensions.contains(ext)) continue;
+      if (!isVobSubPairCompleteInNames(entry.name, webdavNames)) continue;
       candidates.add(
         WebDavRemoteSubtitleCandidate(
           connection: resolved.connection,
@@ -1144,24 +1555,38 @@ class RemoteSubtitleService {
       Uri smbUri) async {
     await SMBService.instance.initialize();
 
-    final connection = _resolveSmbConnectionFromUri(smbUri);
+    final stablePath = MediaSourceUtils.parseSmbPath(smbUri.toString());
+    final connection = stablePath == null
+        ? _resolveSmbConnectionFromUri(smbUri)
+        : SMBService.instance
+            .getConnectionByIdOrName(stablePath.connectionName);
     if (connection == null) return const [];
 
-    final smbPath = _normalizeSmbPathFromUri(smbUri);
+    final effectiveConnection = SMBService.instance.effectiveConnection(
+      connection,
+    );
+    final smbPath =
+        stablePath?.relativePath ?? _normalizeSmbPathFromUri(smbUri);
     if (smbPath.isEmpty || smbPath == '/') return const [];
 
     final directory = _posixDirname(smbPath);
     final entries =
         await SMBService.instance.listDirectoryAll(connection, directory);
 
+    final smbNames = entries
+        .where((entry) => !entry.isDirectory)
+        .map((entry) => entry.name.toLowerCase())
+        .toSet();
+
     final candidates = <RemoteSubtitleCandidate>[];
     for (final entry in entries) {
       if (entry.isDirectory) continue;
       final ext = p.extension(entry.name).toLowerCase();
       if (!subtitleExtensions.contains(ext)) continue;
+      if (!isVobSubPairCompleteInNames(entry.name, smbNames)) continue;
       candidates.add(
         SmbRemoteSubtitleCandidate(
-          connection: connection,
+          connection: effectiveConnection,
           smbPath: entry.path,
           name: entry.name,
           extension: ext,
@@ -1186,15 +1611,20 @@ class RemoteSubtitleService {
 
     WebDAVConnection? matched;
     for (final conn in WebDAVService.instance.connections) {
-      final baseUri = Uri.tryParse(conn.url.trim());
-      if (baseUri == null || baseUri.scheme.isEmpty || baseUri.host.isEmpty) {
-        continue;
+      // 内网与公网地址都参与匹配。
+      for (final base in [conn.url, conn.wanUrl]) {
+        if (base.trim().isEmpty) continue;
+        final baseUri = Uri.tryParse(base.trim());
+        if (baseUri == null || baseUri.scheme.isEmpty || baseUri.host.isEmpty) {
+          continue;
+        }
+        if (baseUri.scheme != uri.scheme) continue;
+        if (baseUri.host != uri.host) continue;
+        if (_effectivePort(baseUri) != _effectivePort(uri)) continue;
+        matched = conn;
+        break;
       }
-      if (baseUri.scheme != uri.scheme) continue;
-      if (baseUri.host != uri.host) continue;
-      if (_effectivePort(baseUri) != _effectivePort(uri)) continue;
-      matched = conn;
-      break;
+      if (matched != null) break;
     }
 
     String username = '';
@@ -1286,7 +1716,8 @@ class RemoteSubtitleService {
     if (uri == null) return videoPath;
     final lowerPath = uri.path.toLowerCase();
     if (lowerPath.contains('/api/media/local/manage/stream') ||
-        lowerPath.contains('/api/media/local/share/stream')) {
+        lowerPath.contains('/api/media/local/share/stream') ||
+        lowerPath.startsWith('/smb/stream')) {
       final pathParam = uri.queryParameters['path'];
       if (pathParam != null && pathParam.trim().isNotEmpty) {
         return pathParam.trim();
@@ -1312,10 +1743,13 @@ class RemoteSubtitleService {
 
     SMBConnection? matched;
     for (final conn in SMBService.instance.connections) {
-      if (conn.host.trim().toLowerCase() != host.toLowerCase()) {
-        continue;
-      }
-      if (conn.port != port) continue;
+      final matchesLan =
+          conn.host.trim().toLowerCase() == host.toLowerCase() &&
+              conn.port == port;
+      final matchesWan =
+          conn.wanHost.trim().toLowerCase() == host.toLowerCase() &&
+              conn.wanPort == port;
+      if (!matchesLan && !matchesWan) continue;
       if (username.isNotEmpty && conn.username != username) continue;
       matched = conn;
       break;
@@ -1359,18 +1793,27 @@ class RemoteSubtitleService {
     final connection = SMBService.instance.getConnection(parsed.connName);
     if (connection == null) return const [];
 
+    final effectiveConnection = SMBService.instance.effectiveConnection(
+      connection,
+    );
     final directory = _posixDirname(parsed.smbPath);
     final entries =
         await SMBService.instance.listDirectoryAll(connection, directory);
+
+    final smbNames = entries
+        .where((entry) => !entry.isDirectory)
+        .map((entry) => entry.name.toLowerCase())
+        .toSet();
 
     final candidates = <RemoteSubtitleCandidate>[];
     for (final entry in entries) {
       if (entry.isDirectory) continue;
       final ext = p.extension(entry.name).toLowerCase();
       if (!subtitleExtensions.contains(ext)) continue;
+      if (!isVobSubPairCompleteInNames(entry.name, smbNames)) continue;
       candidates.add(
         SmbRemoteSubtitleCandidate(
-          connection: connection,
+          connection: effectiveConnection,
           smbPath: entry.path,
           name: entry.name,
           extension: ext,
@@ -1386,38 +1829,35 @@ class RemoteSubtitleService {
       WebDavRemoteSubtitleCandidate candidate, File destination) async {
     final rawUrl = WebDAVService.instance
         .getFileUrl(candidate.connection, candidate.remotePath);
-    final rawUri = Uri.parse(rawUrl);
-    final sanitized = rawUri.replace(userInfo: '');
 
-    final headers = <String, String>{
-      'user-agent': 'NipaPlay',
-      'accept': '*/*',
-    };
+    final auth = WebDavChallengeAuth(
+      username: candidate.connection.username,
+      password: candidate.connection.password,
+    );
 
-    final hasAuth = candidate.connection.username.isNotEmpty ||
-        candidate.connection.password.isNotEmpty;
-    if (hasAuth) {
-      final credentials =
-          '${candidate.connection.username}:${candidate.connection.password}';
-      headers['authorization'] =
-          'Basic ${base64Encode(utf8.encode(credentials))}';
-    }
-
+    // 认证头不能放进 BaseOptions：Dio 会把默认头合并到每一跳，跨源重定向
+    // 时就会把凭证带给目标主机。认证与重定向都由 webDavAuthenticatedGet 处理。
     final dio = Dio(
       BaseOptions(
         connectTimeout: const Duration(milliseconds: 15000),
         receiveTimeout: const Duration(milliseconds: 45000),
         sendTimeout: const Duration(milliseconds: 15000),
-        followRedirects: true,
-        responseType: ResponseType.bytes,
-        headers: headers,
       ),
     );
 
-    final resp = await dio.get<List<int>>(sanitized.toString());
+    final resp = await webDavAuthenticatedGet(
+      dio,
+      Uri.parse(rawUrl),
+      auth,
+      headers: const {'user-agent': 'NipaPlay', 'accept': '*/*'},
+    );
+
     final status = resp.statusCode ?? 0;
     if (status != 200 && status != 206) {
-      throw Exception('WebDAV 下载失败 (HTTP $status)');
+      final message = status == 401 || status == 403
+          ? 'WebDAV 服务器拒绝了提供的用户名或密码 (HTTP $status)'
+          : 'WebDAV 下载失败 (HTTP $status)';
+      throw Exception(message);
     }
     final data = resp.data;
     if (data == null || data.isEmpty) {

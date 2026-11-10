@@ -2,8 +2,8 @@
 
 #include <optional>
 
+#include "clipboard_image.h"
 #include "flutter/generated_plugin_registrant.h"
-#include "desktop_multi_window/desktop_multi_window_plugin.h"
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -26,13 +26,11 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
-  DesktopMultiWindowSetWindowCreatedCallback([](void* controller) {
-    auto* flutter_view_controller =
-        reinterpret_cast<flutter::FlutterViewController*>(controller);
-    auto* registry = flutter_view_controller->engine();
-    RegisterPlugins(registry);
-  });
-  SetChildContent(flutter_controller_->view()->GetNativeWindow());
+  RegisterClipboardImageChannel(flutter_controller_->engine()->messenger());
+  HWND flutter_view = flutter_controller_->view()->GetNativeWindow();
+  SetChildContent(flutter_view);
+  windows_native_video_plugin_ = std::make_unique<WindowsNativeVideoPlugin>(
+      GetHandle(), flutter_view, flutter_controller_->engine()->messenger());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
@@ -47,6 +45,10 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  if (windows_native_video_plugin_) {
+    windows_native_video_plugin_->Destroy();
+    windows_native_video_plugin_ = nullptr;
+  }
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
@@ -58,6 +60,37 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  switch (message) {
+    case WM_ACTIVATEAPP:
+      if (windows_native_video_plugin_) {
+        if (wparam != FALSE) {
+          windows_native_video_plugin_->HostWindowDidActivate();
+        } else {
+          windows_native_video_plugin_->HostWindowDidDeactivate();
+        }
+      }
+      break;
+    case WM_WINDOWPOSCHANGED: {
+      const auto* window_pos = reinterpret_cast<WINDOWPOS*>(lparam);
+      if (windows_native_video_plugin_ &&
+          (window_pos == nullptr || (window_pos->flags & SWP_NOZORDER) == 0)) {
+        windows_native_video_plugin_->HostWindowZOrderDidChange();
+      }
+      break;
+    }
+    case WM_MOVE:
+    case WM_MOVING:
+    case WM_SIZE:
+    case WM_SIZING:
+    case WM_EXITSIZEMOVE:
+    case WM_SHOWWINDOW:
+    case WM_DPICHANGED:
+      if (windows_native_video_plugin_) {
+        windows_native_video_plugin_->HostWindowDidChange();
+      }
+      break;
+  }
+
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =

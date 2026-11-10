@@ -13,13 +13,21 @@ on:
 jobs:
   build:
     name: Build Windows Package
-    runs-on: windows-latest
+    # Keep the release build on the VS 2022 SDK until Erika's Windows SMTC
+    # bridge supports the C++/WinRT projection shipped by VS 2026.
+    runs-on: windows-2022
     outputs:
       version: ${{ steps.setup.outputs.version }}
       artifact-name: release-Windows-x64
     env:
       FVP_DEPS_URL: https://sourceforge.net/projects/mdk-sdk/files/nightly
-      FVP_DEPS_LATEST: 1
+      # Keep FVP_DEPS_LATEST unset (treated as 0): with it on, fvp's deps.cmake
+      # re-fetches mdk-sdk's .md5 from the SourceForge web frontend during
+      # `flutter build windows`, and SourceForge serves an HTML interstitial to
+      # CI runners that fatally breaks extraction. The mdk-sdk is pre-downloaded
+      # by the build-windows action, so fvp must trust it and skip downloads.
+      FVP_DEPS_LATEST: 0
+      ERIKA_PREBUILT: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -48,4 +56,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-Windows-x64
-          path: build/windows/*
+          path: |
+            build/windows/*
+            !build/windows/symbols-windows
+
+      - name: Upload Dart debug symbols (for de-obfuscating crash stacks)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dart-symbols-Windows
+          path: build/symbols-windows/
+          if-no-files-found: warn

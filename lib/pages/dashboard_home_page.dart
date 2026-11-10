@@ -1,15 +1,21 @@
 library dashboard_home_page;
 
+import 'package:nipaplay/models/media_library_scope.dart';
+
+import 'package:nipaplay/widgets/page_activity_mixin.dart';
+import 'package:nipaplay/widgets/scroll_edge_builder.dart';
 import 'dart:ui';
 import 'dart:math' as math;
 import 'dart:async';
+import 'package:nipaplay/widgets/dandanplay_login_required_view.dart';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart' as cupertino;
 import 'package:provider/provider.dart';
-import 'package:http/http.dart' as http;
+import 'package:nipaplay/services/dandanplay_http_client.dart' as http;
 import 'package:nipaplay/models/watch_history_model.dart';
 import 'package:nipaplay/providers/watch_history_provider.dart';
 import 'package:nipaplay/providers/jellyfin_provider.dart';
@@ -17,31 +23,37 @@ import 'package:nipaplay/providers/emby_provider.dart';
 import 'package:nipaplay/services/jellyfin_service.dart';
 import 'package:nipaplay/services/emby_service.dart';
 import 'package:nipaplay/services/bangumi_service.dart';
+import 'package:nipaplay/services/bangumi_api_service.dart';
+import 'package:nipaplay/services/quarterly_review_cache.dart';
 import 'package:nipaplay/utils/network_settings.dart';
 import 'package:nipaplay/services/dandanplay_service.dart';
-import 'package:nipaplay/services/search_service.dart';
 import 'package:nipaplay/services/scan_service.dart';
 import 'package:nipaplay/services/web_remote_access_service.dart';
+import 'package:nipaplay/services/random_recommendation_service.dart';
+import 'package:nipaplay/services/trending_bangumi_service.dart';
 import 'package:nipaplay/models/jellyfin_model.dart';
 import 'package:nipaplay/models/emby_model.dart';
 import 'package:nipaplay/models/bangumi_model.dart';
-import 'package:nipaplay/models/search_model.dart';
+import 'package:nipaplay/models/trending_bangumi.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_dialog.dart';
-import 'package:nipaplay/themes/nipaplay/widgets/anime_card.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/blur_dropdown.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/bangumi_comment_dialog.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/quarterly_review_comment.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/hover_scale_text_button.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/horizontal_anime_card.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/horizontal_anime_skeleton.dart';
-import 'package:nipaplay/themes/nipaplay/widgets/loading_placeholder.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/cached_network_image_widget.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/nipaplay_window.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/tag_search_widget.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/floating_action_glass_button.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/startup_notification_controller.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/large_screen_focusable_action.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_page_scaffold.dart';
 import 'package:nipaplay/themes/nipaplay/pages/settings/watch_history_page.dart';
 import 'package:nipaplay/pages/media_server_detail_page.dart';
-import 'package:nipaplay/pages/anime_detail_page.dart';
 import 'package:nipaplay/services/playback_service.dart';
+import 'package:nipaplay/services/episode_file_selection_service.dart';
 import 'package:nipaplay/models/playable_item.dart';
 import 'package:nipaplay/models/media_server_playback.dart';
 import 'package:nipaplay/models/dandanplay_remote_model.dart';
@@ -50,18 +62,25 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:path/path.dart' as path;
 import 'package:nipaplay/providers/appearance_settings_provider.dart';
 import 'package:nipaplay/providers/home_sections_settings_provider.dart';
+import 'package:nipaplay/providers/settings_provider.dart';
 import 'package:nipaplay/utils/video_player_state.dart';
 import 'package:nipaplay/utils/tab_change_notifier.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
 import 'package:nipaplay/utils/media_source_utils.dart';
-import 'package:nipaplay/main.dart';
+import 'package:nipaplay/app/app_page_ids.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
+import 'package:nipaplay/app/app_size_class_scope.dart';
+import 'package:nipaplay/app/unified_home_components.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:cached_network_image/cached_network_image.dart';
-import 'package:nipaplay/models/watch_history_model.dart';
 import 'package:nipaplay/services/server_history_sync_service.dart';
 import 'package:nipaplay/models/shared_remote_library.dart';
+import 'package:nipaplay/providers/shared_remote_library_provider.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/themed_anime_detail.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/large_screen_home_scope.dart';
+import 'package:nipaplay/widgets/media_server_network_image.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_app_page_header.dart';
 import 'package:nipaplay/utils/watch_history_auto_match_helper.dart';
 
 part '../themes/nipaplay/widgets/dashboard_home_page_data_loading.dart';
@@ -71,6 +90,18 @@ part '../themes/nipaplay/widgets/dashboard_home_page_actions.dart';
 part '../themes/nipaplay/widgets/dashboard_home_page_image_helpers.dart';
 part '../themes/nipaplay/widgets/dashboard_home_page_models.dart';
 part '../themes/nipaplay/widgets/dashboard_home_page_random_recommendations.dart';
+part '../themes/nipaplay/widgets/dashboard_home_page_trending.dart';
+part '../themes/nipaplay/widgets/dashboard_home_page_quarterly_review.dart';
+part '../themes/nipaplay/widgets/dashboard_home_page_quarterly_review_logic.dart';
+part '../themes/cupertino/widgets/cupertino_home_page_controls.dart';
+
+/// 一次推荐位封面升级的结果，用于把多次 setState 合并成一次。
+class _UpgradedRecommendation {
+  const _UpgradedRecommendation({required this.index, required this.item});
+
+  final int index;
+  final RecommendedItem item;
+}
 
 class DashboardHomePage extends StatefulWidget {
   const DashboardHomePage({super.key});
@@ -80,9 +111,21 @@ class DashboardHomePage extends StatefulWidget {
 }
 
 class _DashboardHomePageState extends State<DashboardHomePage>
-    with AutomaticKeepAliveClientMixin {
+    with AutomaticKeepAliveClientMixin, PageActivityMixin {
   bool get _isLargeScreenModeActive {
     return NipaplayLargeScreenHomeScope.isActive(context);
+  }
+
+  List<UnifiedHomeComponent> _buildHomeComponents(
+    HomeSectionsSettingsProvider settings,
+  ) {
+    return buildUnifiedHomeComponents(
+      settings: settings,
+      hasTodaySeries: _todayAnimes.isNotEmpty || _isLoadingTodayAnimes,
+      hasRandomRecommendations:
+          _randomRecommendations.isNotEmpty || _isLoadingRandomRecommendations,
+      hasLocalLibrary: _localAnimeItems.isNotEmpty,
+    );
   }
 
   Widget _wrapLargeScreenFocusable({
@@ -98,6 +141,7 @@ class _DashboardHomePageState extends State<DashboardHomePage>
       onActivate: onActivate,
       borderRadius: borderRadius,
       padding: padding,
+      focusScale: 1,
       child: child,
     );
   }
@@ -106,6 +150,8 @@ class _DashboardHomePageState extends State<DashboardHomePage>
   JellyfinProvider? _jellyfinProviderRef;
   EmbyProvider? _embyProviderRef;
   WatchHistoryProvider? _watchHistoryProviderRef;
+  AppearanceSettingsProvider? _appearanceSettingsProviderRef;
+  bool? _lastQuarterlyReviewEnabled;
   ScanService? _scanServiceRef;
   VideoPlayerState? _videoPlayerStateRef;
   DandanplayRemoteProvider? _dandanplayProviderRef;
@@ -137,7 +183,6 @@ class _DashboardHomePageState extends State<DashboardHomePage>
 
   // 待处理的刷新请求
   bool _pendingRefreshAfterLoad = false;
-  String _pendingRefreshReason = '';
 
   // 播放器状态追踪，用于检测退出播放器时触发刷新
   bool _wasPlayerActive = false;
@@ -166,13 +211,66 @@ class _DashboardHomePageState extends State<DashboardHomePage>
   bool _isLoadingTodayAnimes = false;
   ScrollController? _todayAnimesScrollController;
 
+  List<_QuarterlyReviewItem> _quarterlyReviewItems = [];
+  int? _quarterlyReviewYear;
+  int? _quarterlyReviewMonth;
+  bool _isLoadingQuarterlyReview = false;
+  bool _reviewReloadAfterCurrent = false;
+  bool _reviewWarmScheduled = false;
+  bool _reviewCollectionsScheduled = false;
+  bool _isEditingQuarterlyReviewComment = false;
+  _QuarterlyReviewSort _quarterlyReviewSort = _QuarterlyReviewSort.airDate;
+  final ScrollController _quarterlyReviewScrollController = ScrollController();
+  final GlobalKey _quarterlyReviewSortDropdownKey = GlobalKey();
+
+  // 排行榜数据
+  TrendingRankingKind _trendingKind = TrendingRankingKind.allHot;
+  TrendingPeriod _trendingPeriod = TrendingPeriod.week;
+  TrendingNewAnimeScope _trendingScope = TrendingNewAnimeScope.currentSeason;
+  final Map<String, TrendingBangumiResult> _trendingResults = {};
+  final Set<String> _trendingLoadingKeys = {};
+  String? _trendingError;
+  bool _trendingLoginRequired = false;
+  ScrollController? _trendingScrollController;
+
+  void _updateTrendingState(VoidCallback update) => setState(update);
+
   // 随机推荐数据
   List<RandomRecommendationItem> _randomRecommendations = [];
+  List<RandomRecommendationGroup> _randomRecommendationGroups = [];
+  int _randomRecommendationGroupIndex = 0;
   bool _isLoadingRandomRecommendations = false;
   ScrollController? _randomRecommendationsScrollController;
 
   // 本地媒体库图片持久化缓存（与 MediaLibraryPage 复用同一前缀）
   final Map<int, String> _localImageCache = {};
+
+  /// 番剧详情的 Future 备忘。
+  ///
+  /// `FutureBuilder` 的 future 一旦在 build 里现场创建，每次重建都会重新发起
+  /// 一次请求，并把已解析的快照丢掉（表现为卡片简介反复闪回空态）。
+  /// 首页是 eager 构建的整棵树，重建很频繁，因此必须按 animeId 缓存 Future。
+  final Map<int, Future<BangumiAnime>> _animeDetailFutures = {};
+
+  /// 取得（或创建）某个番剧详情的共享 Future。
+  Future<BangumiAnime> _animeDetailsFuture(int animeId) {
+    final existing = _animeDetailFutures[animeId];
+    if (existing != null) return existing;
+
+    late final Future<BangumiAnime> request;
+    request = BangumiService.instance.getAnimeDetails(animeId).catchError(
+      (Object error, StackTrace stackTrace) {
+        // 失败时丢弃缓存，下一次重建可以重试，而不是永久缓存一个失败态。
+        if (identical(_animeDetailFutures[animeId], request)) {
+          _animeDetailFutures.remove(animeId);
+        }
+        throw error;
+      },
+    );
+    _animeDetailFutures[animeId] = request;
+    return request;
+  }
+
   static const String _localPrefsKeyPrefix = 'media_library_image_url_';
   bool _isLoadingLocalImages = false;
   bool _isLoadingDandanImages = false;
@@ -193,10 +291,7 @@ class _DashboardHomePageState extends State<DashboardHomePage>
   bool _isAutoSwitching = true;
   int _currentHeroBannerIndex = 0;
   late final ValueNotifier<int> _heroBannerIndexNotifier;
-  int? _hoveredIndicatorIndex;
-
-  // 缓存映射，用于存储已绘制的缩略图和最后绘制时间
-  final Map<String, Map<String, dynamic>> _thumbnailCache = {};
+  final _hoveredIndicatorIndex = ValueNotifier<int?>(null);
 
   // 追踪已绘制的文件路径
   // ignore: unused_field
@@ -213,6 +308,9 @@ class _DashboardHomePageState extends State<DashboardHomePage>
   void initState() {
     super.initState();
     _heroBannerIndexNotifier = ValueNotifier(0);
+    BangumiApiService.loginStatusNotifier.addListener(_onReviewLoginChanged);
+    QuarterlyReviewCache.instance.revision.addListener(_onReviewCacheChanged);
+    unawaited(_loadQuarterlyReviewSort());
 
     // 🔥 修复Flutter状态错误：将数据加载移到addPostFrameCallback中
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -229,6 +327,7 @@ class _DashboardHomePageState extends State<DashboardHomePage>
           forceRefreshRecommended: true,
           forceRefreshRandom: true,
           forceRefreshToday: true,
+          forceRefreshTrending: true,
         );
       }
 
@@ -285,8 +384,18 @@ class _DashboardHomePageState extends State<DashboardHomePage>
     return _todayAnimesScrollController!;
   }
 
+  @override
+  void onPageActivityChanged(bool active) {
+    if (active) {
+      _startAutoSwitch();
+    } else {
+      _autoSwitchTimer?.cancel();
+    }
+  }
+
   void _startAutoSwitch() {
     _autoSwitchTimer?.cancel();
+    if (!mounted || !isPageActive) return;
     _autoSwitchTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
       if (_isAutoSwitching && _recommendedItems.length >= 5 && mounted) {
         _currentHeroBannerIndex = (_currentHeroBannerIndex + 1) % 5;
@@ -308,11 +417,22 @@ class _DashboardHomePageState extends State<DashboardHomePage>
   }
 
   void _resumeAutoSwitch() {
+    if (!mounted) return;
     _isAutoSwitching = true;
     _startAutoSwitch();
   }
 
   void _setupProviderListeners() {
+    try {
+      _appearanceSettingsProviderRef =
+          Provider.of<AppearanceSettingsProvider>(context, listen: false);
+      _lastQuarterlyReviewEnabled =
+          _appearanceSettingsProviderRef!.showQuarterlyAnimeReview;
+      _appearanceSettingsProviderRef!.addListener(_onReviewAppearanceChanged);
+    } catch (e) {
+      debugPrint('DashboardHomePage: 添加外观设置监听器失败: $e');
+    }
+
     // 订阅 Provider 级 ready；ready 之前不监听 Provider 的即时变化
     try {
       _jellyfinProviderRef =
@@ -322,7 +442,6 @@ class _DashboardHomePageState extends State<DashboardHomePage>
         debugPrint('DashboardHomePage: 收到 Jellyfin Provider ready 信号');
         // ready 后立即清理待处理请求，避免重复刷新
         _pendingRefreshAfterLoad = false;
-        _pendingRefreshReason = '';
         // 先触发首次加载，避免激活监听后立即触发状态变化导致重复刷新
         _triggerLoadIfIdle('Jellyfin Provider ready');
         // 等待首次加载完成后再激活监听，避免加载期间的状态变化被捕获
@@ -344,7 +463,6 @@ class _DashboardHomePageState extends State<DashboardHomePage>
         debugPrint('DashboardHomePage: 收到 Emby Provider ready 信号');
         // ready 后立即清理待处理请求，避免重复刷新
         _pendingRefreshAfterLoad = false;
-        _pendingRefreshReason = '';
         // 先触发首次加载，避免激活监听后立即触发状态变化导致重复刷新
         _triggerLoadIfIdle('Emby Provider ready');
         // 等待首次加载完成后再激活监听，避免加载期间的状态变化被捕获
@@ -490,7 +608,6 @@ class _DashboardHomePageState extends State<DashboardHomePage>
     }
     if (_isLoadingRecommended) {
       _pendingRefreshAfterLoad = true;
-      _pendingRefreshReason = reason;
       return;
     }
     _loadData();
@@ -545,6 +662,7 @@ class _DashboardHomePageState extends State<DashboardHomePage>
     if (!mounted) return;
 
     final isCurrentlyActive = _isVideoPlayerActive();
+    if (isCurrentlyActive == _wasPlayerActive) return;
 
     // 检测播放器从活跃状态变为非活跃状态（退出播放器）
     if (_wasPlayerActive && !isCurrentlyActive) {
@@ -599,6 +717,11 @@ class _DashboardHomePageState extends State<DashboardHomePage>
     _watchHistoryDebounceTimer?.cancel();
     _watchHistoryDebounceTimer = Timer(const Duration(milliseconds: 800), () {
       if (!mounted) return;
+      if (_isVideoPlayerActive()) {
+        debugPrint(
+            'DashboardHomePage: player active, cancel delayed WatchHistory refresh');
+        return;
+      }
       debugPrint('DashboardHomePage: 触发最近观看刷新 - $reason');
       unawaited(_loadRecentContent(includeRemote: false));
     });
@@ -682,7 +805,6 @@ class _DashboardHomePageState extends State<DashboardHomePage>
       }
       if (_isLoadingRecommended) {
         _pendingRefreshAfterLoad = true;
-        _pendingRefreshReason = 'Jellyfin连接完成';
         debugPrint('DashboardHomePage: 正在加载中，记录Jellyfin刷新请求待稍后处理');
       } else {
         debugPrint('DashboardHomePage: Jellyfin连接完成，立即刷新数据');
@@ -744,7 +866,6 @@ class _DashboardHomePageState extends State<DashboardHomePage>
       }
       if (_isLoadingRecommended) {
         _pendingRefreshAfterLoad = true;
-        _pendingRefreshReason = 'Emby连接完成';
         debugPrint('DashboardHomePage: 正在加载中，记录Emby刷新请求待稍后处理');
       } else {
         debugPrint('DashboardHomePage: Emby连接完成，立即刷新数据');
@@ -788,7 +909,6 @@ class _DashboardHomePageState extends State<DashboardHomePage>
       if (!mounted || _isVideoPlayerActive()) return;
       if (_isLoadingRecommended) {
         _pendingRefreshAfterLoad = true;
-        _pendingRefreshReason = '弹弹play状态变化';
         return;
       }
       _loadData(forceRefreshRecommended: true);
@@ -805,6 +925,11 @@ class _DashboardHomePageState extends State<DashboardHomePage>
         Provider.of<WatchHistoryProvider>(context, listen: false);
     debugPrint(
         'DashboardHomePage: WatchHistory加载状态变化 - isLoaded: ${watchHistoryProvider.isLoaded}, mounted: $mounted');
+
+    if (_isVideoPlayerActive()) {
+      debugPrint('DashboardHomePage: player active, skip WatchHistory refresh');
+      return;
+    }
 
     if (watchHistoryProvider.isLoaded && mounted) {
       _scheduleWatchHistoryRefresh('WatchHistory变化');
@@ -854,6 +979,11 @@ class _DashboardHomePageState extends State<DashboardHomePage>
 
   @override
   void dispose() {
+    _appearanceSettingsProviderRef?.removeListener(_onReviewAppearanceChanged);
+    BangumiApiService.loginStatusNotifier.removeListener(_onReviewLoginChanged);
+    QuarterlyReviewCache.instance.revision
+        .removeListener(_onReviewCacheChanged);
+    _quarterlyReviewScrollController.dispose();
     debugPrint('DashboardHomePage: 开始销毁Widget');
 
     // 清理定时器和ValueNotifier
@@ -868,6 +998,7 @@ class _DashboardHomePageState extends State<DashboardHomePage>
     _wasPlayerActive = false;
 
     _heroBannerIndexNotifier.dispose();
+    _hoveredIndicatorIndex.dispose();
 
     // 移除监听器 - 使用初始化时保存的实例引用，避免在dispose中再次查找context
     try {
@@ -949,6 +1080,8 @@ class _DashboardHomePageState extends State<DashboardHomePage>
       _dandanplayScrollController = null;
       _randomRecommendationsScrollController?.dispose();
       _randomRecommendationsScrollController = null;
+      _trendingScrollController?.dispose();
+      _trendingScrollController = null;
 
       debugPrint('DashboardHomePage: ScrollController已销毁');
     } catch (e) {
@@ -962,8 +1095,59 @@ class _DashboardHomePageState extends State<DashboardHomePage>
   @override
   Widget build(BuildContext context) {
     super.build(context);
+    if (AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone) {
+      return _buildCupertinoHomePage();
+    }
     final bool isPhone = MediaQuery.of(context).size.shortestSide < 600;
     final homeSections = context.watch<HomeSectionsSettingsProvider>();
+
+    if (_isLargeScreenModeActive) {
+      return NipaplayLargeScreenPageScaffold(
+        title: '主页',
+        subtitle: '继续观看、排行榜、新番和媒体库推荐',
+        icon: Icons.home_rounded,
+        actions: [
+          NipaplayLargeScreenActionButton(
+            icon: Icons.refresh_rounded,
+            label: '刷新',
+            onPressed: _onDashboardRefreshPressed,
+          ),
+        ],
+        padding: const EdgeInsets.fromLTRB(30, 24, 30, 30),
+        headerBottomSpacing: 14,
+        child: Builder(
+          builder: (context) {
+            final configuredSections = _buildConfiguredSections(
+              isPhone: false,
+              sectionsProvider: homeSections,
+            );
+            final sections = <Widget>[
+              // 主页顶部推荐区（大图轮播 + 两张推荐小卡片，可在外观设置中开关）
+              if (_isAnyHomeHeroWidgetVisible(false)) ...[
+                Builder(builder: (_) => _buildHeroBanner(isPhone: false)),
+                const SizedBox(height: 24),
+              ],
+              if (_hasQuarterlyReviewForToday()) ...[
+                Builder(builder: (_) => _buildQuarterlyReviewSection()),
+                const SizedBox(height: 24),
+              ],
+              ...configuredSections,
+              const SizedBox(height: 56),
+            ];
+            return PrimaryScrollController(
+              controller: _mainScrollController,
+              child: ListView.builder(
+                controller: _mainScrollController,
+                padding: EdgeInsets.zero,
+                physics: const AlwaysScrollableScrollPhysics(),
+                itemCount: sections.length,
+                itemBuilder: (_, index) => sections[index],
+              ),
+            );
+          },
+        ),
+      );
+    }
 
     return Scaffold(
       backgroundColor: Colors.transparent,
@@ -976,33 +1160,37 @@ class _DashboardHomePageState extends State<DashboardHomePage>
         onPressed: _onDashboardRefreshPressed,
       ),
       floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
-      body: Consumer2<JellyfinProvider, EmbyProvider>(
-        builder: (context, jellyfinProvider, embyProvider, child) {
+      body: Builder(
+        builder: (context) {
           final configuredSections = _buildConfiguredSections(
             isPhone: isPhone,
             sectionsProvider: homeSections,
           );
-          return SingleChildScrollView(
+          final sections = <Widget>[
+            // 大海报推荐区域（大图轮播 + 两张推荐小卡片，可在外观设置中开关）
+            if (_isAnyHomeHeroWidgetVisible(isPhone)) ...[
+              Builder(builder: (_) => _buildHeroBanner(isPhone: isPhone)),
+              SizedBox(height: isPhone ? 16 : 32),
+            ],
+            if (_hasQuarterlyReviewForToday()) ...[
+              Builder(builder: (_) => _buildQuarterlyReviewSection()),
+              SizedBox(height: isPhone ? 16 : 32),
+            ],
+            ...configuredSections,
+
+            // 底部间距（大屏幕模式额外预留40px，避免被底部overlay遮挡）
+            SizedBox(
+              height: (isPhone ? 30 : 50) + (_isLargeScreenModeActive ? 40 : 0),
+            ),
+          ];
+          return PrimaryScrollController(
             controller: _mainScrollController,
-            physics: const AlwaysScrollableScrollPhysics(),
-            child: PrimaryScrollController(
+            child: ListView.builder(
               controller: _mainScrollController,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  // 大海报推荐区域
-                  _buildHeroBanner(isPhone: isPhone),
-
-                  SizedBox(height: isPhone ? 16 : 32),
-                  ...configuredSections,
-
-                  // 底部间距（大屏幕模式额外预留40px，避免被底部overlay遮挡）
-                  SizedBox(
-                    height: (isPhone ? 30 : 50) +
-                        (_isLargeScreenModeActive ? 40 : 0),
-                  ),
-                ],
-              ),
+              padding: EdgeInsets.zero,
+              physics: const AlwaysScrollableScrollPhysics(),
+              itemCount: sections.length,
+              itemBuilder: (_, index) => sections[index],
             ),
           );
         },

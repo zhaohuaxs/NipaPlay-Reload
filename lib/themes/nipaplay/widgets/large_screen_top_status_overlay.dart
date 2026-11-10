@@ -8,11 +8,15 @@ import 'package:flutter/material.dart';
 import 'package:nipaplay/services/dandanplay_service.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/large_screen_bottom_hint_overlay.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/large_screen_network_status.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/tv_safe_blur.dart';
+import 'package:nipaplay/widgets/media_server_network_image.dart';
 
 class NipaplayLargeScreenTopStatusOverlay extends StatefulWidget {
-  const NipaplayLargeScreenTopStatusOverlay({super.key, required this.isDarkMode});
+  const NipaplayLargeScreenTopStatusOverlay(
+      {super.key, required this.isDarkMode, this.useVideoBackground = false});
 
   final bool isDarkMode;
+  final bool useVideoBackground;
 
   @override
   State<NipaplayLargeScreenTopStatusOverlay> createState() =>
@@ -21,6 +25,9 @@ class NipaplayLargeScreenTopStatusOverlay extends StatefulWidget {
 
 class _NipaplayLargeScreenTopStatusOverlayState
     extends State<NipaplayLargeScreenTopStatusOverlay> {
+  static bool get _supportsBatteryPlugin =>
+      !kIsWeb && defaultTargetPlatform.name != 'ohos';
+
   final Battery _battery = Battery();
   Timer? _timer;
   StreamSubscription<BatteryState>? _batteryStateSubscription;
@@ -43,7 +50,7 @@ class _NipaplayLargeScreenTopStatusOverlayState
   }
 
   void _listenBatteryState() {
-    if (kIsWeb) {
+    if (!_supportsBatteryPlugin) {
       _batteryAvailable = false;
       return;
     }
@@ -71,7 +78,7 @@ class _NipaplayLargeScreenTopStatusOverlayState
   }
 
   Future<void> _refreshBattery() async {
-    if (!_batteryAvailable || kIsWeb) {
+    if (!_batteryAvailable || !_supportsBatteryPlugin) {
       return;
     }
     try {
@@ -130,7 +137,7 @@ class _NipaplayLargeScreenTopStatusOverlayState
       return Icon(Icons.account_circle_rounded, size: 20, color: textColor);
     }
     return ClipOval(
-      child: Image.network(
+      child: MediaServerAwareNetworkImage(
         avatarUrl,
         width: 20,
         height: 20,
@@ -165,18 +172,34 @@ class _NipaplayLargeScreenTopStatusOverlayState
   @override
   Widget build(BuildContext context) {
     final textColor = widget.isDarkMode ? Colors.white : Colors.black87;
-    final backgroundTint = widget.isDarkMode
-        ? Colors.black.withValues(alpha: 0.18)
-        : Colors.white.withValues(alpha: 0.14);
+    final backgroundColor = widget.isDarkMode ? Colors.black : Colors.white;
+    final backgroundTint = TvSafeBackdropFilter.shouldSkipBlur
+        ? backgroundColor
+        : backgroundColor.withValues(
+            alpha: widget.useVideoBackground
+                ? 0.5
+                : widget.isDarkMode
+                    ? 0.18
+                    : 0.14,
+          );
+    final dividerColor = widget.isDarkMode
+        ? Colors.white.withValues(alpha: 0.14)
+        : Colors.black.withValues(alpha: 0.12);
     final clockText = _formatClock(_now);
 
     return SizedBox(
       height: kNipaplayLargeScreenBottomHintHeight,
       child: ClipRect(
-        child: BackdropFilter(
+        // 电视上使用不透明底色，并跳过常驻顶栏模糊。
+        child: TvSafeBackdropFilter(
           filter: ImageFilter.blur(sigmaX: 25, sigmaY: 25),
-          child: ColoredBox(
-            color: backgroundTint,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: backgroundTint,
+              border: Border(
+                bottom: BorderSide(color: dividerColor, width: 1),
+              ),
+            ),
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 12),
               child: Align(

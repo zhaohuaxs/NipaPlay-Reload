@@ -2,6 +2,7 @@
 #include <new>
 #include <cstddef>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
@@ -10,6 +11,8 @@
 #include "example_calculator.h"
 #include "danmaku_layout.h"
 #include "similarity_engine.h"
+#include "danmaku_parser.h"
+#include "subtitle_parser.h"
 
 // ──── 辅助：NpString 内部分配（C++ 内部函数，非 extern "C"） ────
 NpString np_string_alloc(std::string_view s);
@@ -41,6 +44,10 @@ NIPAPLAY_NATIVE_EXPORT void np_string_free(NpString* str) {
         str->data = nullptr;
         str->length = 0;
     }
+}
+
+NIPAPLAY_NATIVE_EXPORT void np_free_ptr(void* ptr) {
+    std::free(ptr);
 }
 
 // ──── 示例模块：ExampleCalculator ────
@@ -288,17 +295,39 @@ NIPAPLAY_NATIVE_EXPORT NpResult np_layout_frame_raw(
     }
 }
 
-// ──── 弹幕相似度引擎：SimilarityEngine ────
+// ──── 弹幕相似度引擎：SimilarityEngine（有状态对象）───
+
+NIPAPLAY_NATIVE_EXPORT NpHandle np_sim_create(void) {
+    try {
+        auto* obj = new nipaplay::native::SimilarityEngine();
+        return static_cast<NpHandle>(obj);
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+NIPAPLAY_NATIVE_EXPORT void np_sim_destroy(NpHandle handle) {
+    if (handle) [[likely]] {
+        auto* obj = static_cast<nipaplay::native::SimilarityEngine*>(handle);
+        delete obj;
+    }
+}
 
 NIPAPLAY_NATIVE_EXPORT NpResult np_sim_check_batch(
-    const char* items_json, const char* config_json, NpString* output)
+    NpHandle handle, const char* items_json, const char* config_json, NpString* output)
 {
     try {
+        if (!handle) [[unlikely]] {
+            return {NP_ERR_NULL_PTR, "null handle"};
+        }
         if (!items_json || !config_json || !output) [[unlikely]] {
             return {NP_ERR_NULL_PTR, "null pointer argument"};
         }
+        auto* engine = static_cast<nipaplay::native::SimilarityEngine*>(handle);
         std::string result = nipaplay::native::similarity_check_batch_json(
-            items_json, config_json);
+            *engine, items_json, config_json);
         *output = np_string_alloc(result);
         if (!output->data) [[unlikely]] {
             return {NP_ERR_OOM, "failed to allocate NpString"};
@@ -323,4 +352,213 @@ NIPAPLAY_NATIVE_EXPORT double np_sim_pair_similarity(
     } catch (...) {
         return 0.0;
     }
+}
+
+// ──── 弹幕解析模块：DanmakuParser ────
+
+NIPAPLAY_NATIVE_EXPORT NpResult np_danmaku_parse_xml(
+    const char* xml_content, int64_t content_len,
+    NpString* output_json)
+{
+    try {
+        if (!xml_content || !output_json) [[unlikely]] {
+            return {NP_ERR_NULL_PTR, "null pointer argument"};
+        }
+        if (content_len < 0) [[unlikely]] {
+            return {NP_ERR_INVALID_ARG, "content_len must be >= 0"};
+        }
+
+        std::string_view xml_view(xml_content, static_cast<size_t>(content_len));
+        std::string json_result = nipaplay::DanmakuParser::parseXmlToJson(xml_view);
+
+        *output_json = np_string_alloc(json_result);
+        if (!output_json->data) [[unlikely]] {
+            return {NP_ERR_OOM, "failed to allocate NpString"};
+        }
+        return {NP_OK, nullptr};
+    } catch (const std::bad_alloc&) {
+        return {NP_ERR_OOM, "out of memory"};
+    } catch (const std::exception& e) {
+        return {NP_ERR_INTERNAL, saveErrorMessage(e.what())};
+    } catch (...) {
+        return {NP_ERR_INTERNAL, "unknown C++ exception"};
+    }
+}
+
+NIPAPLAY_NATIVE_EXPORT NpResult np_danmaku_parse_json(
+    const char* json_content, int64_t content_len,
+    NpString* output_json)
+{
+    try {
+        if (!json_content || !output_json) [[unlikely]] {
+            return {NP_ERR_NULL_PTR, "null pointer argument"};
+        }
+        if (content_len < 0) [[unlikely]] {
+            return {NP_ERR_INVALID_ARG, "content_len must be >= 0"};
+        }
+
+        std::string_view json_view(json_content, static_cast<size_t>(content_len));
+        std::string json_result = nipaplay::DanmakuParser::parseJsonToStandardized(json_view);
+
+        *output_json = np_string_alloc(json_result);
+        if (!output_json->data) [[unlikely]] {
+            return {NP_ERR_OOM, "failed to allocate NpString"};
+        }
+        return {NP_OK, nullptr};
+    } catch (const std::bad_alloc&) {
+        return {NP_ERR_OOM, "out of memory"};
+    } catch (const std::exception& e) {
+        return {NP_ERR_INTERNAL, saveErrorMessage(e.what())};
+    } catch (...) {
+        return {NP_ERR_INTERNAL, "unknown C++ exception"};
+    }
+}
+
+// ──── 字幕解析模块：SubtitleParser ────
+
+// 辅助：为 NpSubtitleParseResult 分配独立的错误消息
+// 使用 strdup 确保生命周期独立于 thread-local 缓冲区
+// 返回的指针需由 np_subtitle_free_result 释放
+static const char* allocErrorMessage(const char* msg) {
+    if (!msg) return nullptr;
+    // MSVC 报 POSIX 弃用警告，使用 _strdup 替代
+#if defined(_MSC_VER)
+    auto* copy = _strdup(msg);
+#else
+    auto* copy = strdup(msg);
+#endif
+    return copy ? copy : "allocation failed";
+}
+
+NIPAPLAY_NATIVE_EXPORT NpSubtitleParseResult* np_subtitle_parse_bytes(
+    const uint8_t* data, int32_t len, const char* hint_path)
+{
+    // 分配结果结构（零初始化）
+    auto* result = static_cast<NpSubtitleParseResult*>(std::calloc(1, sizeof(NpSubtitleParseResult)));
+    if (!result) [[unlikely]] {
+        return nullptr;
+    }
+
+    try {
+        if (!data || len <= 0) [[unlikely]] {
+            result->code = NP_ERR_INVALID_ARG;
+            result->error_message = allocErrorMessage("invalid data/len");
+            result->format_code = -1;
+            return result;
+        }
+
+        // 调用 C++ 解析器
+        auto hint_sv = hint_path ? std::string_view(hint_path) : std::string_view{};
+        auto output = nipaplay::native::SubtitleParser::parseBytes(data, len, hint_sv);
+
+        // 填充 detected_encoding
+        result->detected_encoding = np_string_alloc(output.detected_encoding);
+        if (!result->detected_encoding.data) [[unlikely]] {
+            result->code = NP_ERR_OOM;
+            result->error_message = allocErrorMessage("failed to allocate encoding string");
+            return result;
+        }
+
+        // 填充 format_code
+        result->format_code = static_cast<int32_t>(output.format);
+
+        // 填充 entries 数组
+        const auto count = static_cast<int32_t>(output.entries.size());
+        if (count > 0) {
+            auto* entries = static_cast<NpSubtitleEntry*>(
+                std::calloc(static_cast<size_t>(count), sizeof(NpSubtitleEntry)));
+            if (!entries) [[unlikely]] {
+                // 已分配的 detected_encoding 需释放
+                np_string_free(&result->detected_encoding);
+                result->code = NP_ERR_OOM;
+                result->error_message = allocErrorMessage("failed to allocate entries array");
+                return result;
+            }
+
+            for (int32_t i = 0; i < count; ++i) {
+                const auto& src = output.entries[static_cast<size_t>(i)];
+                auto& dst = entries[i];
+
+                dst.start_time_ms = src.start_time_ms;
+                dst.end_time_ms   = src.end_time_ms;
+
+                dst.content = np_string_alloc(src.content);
+                if (!dst.content.data) [[unlikely]] goto oom_cleanup;
+
+                dst.style = np_string_alloc(src.style);
+                if (!dst.style.data) [[unlikely]] goto oom_cleanup;
+
+                dst.name = np_string_alloc(src.name);
+                if (!dst.name.data) [[unlikely]] goto oom_cleanup;
+            }
+
+            result->entries = entries;
+            result->entry_count = count;
+        } else {
+            result->entries = nullptr;
+            result->entry_count = 0;
+        }
+
+        result->code = NP_OK;
+        result->error_message = nullptr;
+        return result;
+
+    oom_cleanup:
+        // 部分分配失败：回滚已分配的 NpString
+        if (result->entries) {
+            for (int32_t i = 0; i < count; ++i) {
+                np_string_free(&result->entries[i].content);
+                np_string_free(&result->entries[i].style);
+                np_string_free(&result->entries[i].name);
+            }
+            std::free(result->entries);
+            result->entries = nullptr;
+        }
+        np_string_free(&result->detected_encoding);
+        result->code = NP_ERR_OOM;
+        result->error_message = allocErrorMessage("out of memory during entry allocation");
+        return result;
+
+    } catch (const std::bad_alloc&) {
+        result->code = NP_ERR_OOM;
+        result->error_message = allocErrorMessage("out of memory");
+        return result;
+    } catch (const std::exception& e) {
+        result->code = NP_ERR_INTERNAL;
+        result->error_message = allocErrorMessage(e.what());
+        return result;
+    } catch (...) {
+        result->code = NP_ERR_INTERNAL;
+        result->error_message = allocErrorMessage("unknown C++ exception");
+        return result;
+    }
+}
+
+NIPAPLAY_NATIVE_EXPORT void np_subtitle_free_result(
+    NpSubtitleParseResult* result)
+{
+    if (!result) [[unlikely]] return;
+
+    // 释放 entries 数组中所有 NpString
+    if (result->entries) {
+        for (int32_t i = 0; i < result->entry_count; ++i) {
+            np_string_free(&result->entries[i].content);
+            np_string_free(&result->entries[i].style);
+            np_string_free(&result->entries[i].name);
+        }
+        std::free(result->entries);
+        result->entries = nullptr;
+    }
+
+    // 释放 detected_encoding
+    np_string_free(&result->detected_encoding);
+
+    // 释放 error_message（由 allocErrorMessage/strdup 分配）
+    if (result->error_message) {
+        std::free(const_cast<char*>(result->error_message));
+        result->error_message = nullptr;
+    }
+
+    // 释放 result 本身
+    std::free(result);
 }

@@ -3,25 +3,65 @@ import 'package:http/http.dart' as http;
 import 'package:nipaplay/services/debug_log_service.dart';
 import 'package:flutter/foundation.dart';
 import 'package:nipaplay/services/web_remote_access_service.dart';
+import 'package:nipaplay/services/nipaplay_server_router.dart';
 
 class LogShareService {
-  static const String _baseUrl = 'https://www.aimes-soft.com/nipaplay.php';  // 这个地址是正确的
+  static const String _sharePath = '/nipaplay.php';
+
+  /// 日志分享服务只部署在官方站点上，跟随官方主/备用线路。
+  static Future<String> _resolveBaseUrl() async {
+    final siteBase = await NipaplayServerRouter.instance.officialSiteBase();
+    return '$siteBase$_sharePath';
+  }
+
+  /// 将服务器返回的 URL 中的 localhost 地址重写为官方站点地址。
+  /// 例如 http://localhost:8080/view?id=abc → https://nipaplay.aimes-soft.com/nipaplay.php?id=abc
+  static String _toPublicUrl(String url, String baseUrl) {
+    try {
+      final uri = Uri.parse(url);
+      final host = uri.host.toLowerCase();
+      if (host == 'localhost' ||
+          host == '127.0.0.1' ||
+          host == '::1' ||
+          host.startsWith('192.168.') ||
+          host.startsWith('10.') ||
+          host.startsWith('172.')) {
+        // 提取 id 参数（或其他查询参数），用官方站点地址重建 URL。
+        final id = uri.queryParameters['id'];
+        if (id != null && id.isNotEmpty) {
+          return '$baseUrl?id=$id';
+        }
+        // 如果 URL 路径中包含 ID（如 /view/abc），提取最后一段作为 id。
+        final segments = uri.pathSegments.where((s) => s.isNotEmpty).toList();
+        if (segments.isNotEmpty) {
+          final lastSegment = segments.last;
+          return '$baseUrl?id=$lastSegment';
+        }
+      }
+    } catch (_) {
+      // 解析失败时保持原 URL。
+    }
+    return url;
+  }
 
   /// 上传日志并获取查看URL
   static Future<String> uploadLogs() async {
     try {
       final logService = DebugLogService();
-      final logs = logService.logEntries.map((entry) => {
-        'timestamp': entry.timestamp.toIso8601String(),
-        'level': entry.level,
-        'tag': entry.tag,
-        'message': entry.message,
-      }).toList();
+      final logs = logService.logEntries
+          .map((entry) => {
+                'timestamp': entry.timestamp.toIso8601String(),
+                'level': entry.level,
+                'tag': entry.tag,
+                'message': entry.message,
+              })
+          .toList();
 
       debugPrint('[LogShareService] 开始上传日志...');
-      
+
+      final baseUrl = await _resolveBaseUrl();
       final response = await http.post(
-        WebRemoteAccessService.proxyUri(Uri.parse(_baseUrl)),
+        WebRemoteAccessService.proxyUri(Uri.parse(baseUrl)),
         headers: {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
@@ -37,7 +77,9 @@ class LogShareService {
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         if (data['success'] == true && data['viewUrl'] != null) {
-          final viewUrl = data['viewUrl'];
+          final rawUrl = data['viewUrl'] as String;
+          // 服务器可能返回 localhost 内网地址，将其重写为官方站点地址。
+          final viewUrl = _toPublicUrl(rawUrl, baseUrl);
           debugPrint('[LogShareService] 日志上传成功，查看URL: $viewUrl');
           return viewUrl;
         } else {
@@ -46,7 +88,7 @@ class LogShareService {
           throw '服务器返回错误: $error';
         }
       }
-      
+
       debugPrint('[LogShareService] 服务器返回非200状态码: ${response.statusCode}');
       throw '上传失败: HTTP ${response.statusCode}';
     } catch (e) {
@@ -54,4 +96,4 @@ class LogShareService {
       throw '上传日志失败: $e';
     }
   }
-} 
+}

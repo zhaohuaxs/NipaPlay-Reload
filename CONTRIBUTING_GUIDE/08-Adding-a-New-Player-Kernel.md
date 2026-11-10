@@ -4,6 +4,10 @@ NipaPlay-Reload 的核心优势之一是其灵活的播放器架构，它允许�
 
 这是一个具有挑战性但非常有价值的贡献。在开始之前，请确保你已经熟悉了前面章节介绍的所有基础贡献流程。
 
+> **当前重点方向：Erika 自研内核**
+>
+> [Erika](https://github.com/AimesSoft/Erika) 是 Rust 实现的自研播放内核。NipaPlay 通过固定的 Erika release pin 接入它；桌面上的 Erika 仓库可能领先于 NipaPlay 当前集成版本。Erika 已覆盖 NipaPlay 的所有原生客户端平台，**仅 Linux 不支持**；仅 tvOS 会强制使用 Erika，Android TV 仍可选择其它已支持内核。HDR、硬解和真机验收细节仍按平台不同。开始跨仓库工作前请阅读 [Erika 跨仓库开发](13-Erika-Cross-Repository-Development.md) 和 [平台能力矩阵](../Documentation/platform-matrix.md)。
+
 ## 播放器抽象层架构解析
 
 在动手编码前，理解我们是如何做到“可插拔”播放器的是至关重要的。核心思想在于**抽象**和**适配**。我们不让UI代码直接与某个具体的播放器SDK（如 MDK、MediaKit）对话，而是通过一个我们自己定义的“标准播放器接口”来沟通。

@@ -8,12 +8,25 @@ import 'dart:convert';
 import 'dart:async';
 import 'video_player_state.dart';
 import 'danmaku_dialog_manager.dart'; // 导入弹幕对话框管理器
+import 'package:nipaplay/services/desktop_player_window_service.dart';
+
+@visibleForTesting
+bool shouldBlockDesktopHotkeys({
+  required bool isLargeScreenModeActive,
+  required bool hasActiveOverlay,
+  required bool isEditableTextFocused,
+  required bool playerHotkeysSuppressed,
+}) {
+  return isLargeScreenModeActive ||
+      hasActiveOverlay ||
+      isEditableTextFocused ||
+      playerHotkeysSuppressed;
+}
 
 /// 热键管理服务，用于替代Flutter内部的键盘事件处理
 class HotkeyService extends ChangeNotifier {
   static final HotkeyService _instance = HotkeyService._internal();
   static const String _shortcutsKey = 'keyboard_shortcuts';
-  static const int _debounceTime = 300; // 防抖时间（毫秒）
   static const int _longPressThreshold = 800; // 长按阈值（毫秒）
 
   bool get _supportsHotkeys {
@@ -26,6 +39,8 @@ class HotkeyService extends ChangeNotifier {
       case TargetPlatform.android:
       case TargetPlatform.iOS:
       case TargetPlatform.fuchsia:
+        return false;
+      default:
         return false;
     }
   }
@@ -46,8 +61,13 @@ class HotkeyService extends ChangeNotifier {
   // 上下文，用于访问Provider
   BuildContext? _context;
 
+  // 大屏幕模式拥有独立的焦点与遥控输入层，激活时必须屏蔽全部旧热键。
+  bool _isLargeScreenModeActive = false;
+
   // overlay 计数器，>0 时表示有对话框/overlay 在视频播放界面上方
   static int _overlayCount = 0;
+
+  static bool get hasActiveOverlay => _overlayCount > 0;
 
   /// overlay 打开时调用：0→1 时注销热键
   static void overlayPush() {
@@ -69,6 +89,22 @@ class HotkeyService extends ChangeNotifier {
   Timer? _longPressTimer;
   bool _isForwardKeyPressed = false;
   bool _isSpeedBoostActive = false;
+
+  void setLargeScreenModeActive(bool isActive) {
+    if (_isLargeScreenModeActive == isActive) {
+      return;
+    }
+    _isLargeScreenModeActive = isActive;
+    if (!isActive) {
+      return;
+    }
+
+    _isForwardKeyPressed = false;
+    _longPressTimer?.cancel();
+    if (_isSpeedBoostActive) {
+      _stopSpeedBoost();
+    }
+  }
 
   // 初始化热键服务
   Future<void> initialize(BuildContext context) async {
@@ -92,6 +128,10 @@ class HotkeyService extends ChangeNotifier {
   // 注册热键
   Future<void> registerHotkeys() async {
     if (!_supportsHotkeys) return;
+    if (hasActiveOverlay) {
+      await unregisterHotkeys();
+      return;
+    }
     // 先清理已注册的热键，再重新注册
     if (_registeredHotkeys.isNotEmpty) {
       //debugPrint('[HotkeyService] 清理现有热键后重新注册');
@@ -106,12 +146,12 @@ class HotkeyService extends ChangeNotifier {
       _registeredHotkeys.clear();
       return;
     }
+    await hotKeyManager.unregisterAll();
     if (_registeredHotkeys.isEmpty) {
       //debugPrint('[HotkeyService] 没有已注册的热键需要注销');
       return;
     }
     //debugPrint('[HotkeyService] 开始注销 ${_registeredHotkeys.length} 个热键');
-    await hotKeyManager.unregisterAll();
     // 清空已注册列表，以便下次可以重新注册
     _registeredHotkeys.clear();
     //debugPrint('[HotkeyService] 热键注销完成');
@@ -132,10 +172,18 @@ class HotkeyService extends ChangeNotifier {
       'toggle_danmaku': 'D',
       'volume_up': '↑',
       'volume_down': '↓',
+      'speed_up': ']',
+      'speed_down': '[',
+      'speed_reset': '退格',
       'previous_episode': 'Shift+←',
       'next_episode': 'Shift+→',
       'send_danmaku': 'C', // 添加发送弹幕快捷键
       'skip': 'S', // 添加跳过快捷键
+      'step_forward': 'E', // 逐帧前进
+      'step_backward': 'Q', // 逐帧后退
+      'resize_to_video': 'R', // 窗口适配视频
+      'toggle_picture_in_picture': 'P', // 切换画中画
+      'toggle_detached_player': 'W', // 移入/移回独立窗口
     });
 
     if (savedShortcutsString != null) {
@@ -175,6 +223,10 @@ class HotkeyService extends ChangeNotifier {
   // 注册所有热键
   Future<void> registerAllHotkeys() async {
     if (!_supportsHotkeys) return;
+    if (hasActiveOverlay) {
+      await unregisterHotkeys();
+      return;
+    }
     //debugPrint('[HotkeyService] 开始注册所有热键');
     // 先清除所有已注册的热键
     await hotKeyManager.unregisterAll();
@@ -201,6 +253,10 @@ class HotkeyService extends ChangeNotifier {
     // 注册音量减少热键
     await _registerHotkey('volume_down', '音量-', _handleVolumeDown);
 
+    await _registerHotkey('speed_up', '倍速 +0.1', () => _changePlaybackRate(0.1));
+    await _registerHotkey('speed_down', '倍速 -0.1', () => _changePlaybackRate(-0.1));
+    await _registerHotkey('speed_reset', '恢复 1 倍速', () => _changePlaybackRate(null));
+
     // 注册上一集热键
     await _registerHotkey('previous_episode', '上一集', _handlePreviousEpisode);
 
@@ -212,6 +268,29 @@ class HotkeyService extends ChangeNotifier {
 
     // 注册跳过热键
     await _registerHotkey('skip', '跳过', _handleSkip);
+
+    // 注册逐帧前进热键
+    await _registerHotkey('step_forward', '逐帧前进', _handleStepForward);
+
+    // 注册逐帧后退热键
+    await _registerHotkey('step_backward', '逐帧后退', _handleStepBackward);
+
+    // 注册窗口适配视频热键
+    await _registerHotkey('resize_to_video', '窗口适配视频', _handleResizeToVideo);
+
+    // 注册画中画热键
+    await _registerHotkey(
+      'toggle_picture_in_picture',
+      '切换画中画',
+      _handleTogglePictureInPicture,
+    );
+
+    // 注册独立窗口热键
+    await _registerHotkey(
+      'toggle_detached_player',
+      '切换独立窗口',
+      _handleToggleDetachedPlayer,
+    );
 
     // 注册ESC键退出全屏
     await _registerEscapeKey();
@@ -247,7 +326,7 @@ class HotkeyService extends ChangeNotifier {
       await hotKeyManager.register(
         hotKey,
         keyDownHandler: (HotKey hotKey) {
-          if (_shouldBlockHotkeyInTextInput()) {
+          if (_shouldBlockHotkey()) {
             return;
           }
           ////debugPrint('[HotkeyService] 热键触发: $description ($keyString)');
@@ -270,16 +349,17 @@ class HotkeyService extends ChangeNotifier {
     return focusedContext.widget is EditableText;
   }
 
-  bool _shouldBlockHotkeyInTextInput() {
-    if (_isEditableTextFocused()) {
+  bool _shouldBlockHotkey() {
+    if (_isLargeScreenModeActive) {
       return true;
     }
-    // 播放器内菜单打开时禁用热键
     final videoState = _getVideoPlayerState();
-    if (videoState != null && videoState.hotkeysSuppressed) {
-      return true;
-    }
-    return false;
+    return shouldBlockDesktopHotkeys(
+      isLargeScreenModeActive: false,
+      hasActiveOverlay: hasActiveOverlay,
+      isEditableTextFocused: _isEditableTextFocused(),
+      playerHotkeysSuppressed: videoState?.hotkeysSuppressed ?? false,
+    );
   }
 
   bool _isShiftPressed() {
@@ -411,6 +491,10 @@ class HotkeyService extends ChangeNotifier {
         return PhysicalKeyboardKey.end;
       case 'Tab':
         return PhysicalKeyboardKey.tab;
+      case '[':
+        return PhysicalKeyboardKey.bracketLeft;
+      case ']':
+        return PhysicalKeyboardKey.bracketRight;
       case '退格':
         return PhysicalKeyboardKey.backspace;
       case 'Del':
@@ -657,6 +741,11 @@ class HotkeyService extends ChangeNotifier {
   }
 
   void _handleFullscreen() {
+    final windowService = DesktopPlayerWindowService.instance;
+    if (windowService.isPlayerDetached) {
+      unawaited(windowService.toggleDetachedFullscreen());
+      return;
+    }
     final videoState = _getVideoPlayerState();
     if (videoState != null) {
       videoState.toggleFullscreen();
@@ -698,6 +787,15 @@ class HotkeyService extends ChangeNotifier {
     if (videoState != null) {
       videoState.toggleDanmakuVisible();
     }
+  }
+
+  void _changePlaybackRate(double? delta) {
+    final state = _getVideoPlayerState();
+    if (state == null || !state.hasVideo) return;
+    final rate = delta == null
+        ? 1.0
+        : ((state.playbackRate * 10).round() + (delta * 10).round()) / 10;
+    unawaited(state.setPlaybackRate(rate));
   }
 
   void _handleVolumeUp() {
@@ -751,6 +849,68 @@ class HotkeyService extends ChangeNotifier {
     }
   }
 
+  void _handleStepForward() {
+    final videoState = _getVideoPlayerState();
+    if (videoState != null) {
+      videoState.stepForward();
+    }
+  }
+
+  void _handleStepBackward() {
+    final videoState = _getVideoPlayerState();
+    if (videoState != null) {
+      videoState.stepBackward();
+    }
+  }
+
+  void _handleResizeToVideo() {
+    final windowService = DesktopPlayerWindowService.instance;
+    if (windowService.isPlayerDetached) {
+      unawaited(windowService.resizeDetachedWindowToVideo());
+      return;
+    }
+    final videoState = _getVideoPlayerState();
+    if (videoState != null) {
+      videoState.resizeWindowToVideoSize();
+    }
+  }
+
+  void _handleTogglePictureInPicture() {
+    final windowService = DesktopPlayerWindowService.instance;
+    if (!DesktopPlayerWindowService.isFeatureEnabled) return;
+
+    if (windowService.isPlayerDetached) {
+      debugPrint('[HotkeyService] 切换画中画: 当前播放器已在独立窗口');
+      unawaited(windowService.togglePictureInPicture());
+      return;
+    }
+
+    final context = _context;
+    final videoState = _getVideoPlayerState();
+    if (context == null || videoState == null || !videoState.hasVideo) return;
+    debugPrint('[HotkeyService] 切换画中画: 从主窗口拆离并进入画中画');
+    unawaited(
+      windowService.detachAndEnterPictureInPicture(context, videoState),
+    );
+  }
+
+  void _handleToggleDetachedPlayer() {
+    final windowService = DesktopPlayerWindowService.instance;
+    if (!DesktopPlayerWindowService.isFeatureEnabled) return;
+
+    if (windowService.isPlayerDetached) {
+      debugPrint('[HotkeyService] 切换独立窗口: 将播放器移回主窗口');
+      unawaited(windowService.returnPlayerToMain());
+      return;
+    }
+
+    final context = _context;
+    final videoState = _getVideoPlayerState();
+    if (context == null || videoState == null || !videoState.hasVideo) return;
+    debugPrint('[HotkeyService] 切换独立窗口: 将播放器移入独立窗口');
+    unawaited(windowService.detachPlayer(context, videoState));
+  }
+
   // 注册快进热键，支持长按倍速
   Future<void> _registerForwardHotkeyWithLongPress() async {
     final keyString = _shortcuts['forward'];
@@ -773,9 +933,15 @@ class HotkeyService extends ChangeNotifier {
       await hotKeyManager.register(
         hotKey,
         keyDownHandler: (HotKey hotKey) {
+          if (_shouldBlockHotkey()) {
+            return;
+          }
           _handleForwardKeyDown();
         },
         keyUpHandler: (HotKey hotKey) {
+          if (_shouldBlockHotkey()) {
+            return;
+          }
           _handleForwardKeyUp();
         },
       );
@@ -787,7 +953,7 @@ class HotkeyService extends ChangeNotifier {
   }
 
   void _handleForwardKeyDown() {
-    if (_shouldBlockHotkeyInTextInput()) {
+    if (_shouldBlockHotkey()) {
       return;
     }
     _isForwardKeyPressed = true;
@@ -796,7 +962,8 @@ class HotkeyService extends ChangeNotifier {
     _longPressTimer?.cancel();
 
     // 启动长按检测计时器
-    _longPressTimer = Timer(Duration(milliseconds: _longPressThreshold), () {
+    _longPressTimer =
+        Timer(const Duration(milliseconds: _longPressThreshold), () {
       if (_isForwardKeyPressed && !_isSpeedBoostActive) {
         _startSpeedBoost();
       }
@@ -804,9 +971,8 @@ class HotkeyService extends ChangeNotifier {
   }
 
   void _handleForwardKeyUp() {
-    if (_shouldBlockHotkeyInTextInput()) {
-      return;
-    }
+    // ✅ 修复：无论是否 block，倍速和按键状态必须先重置，
+    // 否则 keyUp 被 block 吞掉时会导致倍速卡住不恢复。
     _isForwardKeyPressed = false;
 
     // 取消长按计时器
@@ -815,10 +981,16 @@ class HotkeyService extends ChangeNotifier {
     if (_isSpeedBoostActive) {
       // 如果正在倍速播放，停止倍速
       _stopSpeedBoost();
-    } else {
-      // 如果没有触发倍速（短按），执行快进
-      _handleForward();
+      // 倍速已停止，不再执行快进
+      return;
     }
+
+    // block 检查仅影响"短按快进"逻辑（倍速已在上面的分支中处理）
+    if (_shouldBlockHotkey()) {
+      return;
+    }
+    // 如果没有触发倍速（短按），执行快进
+    _handleForward();
   }
 
   void _startSpeedBoost() {
@@ -840,7 +1012,15 @@ class HotkeyService extends ChangeNotifier {
   }
 
   void _handleEscape() {
-    if (_shouldBlockHotkeyInTextInput()) {
+    if (_shouldBlockHotkey()) {
+      return;
+    }
+    final windowService = DesktopPlayerWindowService.instance;
+    final detachedWindow = windowService.activeWindow;
+    if (windowService.isPlayerDetached &&
+        detachedWindow != null &&
+        detachedWindow.isFullscreen) {
+      unawaited(detachedWindow.setFullscreen(false));
       return;
     }
     final videoState = _getVideoPlayerState();
@@ -854,7 +1034,9 @@ class HotkeyService extends ChangeNotifier {
     ////debugPrint('[HotkeyService] 更新快捷键: $action -> $shortcut');
     _shortcuts[action] = shortcut;
     await saveShortcuts();
-    await registerAllHotkeys(); // 重新注册所有热键
+    if (!hasActiveOverlay) {
+      await registerAllHotkeys(); // 重新注册所有热键
+    }
     notifyListeners(); // 通知监听者
   }
 

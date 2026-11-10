@@ -1,13 +1,49 @@
+import 'package:flutter/cupertino.dart' as cupertino;
 import 'package:flutter/material.dart';
 import 'package:kmbal_ionicons/kmbal_ionicons.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
+import 'package:nipaplay/media_library/unified_library_management_model.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_dropdown.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/search_bar_action_button.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_media_search_toolbar.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
 
 enum LocalLibrarySortType {
+  comprehensive,
   name,
   dateAdded,
   rating,
+}
+
+class LocalLibraryActionControl extends StatelessWidget {
+  const LocalLibraryActionControl({
+    super.key,
+    required this.label,
+    required this.desktopIcon,
+    required this.phoneIcon,
+    required this.onPressed,
+    this.isDestructive = false,
+  });
+
+  final String label;
+  final IconData desktopIcon;
+  final IconData phoneIcon;
+  final VoidCallback? onPressed;
+  final bool isDestructive;
+
+  @override
+  Widget build(BuildContext context) {
+    return AdaptiveMediaIconButton(
+      desktopIcon: desktopIcon,
+      phoneIcon: phoneIcon,
+      tooltip: label,
+      color: isDestructive ? Colors.redAccent : null,
+      onPressed: onPressed,
+    );
+  }
 }
 
 class LocalLibraryControlBar extends StatefulWidget {
@@ -20,7 +56,12 @@ class LocalLibraryControlBar extends StatefulWidget {
   final VoidCallback? onBack;
   final String? title;
   final bool showSort;
-  final List<Widget>? trailingActions;
+  final bool showComprehensiveSort;
+  final List<LocalLibraryActionControl>? trailingActions;
+  final LibraryManagementViewMode? viewMode;
+  final VoidCallback? onToggleViewMode;
+  final bool? showUnwatchedOnly;
+  final VoidCallback? onToggleUnwatchedOnly;
 
   LocalLibraryControlBar({
     super.key,
@@ -33,7 +74,12 @@ class LocalLibraryControlBar extends StatefulWidget {
     this.onBack,
     this.title,
     this.showSort = true,
+    this.showComprehensiveSort = false,
     this.trailingActions,
+    this.viewMode,
+    this.onToggleViewMode,
+    this.showUnwatchedOnly,
+    this.onToggleUnwatchedOnly,
   });
 
   @override
@@ -43,7 +89,6 @@ class LocalLibraryControlBar extends StatefulWidget {
 class _LocalLibraryControlBarState extends State<LocalLibraryControlBar> {
   final GlobalKey _dropdownKey = GlobalKey();
   final FocusNode _searchFocusNode = FocusNode();
-  bool _isBackHovered = false;
 
   @override
   void initState() {
@@ -63,21 +108,16 @@ class _LocalLibraryControlBarState extends State<LocalLibraryControlBar> {
   Widget build(BuildContext context) {
     assert(!widget.showSort ||
         (widget.currentSort != null && widget.onSortChanged != null));
+    assert((widget.viewMode == null) == (widget.onToggleViewMode == null));
+    assert((widget.showUnwatchedOnly == null) ==
+        (widget.onToggleUnwatchedOnly == null));
+    if (AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone) {
+      return _buildPhoneControlBar(context);
+    }
+
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final currentSort = widget.currentSort ?? LocalLibrarySortType.dateAdded;
 
-    final activeColor = AppAccentColors.current;
-    final idleBorderColor = isDark
-        ? Colors.white.withValues(alpha: 0.1)
-        : Colors.black.withValues(alpha: 0.1);
-
-    // 提高背景对比度，日间模式下使用纯白
-    final bgColor =
-        isDark ? Colors.white.withValues(alpha: 0.12) : Colors.white;
-
-    final textColor = isDark
-        ? Colors.white.withValues(alpha: 0.8)
-        : Colors.black.withValues(alpha: 0.7);
     final primaryTextColor = isDark ? Colors.white : Colors.black;
 
     return Container(
@@ -86,27 +126,12 @@ class _LocalLibraryControlBarState extends State<LocalLibraryControlBar> {
       child: Row(
         children: [
           if (widget.showBackButton) ...[
-            MouseRegion(
-              onEnter: (_) => setState(() => _isBackHovered = true),
-              onExit: (_) => setState(() => _isBackHovered = false),
-              cursor: SystemMouseCursors.click,
-              child: GestureDetector(
-                onTap: widget.onBack,
-                behavior: HitTestBehavior.opaque,
-                child: AnimatedScale(
-                  scale: _isBackHovered ? 1.2 : 1.0,
-                  duration: const Duration(milliseconds: 200),
-                  curve: Curves.easeOut,
-                  child: Padding(
-                    padding: const EdgeInsets.all(4.0),
-                    child: Icon(
-                      Ionicons.arrow_back,
-                      size: 24,
-                      color: primaryTextColor,
-                    ),
-                  ),
-                ),
-              ),
+            SearchBarActionButton(
+              icon: Ionicons.arrow_back,
+              size: 24,
+              color: primaryTextColor,
+              tooltip: '返回',
+              onPressed: widget.onBack,
             ),
             SizedBox(width: 12),
           ],
@@ -129,56 +154,42 @@ class _LocalLibraryControlBarState extends State<LocalLibraryControlBar> {
           ],
           // 搜索框
           Expanded(
-            child: Container(
-              height: 40,
-              decoration: BoxDecoration(
-                color: bgColor,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                  color:
-                      _searchFocusNode.hasFocus ? activeColor : idleBorderColor,
-                  width: _searchFocusNode.hasFocus ? 1.5 : 1,
-                ),
-              ),
-              child: Theme(
-                data: Theme.of(context).copyWith(
-                  textSelectionTheme: TextSelectionThemeData(
-                    selectionColor: activeColor.withValues(alpha: 0.3),
-                    selectionHandleColor: activeColor,
-                  ),
-                ),
-                child: TextField(
-                  controller: widget.searchController,
-                  focusNode: _searchFocusNode,
-                  onChanged: widget.onSearchChanged,
-                  style: TextStyle(color: primaryTextColor, fontSize: 14),
-                  cursorColor: activeColor,
-                  decoration: InputDecoration(
-                    hintText: '搜索...',
-                    hintStyle: TextStyle(
-                        color: textColor.withValues(alpha: 0.5), fontSize: 14),
-                    prefixIcon: Icon(Ionicons.search_outline,
-                        size: 18,
-                        color: _searchFocusNode.hasFocus
-                            ? activeColor
-                            : textColor.withValues(alpha: 0.5)),
-                    suffixIcon: widget.searchController.text.isNotEmpty
-                        ? SearchBarActionButton(
-                            icon: Ionicons.close_circle,
-                            onPressed: () {
-                              widget.searchController.clear();
-                              widget.onSearchChanged('');
-                              widget.onClearSearch?.call();
-                            },
-                          )
-                        : null,
-                    border: InputBorder.none,
-                    contentPadding: const EdgeInsets.symmetric(vertical: 8),
-                  ),
-                ),
-              ),
+            child: AdaptiveMediaSearchField(
+              controller: widget.searchController,
+              focusNode: _searchFocusNode,
+              placeholder: '搜索…',
+              onChanged: widget.onSearchChanged,
+              onClear: widget.onClearSearch,
             ),
           ),
+          if (widget.showUnwatchedOnly != null) ...[
+            const SizedBox(width: 10),
+            SearchBarActionButton(
+              icon: widget.showUnwatchedOnly == true
+                  ? Ionicons.eye_off_outline
+                  : Ionicons.eye_outline,
+              size: 20,
+              color: widget.showUnwatchedOnly == true
+                  ? AppAccentColors.current
+                  : primaryTextColor,
+              tooltip: widget.showUnwatchedOnly == true ? '显示全部' : '只看未观看',
+              onPressed: widget.onToggleUnwatchedOnly,
+            ),
+          ],
+          if (widget.viewMode != null) ...[
+            const SizedBox(width: 10),
+            SearchBarActionButton(
+              icon: widget.viewMode == LibraryManagementViewMode.icons
+                  ? Ionicons.list_outline
+                  : Ionicons.grid_outline,
+              size: 20,
+              color: primaryTextColor,
+              tooltip: widget.viewMode == LibraryManagementViewMode.icons
+                  ? '切换到列表视图'
+                  : '切换到图标视图',
+              onPressed: widget.onToggleViewMode,
+            ),
+          ],
           if (widget.trailingActions != null &&
               widget.trailingActions!.isNotEmpty) ...[
             SizedBox(width: 12),
@@ -197,6 +208,13 @@ class _LocalLibraryControlBarState extends State<LocalLibraryControlBar> {
               dropdownKey: _dropdownKey,
               onItemSelected: widget.onSortChanged!,
               items: [
+                if (widget.showComprehensiveSort)
+                  DropdownMenuItemData(
+                    title: '综合排序',
+                    value: LocalLibrarySortType.comprehensive,
+                    isSelected:
+                        currentSort == LocalLibrarySortType.comprehensive,
+                  ),
                 DropdownMenuItemData(
                   title: '最近观看',
                   value: LocalLibrarySortType.dateAdded,
@@ -213,5 +231,123 @@ class _LocalLibraryControlBarState extends State<LocalLibraryControlBar> {
         ],
       ),
     );
+  }
+
+  Widget _buildPhoneControlBar(BuildContext context) {
+    final actions = <CupertinoMediaSearchToolbarAction>[
+      if (widget.viewMode != null)
+        CupertinoMediaSearchToolbarAction(
+          label: widget.viewMode == LibraryManagementViewMode.icons
+              ? '切换到列表视图'
+              : '切换到图标视图',
+          icon: widget.viewMode == LibraryManagementViewMode.icons
+              ? cupertino.CupertinoIcons.list_bullet
+              : cupertino.CupertinoIcons.square_grid_2x2,
+          onPressed: widget.onToggleViewMode,
+        ),
+      for (final action in widget.trailingActions ?? const [])
+        CupertinoMediaSearchToolbarAction(
+          label: action.label,
+          icon: action.phoneIcon,
+          onPressed: action.onPressed,
+        ),
+      if (widget.showSort)
+        CupertinoMediaSearchToolbarAction(
+          label: '排序',
+          icon: cupertino.CupertinoIcons.arrow_up_arrow_down,
+          onPressed: () => _showPhoneSortMenu(context),
+        ),
+    ];
+    return CupertinoMediaSearchToolbar(
+      controller: widget.searchController,
+      placeholder:
+          widget.title?.isNotEmpty == true ? '搜索${widget.title}' : '搜索…',
+      onChanged: (value) {
+        widget.onSearchChanged(value);
+        if (value.isEmpty) widget.onClearSearch?.call();
+      },
+      leadingAction: widget.showBackButton
+          ? CupertinoMediaSearchToolbarAction(
+              label: '返回',
+              icon: cupertino.CupertinoIcons.back,
+              onPressed: widget.onBack,
+            )
+          : null,
+      actions: actions,
+    );
+  }
+
+  Future<void> _showPhoneSortMenu(BuildContext context) async {
+    final showUnwatched = widget.showUnwatchedOnly != null;
+    final sortEntries = <(LocalLibrarySortType, String)>[
+      if (widget.showComprehensiveSort)
+        (LocalLibrarySortType.comprehensive, '综合排序'),
+      (LocalLibrarySortType.dateAdded, '最近观看'),
+      (LocalLibrarySortType.name, '名称排序'),
+      (LocalLibrarySortType.rating, '评分排序'),
+    ];
+
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final contentHeight = 112.0 + (sortEntries.length + 1) * 52.0;
+    final effectiveHeightRatio =
+        (contentHeight / screenHeight).clamp(0.3, 0.82).toDouble();
+
+    final selected =
+        await CupertinoBottomSheet.show<LocalLibrarySortType>(
+      context: context,
+      title: '排序',
+      heightRatio: effectiveHeightRatio,
+      child: CupertinoBottomSheetContentLayout(
+        sliversBuilder: (sheetContext, topSpacing) => [
+          SliverPadding(
+            padding: EdgeInsets.fromLTRB(12, topSpacing + 4, 12, 24),
+            sliver: SliverToBoxAdapter(
+              child: cupertino.CupertinoListSection.insetGrouped(
+                margin: EdgeInsets.zero,
+                children: [
+                  if (showUnwatched)
+                    cupertino.CupertinoListTile(
+                      leading: Icon(
+                        cupertino.CupertinoIcons.eye,
+                        size: 20,
+                      ),
+                      title: const Text('只看未观看'),
+                      trailing: widget.showUnwatchedOnly == true
+                          ? Icon(
+                              cupertino.CupertinoIcons.check_mark,
+                              size: 18,
+                              color: cupertino.CupertinoTheme.of(sheetContext)
+                                  .primaryColor,
+                            )
+                          : null,
+                      onTap: () {
+                        Navigator.of(sheetContext).pop();
+                        widget.onToggleUnwatchedOnly?.call();
+                      },
+                    ),
+                  for (final entry in sortEntries)
+                    cupertino.CupertinoListTile(
+                      title: Text(entry.$2),
+                      trailing: widget.currentSort == entry.$1
+                          ? Icon(
+                              cupertino.CupertinoIcons.check_mark,
+                              size: 18,
+                              color: cupertino.CupertinoTheme.of(sheetContext)
+                                  .primaryColor,
+                            )
+                          : null,
+                      onTap: () => Navigator.of(sheetContext)
+                          .pop<LocalLibrarySortType>(entry.$1),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (selected != null) {
+      widget.onSortChanged?.call(selected);
+    }
   }
 }

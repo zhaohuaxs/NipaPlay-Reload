@@ -1,10 +1,14 @@
+import 'dart:async';
+
 import 'package:flutter/services.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
-import 'dart:io';
 import 'globals.dart' as globals;
 
 class ScreenOrientationManager {
+  static const Duration _harmonyPlatformCallTimeout = Duration(
+    milliseconds: 300,
+  );
+
   static ScreenOrientationManager? _instance;
   static ScreenOrientationManager get instance =>
       _instance ??= ScreenOrientationManager._();
@@ -58,12 +62,29 @@ class ScreenOrientationManager {
         // 平板设备：已经是横屏，无需改变
         return;
       } else {
-        // 手机设备：切换到横屏
-        // 若已是横屏（例如自动下一集），跳过“先允许竖屏再锁横屏”的过渡，
-        // 避免出现短暂的横/竖来回切换。
-        final bool alreadyLandscape = isLandscape;
-        await _setLandscapeOnly(allowTransientPortrait: !alreadyLandscape);
+        // 手机开始播放时默认进入横屏全屏。
+        await _setLandscapeOnly();
       }
+    } finally {
+      _isTransitioning = false;
+    }
+  }
+
+  Future<void> setPhonePlaybackLandscape() async {
+    if (!globals.isMobilePlatform || globals.isTablet) return;
+    _isTransitioning = true;
+    try {
+      await _setLandscapeOnly();
+    } finally {
+      _isTransitioning = false;
+    }
+  }
+
+  Future<void> setPhonePlaybackPortrait() async {
+    if (!globals.isMobilePlatform || globals.isTablet) return;
+    _isTransitioning = true;
+    try {
+      await _setPortraitOnly();
     } finally {
       _isTransitioning = false;
     }
@@ -118,24 +139,36 @@ class ScreenOrientationManager {
   Future<void> _setLandscapeOnly({bool allowTransientPortrait = true}) async {
     try {
       if (allowTransientPortrait) {
-        await SystemChrome.setPreferredOrientations([
-          DeviceOrientation.landscapeLeft,
-          DeviceOrientation.landscapeRight,
-          DeviceOrientation.portraitUp,
-        ]);
+        await _awaitSystemChromeCall(
+          SystemChrome.setPreferredOrientations([
+            DeviceOrientation.landscapeLeft,
+            DeviceOrientation.landscapeRight,
+            DeviceOrientation.portraitUp,
+          ]),
+          'allow transient portrait before landscape',
+        );
         await Future.delayed(const Duration(milliseconds: 100));
       }
-      await SystemChrome.setPreferredOrientations([
-        DeviceOrientation.landscapeLeft,
-        DeviceOrientation.landscapeRight,
-      ]);
+      await _awaitSystemChromeCall(
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]),
+        'lock landscape orientation',
+      );
 
       if (_isTabletDevice) {
         // 平板设备不自动隐藏系统UI，由全屏按钮控制
-        await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+        await _awaitSystemChromeCall(
+          SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
+          'enable edge-to-edge system UI',
+        );
       } else {
         // 手机设备隐藏系统UI
-        await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+        await _awaitSystemChromeCall(
+          SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+          'enable immersive system UI',
+        );
       }
 
       await Future.delayed(const Duration(milliseconds: 300));
@@ -147,16 +180,25 @@ class ScreenOrientationManager {
   // 设置竖屏并锁定
   Future<void> _setPortraitOnly() async {
     try {
-      await SystemChrome.setPreferredOrientations([
-        DeviceOrientation.landscapeLeft,
-        DeviceOrientation.landscapeRight,
-        DeviceOrientation.portraitUp,
-      ]);
+      await _awaitSystemChromeCall(
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+          DeviceOrientation.portraitUp,
+        ]),
+        'allow transient landscape before portrait',
+      );
       await Future.delayed(const Duration(milliseconds: 100));
-      await SystemChrome.setPreferredOrientations([
-        DeviceOrientation.portraitUp,
-      ]);
-      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      await _awaitSystemChromeCall(
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.portraitUp,
+        ]),
+        'lock portrait orientation',
+      );
+      await _awaitSystemChromeCall(
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
+        'enable edge-to-edge system UI',
+      );
       await Future.delayed(const Duration(milliseconds: 300));
     } catch (e) {
       debugPrint('设置竖屏时出错: $e');
@@ -168,15 +210,43 @@ class ScreenOrientationManager {
     if (!globals.isMobilePlatform) return;
 
     try {
-      await SystemChrome.setPreferredOrientations([
-        DeviceOrientation.portraitUp,
-        DeviceOrientation.portraitDown,
-        DeviceOrientation.landscapeLeft,
-        DeviceOrientation.landscapeRight,
-      ]);
-      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      await _awaitSystemChromeCall(
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.portraitUp,
+          DeviceOrientation.portraitDown,
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]),
+        'enable free rotation',
+      );
+      await _awaitSystemChromeCall(
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
+        'enable edge-to-edge system UI',
+      );
     } catch (e) {
       debugPrint('恢复自由旋转时出错: $e');
+    }
+  }
+
+  Future<void> _awaitSystemChromeCall(
+    Future<void> operation,
+    String description,
+  ) async {
+    if (!globals.isHarmonyOS) {
+      await operation;
+      return;
+    }
+
+    try {
+      await operation.timeout(_harmonyPlatformCallTimeout);
+    } on TimeoutException {
+      // The HarmonyOS Flutter embedder applies orientation/system-UI changes
+      // but may never reply to the platform-channel request. Playback startup
+      // must not remain blocked waiting for that missing reply.
+      debugPrint(
+        '[ScreenOrientationManager] HarmonyOS platform call timed out '
+        '($description); continuing.',
+      );
     }
   }
 }

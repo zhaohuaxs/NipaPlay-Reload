@@ -1,23 +1,29 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:nipaplay/danmaku_abstraction/danmaku_kernel_factory.dart';
+import 'package:nipaplay/player_abstraction/player_factory.dart';
+import 'package:nipaplay/utils/danmaku/style.dart';
 import 'package:nipaplay/utils/video_player_state.dart';
 import 'base_settings_menu.dart';
+import 'player_menu_theme.dart';
 import 'settings_hint_text.dart';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:ui';
-import 'settings_slider.dart';
 import 'blur_button.dart';
+import 'blur_dropdown.dart';
 import 'fluent_settings_switch.dart';
+import 'settings_slider.dart';
 import 'package:nipaplay/services/manual_danmaku_matcher.dart';
+import 'package:nipaplay/utils/storage_service.dart';
 import 'package:nipaplay/utils/danmaku_history_sync.dart';
-import 'package:nipaplay/danmaku_abstraction/danmaku_kernel_factory.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 import 'package:nipaplay/providers/ui_theme_provider.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/text_input_dialog.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
 import 'package:file_selector/file_selector.dart';
 import 'package:path/path.dart' as p;
+import 'package:nipaplay/plugins/danmaku/titan_danmaku_settings.dart';
+import 'package:nipaplay/plugins/models/plugin_danmaku_renderer.dart';
 
 enum _DanmakuExportFormat { json, xml }
 
@@ -46,7 +52,6 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
     0.67,
     1.0,
   ];
-
   static final Map<double, String> _danmakuDisplayAreaLabels = <double, String>{
     0.0: '单行显示',
     0.125: '1/8 屏幕',
@@ -66,65 +71,6 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
     _blockWordController.dispose();
     super.dispose();
   }
-
-  Future<void> _pickDanmakuFontFile(VideoPlayerState videoState) async {
-    final selected = await openFile(
-      acceptedTypeGroups: const [
-        XTypeGroup(
-          label: 'Font',
-          extensions: ['ttf', 'otf', 'ttc', 'otc'],
-        ),
-      ],
-    );
-    if (selected == null) return;
-
-    final success = await videoState.importDanmakuFontFile(selected.path);
-    if (!mounted) return;
-    if (success) {
-      BlurSnackBar.show(context, '已应用字体: ${p.basename(selected.path)}');
-    } else {
-      BlurSnackBar.show(context, '字体加载失败，请选择有效的字体文件');
-    }
-  }
-
-  Future<void> _resetDanmakuFont(VideoPlayerState videoState) async {
-    await videoState.resetDanmakuFont();
-    if (!mounted) return;
-    BlurSnackBar.show(context, '已恢复为系统默认字体');
-  }
-
-  String _danmakuFontLabel(VideoPlayerState videoState) {
-    final fontPath = videoState.danmakuFontFilePath.trim();
-    if (fontPath.isEmpty) return '系统默认字体';
-    return p.basename(fontPath);
-  }
-
-  String _outlineStyleLabel(DanmakuOutlineStyle style) {
-    switch (style) {
-      case DanmakuOutlineStyle.none:
-        return '无描边';
-      case DanmakuOutlineStyle.stroke:
-        return '标准描边';
-      case DanmakuOutlineStyle.uniform:
-        return '均匀描边';
-    }
-  }
-
-  String _shadowStyleLabel(DanmakuShadowStyle style) {
-    switch (style) {
-      case DanmakuShadowStyle.none:
-        return '无阴影';
-      case DanmakuShadowStyle.soft:
-        return '柔和阴影';
-      case DanmakuShadowStyle.medium:
-        return '标准阴影';
-      case DanmakuShadowStyle.strong:
-        return '增强阴影';
-    }
-  }
-
-  bool get _isNext2Kernel =>
-      DanmakuKernelFactory.getKernelType() == DanmakuRenderEngine.next2;
 
   List<String> _splitBlockWords(String input) {
     final result = <String>[];
@@ -336,6 +282,168 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
         '${twoDigits(time.second)}';
   }
 
+  bool get _isNext2Kernel =>
+      DanmakuKernelFactory.getKernelType() == DanmakuRenderEngine.next2;
+
+  bool get _isDfmPlusKernel =>
+      DanmakuKernelFactory.getKernelType() == DanmakuRenderEngine.dfmPlus;
+
+  bool get _usesBinaryDanmakuEffectToggles =>
+      _isNext2Kernel || _isDfmPlusKernel;
+
+  String get _binaryDanmakuEffectKernelName =>
+      _isDfmPlusKernel ? 'DFM+' : 'Next2';
+
+  Future<List<String>>? _danmakuFontLibraryFuture;
+
+  Future<void> _applyDanmakuFontFromLibrary(
+      VideoPlayerState videoState, String name, List<String> allNames) async {
+    // listSubtitleFonts 返回去掉扩展名的名称；按字体库目录拼回真实文件
+    try {
+      final baseDir = await StorageService.getAppStorageDirectory();
+      final fontsDir = Directory(p.join(baseDir.path, 'subtitle_fonts'));
+      if (await fontsDir.exists()) {
+        await for (final entity in fontsDir.list()) {
+          if (entity is! File) continue;
+          if (p.basenameWithoutExtension(entity.path) == name) {
+            final success =
+                await videoState.importDanmakuFontFile(entity.path);
+            if (!mounted) return;
+            if (success) {
+              BlurSnackBar.show(context, '已应用字体: $name');
+            } else {
+              BlurSnackBar.show(context, '字体加载失败');
+            }
+            return;
+          }
+        }
+      }
+      if (mounted) {
+        BlurSnackBar.show(context, '字体文件不存在，请重新导入');
+      }
+    } catch (e) {
+      debugPrint('应用字体库字体失败: $e');
+    }
+  }
+
+  Future<void> _pickDanmakuFontFile(VideoPlayerState videoState) async {
+    final files = await openFiles(
+      acceptedTypeGroups: const [
+        XTypeGroup(
+          label: 'Font',
+          extensions: ['ttf', 'otf', 'ttc', 'otc'],
+          // iOS 上 file_selector 只认 UTI，缺 extended 会弹不出选择器
+          uniformTypeIdentifiers: [
+            'public.truetype-font',
+            'public.opentype-font',
+            'public.font',
+            'public.data',
+            'public.item',
+          ],
+        ),
+      ],
+    );
+    if (files.isEmpty) return;
+    var count = 0;
+    for (final f in files) {
+      if (await videoState.importDanmakuFontFile(f.path)) count++;
+    }
+    if (!mounted) return;
+    if (count > 0) {
+      BlurSnackBar.show(context, '已应用 $count 个字体文件');
+    } else {
+      BlurSnackBar.show(context, '字体加载失败，请选择有效的字体文件');
+    }
+  }
+
+  Future<void> _pickDanmakuFontFolder(VideoPlayerState videoState) async {
+    // iOS 上 file_selector 的 getDirectoryPath 不受支持，改用多选字体文件兜底
+    if (Platform.isIOS) {
+      await _pickDanmakuFontFile(videoState);
+      return;
+    }
+    final directory = await getDirectoryPath();
+    if (directory == null) return;
+    final dir = Directory(directory);
+    if (!await dir.exists()) return;
+    var count = 0;
+    await for (final entity in dir.list()) {
+      if (entity is! File) continue;
+      final ext = p.extension(entity.path).toLowerCase();
+      if (ext == '.ttf' || ext == '.otf' || ext == '.ttc' || ext == '.otc') {
+        if (await videoState.importDanmakuFontFile(entity.path)) count++;
+      }
+    }
+    if (!mounted) return;
+    BlurSnackBar.show(
+        context, count > 0 ? '从文件夹导入 $count 个字体' : '文件夹中没有可用字体');
+  }
+
+  Future<void> _resetDanmakuFont(VideoPlayerState videoState) async {
+    await videoState.resetDanmakuFont();
+    if (!mounted) return;
+    BlurSnackBar.show(context, '已恢复为系统默认字体');
+  }
+
+  String _danmakuFontLabel(VideoPlayerState videoState) {
+    final fontPath = videoState.danmakuFontFilePath.trim();
+    if (fontPath.isEmpty) return '系统默认字体';
+    return p.basename(fontPath);
+  }
+
+  String _shadowStyleLabel(DanmakuShadowStyle style) {
+    switch (style) {
+      case DanmakuShadowStyle.none:
+        return '无阴影';
+      case DanmakuShadowStyle.soft:
+        return '柔和阴影';
+      case DanmakuShadowStyle.medium:
+        return '标准阴影';
+      case DanmakuShadowStyle.strong:
+        return '增强阴影';
+    }
+  }
+
+  String _outlineStyleLabel(DanmakuOutlineStyle style) {
+    switch (style) {
+      case DanmakuOutlineStyle.none:
+        return '无描边';
+      case DanmakuOutlineStyle.stroke:
+        return '标准描边';
+      case DanmakuOutlineStyle.uniform:
+        return '均匀描边';
+    }
+  }
+
+  String _outlineWidthLevelLabel(double value) {
+    switch (normalizeDanmakuOutlineWidthLevel(value).round()) {
+      case 0:
+        return '0 · 无描边';
+      case 2:
+        return '2 · 粗边';
+      default:
+        return '1 · 细边';
+    }
+  }
+
+  double _snapDanmakuDisplayArea(double value) {
+    double best = _danmakuDisplayAreaOptions.first;
+    double bestDiff = (value - best).abs();
+    for (final option in _danmakuDisplayAreaOptions.skip(1)) {
+      final diff = (value - option).abs();
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        best = option;
+      }
+    }
+    return best;
+  }
+
+  String _danmakuDisplayAreaText(double value) {
+    final snapped = _snapDanmakuDisplayArea(value);
+    return _danmakuDisplayAreaLabels[snapped] ?? '全屏';
+  }
+
   // 检查是否是正则表达式规则格式: 规则名称/表达式/
   bool _isRegexRule(String word) {
     if (!word.contains('/')) return false;
@@ -357,6 +465,7 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
   Widget _buildBlockWordsList() {
     return Consumer<VideoPlayerState>(
       builder: (context, videoState, child) {
+        final menuColors = PlayerMenuTheme.colorsOf(context);
         if (videoState.danmakuBlockWords.isEmpty) {
           return Container(
             padding: const EdgeInsets.symmetric(vertical: 10),
@@ -364,7 +473,7 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
             child: Text(
               '暂无屏蔽词',
               style:
-                  TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 14),
+                  TextStyle(color: menuColors.disabledForeground, fontSize: 14),
             ),
           );
         }
@@ -373,39 +482,37 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
           spacing: 8,
           runSpacing: 8,
           children: videoState.danmakuBlockWords.map((word) {
-            return ClipRRect(
-              borderRadius: BorderRadius.circular(16),
-              child: BackdropFilter(
-                filter: ImageFilter.blur(sigmaX: 5, sigmaY: 5),
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.15),
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(
-                      color: Colors.white.withOpacity(0.3),
-                      width: 0.5,
+            return Container(
+              decoration: BoxDecoration(
+                color: menuColors.controlBackground,
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: menuColors.controlBorder,
+                  width: 0.5,
+                ),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      _getDisplayText(word),
+                      style: TextStyle(
+                        color: menuColors.foreground,
+                        fontSize: 12,
+                      ),
                     ),
-                  ),
-                  child: Padding(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          _getDisplayText(word),
-                          style: const TextStyle(
-                              color: Colors.white, fontSize: 12),
-                        ),
-                        const SizedBox(width: 4),
-                        InkWell(
-                          onTap: () => videoState.removeDanmakuBlockWord(word),
-                          child: const Icon(Icons.close,
-                              size: 14, color: Colors.white),
-                        ),
-                      ],
+                    const SizedBox(width: 4),
+                    InkWell(
+                      onTap: () => videoState.removeDanmakuBlockWord(word),
+                      child: Icon(
+                        Icons.close,
+                        size: 14,
+                        color: menuColors.secondaryForeground,
+                      ),
                     ),
-                  ),
+                  ],
                 ),
               ),
             );
@@ -415,28 +522,607 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
     );
   }
 
-  double _snapDanmakuDisplayArea(double value) {
-    double best = _danmakuDisplayAreaOptions.first;
-    double bestDiff = (value - best).abs();
-    for (final option in _danmakuDisplayAreaOptions.skip(1)) {
-      final diff = (value - option).abs();
-      if (diff < bestDiff) {
-        bestDiff = diff;
-        best = option;
-      }
-    }
-    return best;
+  Widget _buildDanmakuStyleSection(VideoPlayerState videoState) {
+    final isErikaPlayerKernel =
+        PlayerFactory.getKernelType() == PlayerKernelType.erika;
+    final effectivePluginRenderer = PluginDanmakuRenderer.resolveForPlayback(
+      selectedRenderer: DanmakuKernelFactory.activePluginRenderer,
+      nativeDanmakuActive: isErikaPlayerKernel,
+    );
+    final usesTitanSettings =
+        effectivePluginRenderer?.usesTitanSettings ?? false;
+    final titan = videoState.titanDanmakuSettings;
+    final showBinaryDanmakuEffectToggles =
+        isErikaPlayerKernel || _usesBinaryDanmakuEffectToggles;
+    final showMergeToggle = isErikaPlayerKernel ||
+        DanmakuKernelFactory.getKernelType() != DanmakuRenderEngine.canvas;
+
+    return Padding(
+      padding: const EdgeInsets.only(left: 16, right: 16, top: 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '弹幕样式',
+            style: TextStyle(
+              color: PlayerMenuTheme.colorsOf(context).foreground,
+              fontSize: 14,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 12),
+          _buildSliderSection(
+            label: usesTitanSettings ? 'Titan 弹幕不透明度' : '弹幕不透明度',
+            value:
+                usesTitanSettings ? titan.opacity : videoState.danmakuOpacity,
+            min: usesTitanSettings ? 0.2 : 0,
+            max: 1,
+            step: usesTitanSettings ? 0.05 : 0.01,
+            displayTextBuilder: (value) => '${(value * 100).round()}%',
+            onChanged: usesTitanSettings
+                ? (value) => videoState.setTitanDanmakuSettings(
+                      videoState.titanDanmakuSettings.copyWith(opacity: value),
+                    )
+                : videoState.setDanmakuOpacity,
+            hint: usesTitanSettings ? 'Titan 默认 85%，不改变其他引擎透明度' : '调整弹幕文字透明度',
+          ),
+          if (usesTitanSettings) ...[
+            _buildSliderSection(
+              label: 'Titan 字号倍率',
+              value: titan.fontSize,
+              min: 0.5,
+              max: 2.0,
+              step: 0.05,
+              displayTextBuilder: (value) => '${value.toStringAsFixed(2)}×',
+              onChanged: (value) => videoState.setTitanDanmakuSettings(
+                videoState.titanDanmakuSettings.copyWith(fontSize: value),
+              ),
+              hint: '仅调整 Titan，不改变其他引擎的像素字号',
+            ),
+            _buildOptionButtonsSection<String>(
+              title: 'Titan 弹幕字体',
+              description: '未安装的字体会回退到简体中文系统字体',
+              items: TitanDanmakuSettings.fontOptions
+                  .map(
+                    (option) => DropdownMenuItemData<String>(
+                      title: option.label,
+                      value: option.value,
+                      isSelected: titan.fontFamily == option.value,
+                    ),
+                  )
+                  .toList(),
+              onSelected: (value) => videoState.setTitanDanmakuSettings(
+                videoState.titanDanmakuSettings.copyWith(fontFamily: value),
+              ),
+            ),
+            _buildSwitchSection(
+              label: 'Titan 弹幕加粗',
+              value: titan.bold,
+              onChanged: (value) => videoState.setTitanDanmakuSettings(
+                videoState.titanDanmakuSettings.copyWith(bold: value),
+              ),
+              hint: '使用 Titan 原生粗体样式',
+            ),
+            _buildOptionButtonsSection<int>(
+              title: 'Titan 描边类型',
+              description: '对应引擎 fontBorder 设置',
+              items: <DropdownMenuItemData<int>>[
+                for (final entry in const <int, String>{
+                  0: '重墨',
+                  1: '描边',
+                  2: '45° 投影',
+                }.entries)
+                  DropdownMenuItemData<int>(
+                    title: entry.value,
+                    value: entry.key,
+                    isSelected: titan.fontBorder == entry.key,
+                  ),
+              ],
+              onSelected: (value) => videoState.setTitanDanmakuSettings(
+                videoState.titanDanmakuSettings.copyWith(fontBorder: value),
+              ),
+            ),
+            _buildSliderSection(
+              label: 'Titan 滚动速度',
+              value: titan.speedPlus,
+              min: 0.25,
+              max: 3.0,
+              step: 0.25,
+              displayTextBuilder: (value) => '${value.toStringAsFixed(2)}×',
+              onChanged: (value) => videoState.setTitanDanmakuSettings(
+                videoState.titanDanmakuSettings.copyWith(speedPlus: value),
+              ),
+              hint: '使用 Titan 原生 speedPlus',
+            ),
+            _buildSliderSection(
+              label: 'Titan 弹幕密度',
+              value: titan.density,
+              min: 0.1,
+              max: 1.0,
+              step: 0.1,
+              displayTextBuilder: (value) => value.toStringAsFixed(1),
+              onChanged: (value) => videoState.setTitanDanmakuSettings(
+                videoState.titanDanmakuSettings.copyWith(density: value),
+              ),
+              hint: '限制同屏轨道占用密度',
+            ),
+            _buildSliderSection(
+              label: 'Titan 基准时长',
+              value: titan.duration,
+              min: 2.0,
+              max: 12.0,
+              step: 0.5,
+              displayTextBuilder: (value) => '${value.toStringAsFixed(1)}s',
+              onChanged: (value) => videoState.setTitanDanmakuSettings(
+                videoState.titanDanmakuSettings.copyWith(duration: value),
+              ),
+              hint: '设置滚动弹幕的基础存活时间',
+            ),
+            _buildSwitchSection(
+              label: 'Titan 防挡字幕',
+              value: titan.preventShade,
+              onChanged: (value) => videoState.setTitanDanmakuSettings(
+                videoState.titanDanmakuSettings.copyWith(preventShade: value),
+              ),
+              hint: '避免弹幕覆盖画面底部的字幕区域',
+            ),
+          ] else ...[
+            _buildSliderSection(
+              label: '弹幕字体大小',
+              value: videoState.danmakuFontSize <= 0
+                  ? videoState.actualDanmakuFontSize
+                  : videoState.danmakuFontSize,
+              min: 12,
+              max: 60,
+              step: 0.5,
+              displayTextBuilder: (value) => '${value.toStringAsFixed(1)}px',
+              onChanged: videoState.setDanmakuFontSize,
+              onChangeEnd: (value) =>
+                  videoState.setDanmakuFontSize(value, commit: true),
+              hint: '调整弹幕文字大小，轨道间距会自动适配',
+            ),
+            _buildFontSection(videoState),
+            _buildOutlineSection(
+              videoState,
+              useDiscreteLevels: showBinaryDanmakuEffectToggles,
+            ),
+            if (!isErikaPlayerKernel) _buildShadowSection(videoState),
+            _buildSliderSection(
+              label: '滚动弹幕速度',
+              value: videoState.danmakuSpeedMultiplier,
+              min: 0.5,
+              max: 2,
+              step: 0.05,
+              displayTextBuilder: (value) => '${value.toStringAsFixed(2)}x',
+              onChanged: videoState.setDanmakuSpeedMultiplier,
+              hint: '向左减慢滚动弹幕速度，向右加快',
+            ),
+          ],
+          _buildDisplayAreaSection(videoState),
+          if (showMergeToggle)
+            _buildSwitchSection(
+              label: '合并相同弹幕',
+              value: videoState.mergeDanmaku,
+              onChanged: videoState.setMergeDanmaku,
+              hint: '将内容相同的弹幕合并为一条显示',
+            ),
+        ],
+      ),
+    );
   }
 
-  String _danmakuDisplayAreaText(double value) {
-    final snapped = _snapDanmakuDisplayArea(value);
-    return _danmakuDisplayAreaLabels[snapped] ?? '全屏';
+  Widget _buildDanmakuBlockModeSection(VideoPlayerState videoState) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 16, right: 16, top: 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '弹幕屏蔽',
+            style: TextStyle(
+              color: PlayerMenuTheme.colorsOf(context).foreground,
+              fontSize: 14,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          _buildSwitchSection(
+            label: '屏蔽顶部弹幕',
+            value: videoState.blockTopDanmaku,
+            onChanged: videoState.setBlockTopDanmaku,
+            hint: '不显示顶部固定弹幕',
+          ),
+          _buildSwitchSection(
+            label: '屏蔽底部弹幕',
+            value: videoState.blockBottomDanmaku,
+            onChanged: videoState.setBlockBottomDanmaku,
+            hint: '不显示底部固定弹幕',
+          ),
+          _buildSwitchSection(
+            label: '屏蔽滚动弹幕',
+            value: videoState.blockScrollDanmaku,
+            onChanged: videoState.setBlockScrollDanmaku,
+            hint: '不显示从右向左滚动的弹幕',
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSliderSection({
+    required String label,
+    required double value,
+    required double min,
+    required double max,
+    required double step,
+    required String Function(double) displayTextBuilder,
+    required ValueChanged<double> onChanged,
+    ValueChanged<double>? onChangeEnd,
+    required String hint,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SettingsSlider(
+            value: value,
+            onChanged: onChanged,
+            onChangeEnd: onChangeEnd,
+            label: label,
+            displayTextBuilder: displayTextBuilder,
+            min: min,
+            max: max,
+            step: step,
+          ),
+          const SizedBox(height: 4),
+          SettingsHintText(hint),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFontSection(VideoPlayerState videoState) {
+    final menuColors = PlayerMenuTheme.colorsOf(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '字体选择',
+            style: TextStyle(
+              color: menuColors.foreground,
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '当前字体：${_danmakuFontLabel(videoState)}',
+            style: TextStyle(
+              color: menuColors.secondaryForeground,
+              fontSize: 13,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: BlurButton(
+                  text: '选择字体文件夹',
+                  icon: Icons.create_new_folder_outlined,
+                  onTap: () => _pickDanmakuFontFolder(videoState),
+                  expandHorizontally: true,
+                ),
+              ),
+            ],
+          ),
+          ...[
+            const SizedBox(height: 4),
+            // 默认与字幕字体文件夹同路径（subtitle_fonts）：总是展示字体库可点选
+            FutureBuilder<List<String>>(
+              future: _danmakuFontLibraryFuture ??=
+                  videoState.listSubtitleFonts(),
+              builder: (context, snapshot) {
+                final fonts = snapshot.data ?? const <String>[];
+                if (fonts.isEmpty) return const SizedBox.shrink();
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '字体库（点击应用，与字幕字体同目录）',
+                      style: TextStyle(
+                        color: menuColors.secondaryForeground,
+                        fontSize: 12,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 120),
+                      child: SingleChildScrollView(
+                        child: Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: [
+                            for (final name in fonts)
+                              ActionChip(
+                                label: Text(
+                                  name,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: videoState.danmakuFontFilePath
+                                            .trim()
+                                            .isNotEmpty &&
+                                        videoState.danmakuFontFilePath
+                                            .contains(name)
+                                        ? menuColors.accent
+                                        : menuColors.foreground,
+                                  ),
+                                ),
+                                backgroundColor: menuColors.controlBackground,
+                                side: BorderSide(
+                                  color: menuColors.controlBorder,
+                                ),
+                                onPressed: () async {
+                                  // 再次点击已应用的字体 = 恢复默认
+                                  final applied = videoState
+                                      .danmakuFontFilePath
+                                      .trim()
+                                      .isNotEmpty &&
+                                      videoState.danmakuFontFilePath
+                                          .contains(name);
+                                  if (applied) {
+                                    await _resetDanmakuFont(videoState);
+                                  } else {
+                                    await _applyDanmakuFontFromLibrary(
+                                        videoState, name, fonts);
+                                  }
+                                },
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ],
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: BlurButton(
+                  text: '选择字体文件',
+                  icon: Icons.folder_open,
+                  onTap: () => _pickDanmakuFontFile(videoState),
+                  expandHorizontally: true,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: BlurButton(
+                  text: '恢复默认',
+                  icon: Icons.restart_alt,
+                  onTap: () => _resetDanmakuFont(videoState),
+                  expandHorizontally: true,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          const SettingsHintText('支持 ttf、otf、ttc、otc 字体文件'),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildOutlineSection(
+    VideoPlayerState videoState, {
+    required bool useDiscreteLevels,
+  }) {
+    if (useDiscreteLevels) {
+      return _buildSliderSection(
+        label: '弹幕描边',
+        value: videoState.next2DanmakuOutlineWidth,
+        min: 0.0,
+        max: 2.0,
+        step: 1.0,
+        displayTextBuilder: _outlineWidthLevelLabel,
+        onChanged: videoState.setNext2DanmakuOutlineWidth,
+        hint: '0 无描边 · 1 细边 · 2 粗边',
+      );
+    }
+
+    final items = DanmakuOutlineStyle.values
+        .map(
+          (style) => DropdownMenuItemData<DanmakuOutlineStyle>(
+            title: _outlineStyleLabel(style),
+            value: style,
+            isSelected: videoState.danmakuOutlineStyle == style,
+          ),
+        )
+        .toList();
+
+    return _buildOptionButtonsSection(
+      title: '弹幕描边',
+      description: '选择弹幕文字外缘的描边方式',
+      items: items,
+      onSelected: videoState.setDanmakuOutlineStyle,
+    );
+  }
+
+  Widget _buildShadowSection(VideoPlayerState videoState) {
+    if (_usesBinaryDanmakuEffectToggles) {
+      return _buildSwitchSection(
+        label: '弹幕阴影',
+        value: videoState.danmakuShadowStyle != DanmakuShadowStyle.none,
+        onChanged: (value) {
+          videoState.setDanmakuShadowStyle(
+            value ? DanmakuShadowStyle.strong : DanmakuShadowStyle.none,
+          );
+        },
+        hint: '开启后为 $_binaryDanmakuEffectKernelName 弹幕添加阴影',
+      );
+    }
+
+    final items = DanmakuShadowStyle.values
+        .map(
+          (style) => DropdownMenuItemData<DanmakuShadowStyle>(
+            title: _shadowStyleLabel(style),
+            value: style,
+            isSelected: videoState.danmakuShadowStyle == style,
+          ),
+        )
+        .toList();
+
+    return _buildOptionButtonsSection(
+      title: '弹幕阴影',
+      description: '选择弹幕文字的阴影强度',
+      items: items,
+      onSelected: videoState.setDanmakuShadowStyle,
+    );
+  }
+
+  Widget _buildDisplayAreaSection(VideoPlayerState videoState) {
+    final selectedArea = _snapDanmakuDisplayArea(videoState.danmakuDisplayArea);
+    final items = _danmakuDisplayAreaOptions
+        .map(
+          (area) => DropdownMenuItemData<double>(
+            title: _danmakuDisplayAreaText(area),
+            value: area,
+            isSelected: selectedArea == area,
+          ),
+        )
+        .toList();
+
+    return _buildOptionButtonsSection(
+      title: '轨道显示区域',
+      description: '设置弹幕轨道在屏幕上的显示范围',
+      items: items,
+      onSelected: (value) {
+        videoState.setDanmakuDisplayArea(_snapDanmakuDisplayArea(value));
+      },
+    );
+  }
+
+  Widget _buildOptionButtonsSection<T>({
+    required String title,
+    required String description,
+    required List<DropdownMenuItemData<T>> items,
+    required ValueChanged<T> onSelected,
+  }) {
+    final menuColors = PlayerMenuTheme.colorsOf(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: TextStyle(
+              color: menuColors.foreground,
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: items
+                .map((item) => _buildOptionButton(item, onSelected))
+                .toList(),
+          ),
+          const SizedBox(height: 4),
+          SettingsHintText(description),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildOptionButton<T>(
+    DropdownMenuItemData<T> item,
+    ValueChanged<T> onSelected,
+  ) {
+    final menuColors = PlayerMenuTheme.colorsOf(context);
+    final isSelected = item.isSelected;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: () => onSelected(item.value),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: isSelected
+                ? menuColors.selectedBackground
+                : menuColors.controlBackground,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: isSelected
+                  ? menuColors.selectedBorder
+                  : menuColors.controlBorder,
+              width: 1,
+            ),
+          ),
+          child: Text(
+            item.title,
+            style: TextStyle(
+              color: isSelected
+                  ? menuColors.selectedForeground
+                  : menuColors.foreground,
+              fontSize: 13,
+              fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSwitchSection({
+    required String label,
+    required bool value,
+    required ValueChanged<bool> onChanged,
+    required String hint,
+  }) {
+    final menuColors = PlayerMenuTheme.colorsOf(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Expanded(
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    color: menuColors.foreground,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              FluentSettingsSwitch(value: value, onChanged: onChanged),
+            ],
+          ),
+          const SizedBox(height: 4),
+          SettingsHintText(hint),
+        ],
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Consumer<VideoPlayerState>(
       builder: (context, videoState, child) {
+        final menuColors = PlayerMenuTheme.colorsOf(context);
         return BaseSettingsMenu(
           title: '弹幕设置',
           onClose: widget.onClose,
@@ -453,10 +1139,10 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        const Text(
+                        Text(
                           '显示弹幕',
                           style: TextStyle(
-                            color: Colors.white,
+                            color: menuColors.foreground,
                             fontSize: 14,
                           ),
                         ),
@@ -472,36 +1158,8 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
                   ],
                 ),
               ),
-              // 随机染色开关
-              Padding(
-                padding: const EdgeInsets.only(left: 16, right: 16, top: 8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text(
-                          '随机染色',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 14,
-                          ),
-                        ),
-                        FluentSettingsSwitch(
-                          value: videoState.danmakuRandomColorEnabled,
-                          onChanged: (value) {
-                            videoState.setDanmakuRandomColorEnabled(value);
-                          },
-                        ),
-                      ],
-                    ),
-                    const SettingsHintText(
-                      '开启后忽略弹幕原始颜色，按发送弹幕预设色随机分配',
-                    ),
-                  ],
-                ),
-              ),
+              _buildDanmakuStyleSection(videoState),
+              _buildDanmakuBlockModeSection(videoState),
               // 手动匹配弹幕
               Padding(
                 padding: const EdgeInsets.only(left: 16, right: 16, top: 8),
@@ -520,7 +1178,7 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
                           context,
                           listen: false,
                         );
-                        if (uiThemeProvider.isCupertinoTheme) {
+                        if (uiThemeProvider.isPhoneLayout) {
                           final menuScope = SettingsMenuScope.maybeOf(context);
                           if (menuScope?.requestClose != null) {
                             await menuScope!.requestClose!();
@@ -540,9 +1198,7 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
                                 : p.basenameWithoutExtension(initialVideoPath);
                         final result = await ManualDanmakuMatcher.instance
                             .showManualMatchDialog(
-                          uiThemeProvider.isCupertinoTheme
-                              ? rootContext
-                              : context,
+                          uiThemeProvider.isPhoneLayout ? rootContext : context,
                           initialVideoTitle: initialSearchKeyword,
                         );
 
@@ -597,10 +1253,10 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
+                    Text(
                       '保存弹幕',
                       style: TextStyle(
-                        color: Colors.white,
+                        color: menuColors.foreground,
                         fontSize: 14,
                       ),
                     ),
@@ -632,274 +1288,6 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
                   ],
                 ),
               ),
-              // 弹幕不透明度
-              Container(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SettingsSlider(
-                      value: videoState.danmakuOpacity,
-                      onChanged: (v) => videoState.setDanmakuOpacity(v),
-                      label: '弹幕不透明度',
-                      displayTextBuilder: (v) => '${(v * 100).toInt()}%',
-                      min: 0.0,
-                      max: 1.0,
-                    ),
-                    const SizedBox(height: 4),
-                    const SettingsHintText('拖动滑块调整弹幕不透明度'),
-                  ],
-                ),
-              ),
-              // 弹幕字体大小
-              Container(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SettingsSlider(
-                      value: videoState.danmakuFontSize <= 0
-                          ? videoState.actualDanmakuFontSize
-                          : videoState.danmakuFontSize,
-                      onChanged: (v) => videoState.setDanmakuFontSize(v),
-                      onChangeEnd: (v) => videoState.setDanmakuFontSize(
-                        v,
-                        commit: true,
-                      ),
-                      label: '弹幕字体大小',
-                      displayTextBuilder: (v) => '${v.toStringAsFixed(1)}px',
-                      min: 12.0,
-                      max: 60.0,
-                      step: 0.5, // 0.5间隔
-                    ),
-                    const SizedBox(height: 4),
-                    const SettingsHintText('调整弹幕文字的大小，轨道间距会自动适配'),
-                  ],
-                ),
-              ),
-              // 弹幕显示效果
-              Container(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      '弹幕显示效果',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 14,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      '当前字体：${_danmakuFontLabel(videoState)}',
-                      style: TextStyle(
-                        color: Colors.white.withOpacity(0.85),
-                        fontSize: 13,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: BlurButton(
-                            text: '选择字体文件',
-                            icon: Icons.folder_open,
-                            onTap: () => _pickDanmakuFontFile(videoState),
-                            expandHorizontally: true,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: BlurButton(
-                            text: '恢复默认',
-                            icon: Icons.restart_alt,
-                            onTap: () => _resetDanmakuFont(videoState),
-                            expandHorizontally: true,
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    if (_isNext2Kernel) ...[
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text(
-                            '描边',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 13,
-                            ),
-                          ),
-                          FluentSettingsSwitch(
-                            value: videoState.next2DanmakuOutlineWidth > 0.0,
-                            onChanged: (value) {
-                              videoState.setNext2DanmakuOutlineWidth(
-                                value ? 1.0 : 0.0,
-                              );
-                            },
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                    ] else ...[
-                      const Text(
-                        '描边样式',
-                        style: TextStyle(color: Colors.white, fontSize: 13),
-                      ),
-                      const SizedBox(height: 8),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: DanmakuOutlineStyle.values.map((style) {
-                          final selected =
-                              videoState.danmakuOutlineStyle == style;
-                          return BlurButton(
-                            text: _outlineStyleLabel(style),
-                            icon: selected
-                                ? Icons.check_circle
-                                : Icons.radio_button_unchecked,
-                            fontSize: 12,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                              vertical: 5,
-                            ),
-                            foregroundColor: selected
-                                ? Colors.white
-                                : Colors.white.withOpacity(0.75),
-                            onTap: () =>
-                                videoState.setDanmakuOutlineStyle(style),
-                          );
-                        }).toList(),
-                      ),
-                      const SizedBox(height: 12),
-                    ],
-                    if (_isNext2Kernel) ...[
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text(
-                            '阴影',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 13,
-                            ),
-                          ),
-                          FluentSettingsSwitch(
-                            value: videoState.danmakuShadowStyle !=
-                                DanmakuShadowStyle.none,
-                            onChanged: (value) {
-                              videoState.setDanmakuShadowStyle(
-                                value
-                                    ? DanmakuShadowStyle.strong
-                                    : DanmakuShadowStyle.none,
-                              );
-                            },
-                          ),
-                        ],
-                      ),
-                    ] else ...[
-                      const Text(
-                        '阴影样式',
-                        style: TextStyle(color: Colors.white, fontSize: 13),
-                      ),
-                      const SizedBox(height: 8),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: DanmakuShadowStyle.values.map((style) {
-                          final selected =
-                              videoState.danmakuShadowStyle == style;
-                          return BlurButton(
-                            text: _shadowStyleLabel(style),
-                            icon: selected
-                                ? Icons.check_circle
-                                : Icons.radio_button_unchecked,
-                            fontSize: 12,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                              vertical: 5,
-                            ),
-                            foregroundColor: selected
-                                ? Colors.white
-                                : Colors.white.withOpacity(0.75),
-                            onTap: () =>
-                                videoState.setDanmakuShadowStyle(style),
-                          );
-                        }).toList(),
-                      ),
-                    ],
-                    const SizedBox(height: 4),
-                  ],
-                ),
-              ),
-              // 滚动弹幕速度
-              Container(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SettingsSlider(
-                      value: videoState.danmakuSpeedMultiplier,
-                      onChanged: (v) => videoState.setDanmakuSpeedMultiplier(v),
-                      label: '滚动弹幕速度',
-                      displayTextBuilder: (v) => '${v.toStringAsFixed(2)}x',
-                      min: 0.5,
-                      max: 2.0,
-                      step: 0.05,
-                    ),
-                    const SizedBox(height: 4),
-                    const SettingsHintText('向左减慢滚动弹幕速度，向右加快（默认1.00x）'),
-                  ],
-                ),
-              ),
-              // 弹幕轨道显示区域
-              Container(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SettingsSlider(
-                      value: _snapDanmakuDisplayArea(
-                          videoState.danmakuDisplayArea),
-                      onChanged: (v) => videoState
-                          .setDanmakuDisplayArea(_snapDanmakuDisplayArea(v)),
-                      label: '轨道显示区域',
-                      displayTextBuilder: _danmakuDisplayAreaText,
-                      min: _danmakuDisplayAreaOptions.first,
-                      max: _danmakuDisplayAreaOptions.last,
-                    ),
-                    const SizedBox(height: 4),
-                    const SettingsHintText('设置弹幕轨道在屏幕上的显示范围'),
-                  ],
-                ),
-              ),
-              // DFM+ 弹幕轨道间距（仅 DFM+ 引擎显示）
-              if (DanmakuKernelFactory.getKernelType() ==
-                  DanmakuRenderEngine.dfmPlus)
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      SettingsSlider(
-                        value: videoState.danmakuDfmPlusTrackGap,
-                        onChanged: (v) =>
-                            videoState.setDanmakuDfmPlusTrackGap(v),
-                        label: '弹幕轨道间距',
-                        displayTextBuilder: (v) =>
-                            '${(v * 100).round()}%',
-                        min: 0.0,
-                        max: 0.5,
-                        step: 0.01,
-                      ),
-                      const SizedBox(height: 4),
-                      const SettingsHintText(
-                          '增大间距可减少弹幕重叠，减小间距可显示更多弹幕（默认15%）'),
-                    ],
-                  ),
-                ),
               // 弹幕屏蔽词
               Padding(
                 padding: const EdgeInsets.only(left: 16, right: 16, top: 16),
@@ -911,10 +1299,10 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          const Text(
+                          Text(
                             '弹幕屏蔽词',
                             style: TextStyle(
-                              color: Colors.white,
+                              color: menuColors.foreground,
                               fontSize: 14,
                               fontWeight: FontWeight.bold,
                             ),
@@ -948,171 +1336,6 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
                   );
                 }),
               ),
-              // 弹幕堆叠开关（Canvas/NipaPlay Next/Next2/DFM+ 模式下隐藏）
-              if (DanmakuKernelFactory.getKernelType() !=
-                      DanmakuRenderEngine.canvas &&
-                  DanmakuKernelFactory.getKernelType() !=
-                      DanmakuRenderEngine.nipaplayNext &&
-                  DanmakuKernelFactory.getKernelType() !=
-                      DanmakuRenderEngine.next2 &&
-                  DanmakuKernelFactory.getKernelType() !=
-                      DanmakuRenderEngine.dfmPlus)
-                Padding(
-                  padding: const EdgeInsets.only(left: 16, right: 16, top: 8),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text(
-                            '弹幕堆叠',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 14,
-                            ),
-                          ),
-                          FluentSettingsSwitch(
-                            value: videoState.danmakuStacking,
-                            onChanged: (value) {
-                              videoState.setDanmakuStacking(value);
-                            },
-                          ),
-                        ],
-                      ),
-                      const SettingsHintText('允许多条弹幕重叠显示，适合弹幕密集场景'),
-                    ],
-                  ),
-                ),
-              // 合并相同弹幕开关（Canvas模式下隐藏）
-              if (DanmakuKernelFactory.getKernelType() !=
-                  DanmakuRenderEngine.canvas)
-                Padding(
-                  padding: const EdgeInsets.only(left: 16, right: 16, top: 8),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text(
-                            '合并相同弹幕',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 14,
-                            ),
-                          ),
-                          FluentSettingsSwitch(
-                            value: videoState.mergeDanmaku,
-                            onChanged: (value) {
-                              videoState.setMergeDanmaku(value);
-                            },
-                          ),
-                        ],
-                      ),
-                      const SettingsHintText('将内容相同的弹幕合并为一条显示，减少屏幕干扰'),
-                    ],
-                  ),
-                ),
-
-              // 弹幕类型屏蔽（移除标题，只保留开关）
-              Padding(
-                padding: const EdgeInsets.only(left: 16, right: 16, top: 8),
-                child: Consumer<VideoPlayerState>(
-                    builder: (context, videoState, child) {
-                  return Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      // 顶部弹幕屏蔽
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text(
-                            '屏蔽顶部弹幕',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 14,
-                            ),
-                          ),
-                          FluentSettingsSwitch(
-                            value: videoState.blockTopDanmaku,
-                            onChanged: (value) {
-                              videoState.setBlockTopDanmaku(value);
-                            },
-                          ),
-                        ],
-                      ),
-                      // 底部弹幕屏蔽
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text(
-                            '屏蔽底部弹幕',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 14,
-                            ),
-                          ),
-                          FluentSettingsSwitch(
-                            value: videoState.blockBottomDanmaku,
-                            onChanged: (value) {
-                              videoState.setBlockBottomDanmaku(value);
-                            },
-                          ),
-                        ],
-                      ),
-                      // 滚动弹幕屏蔽
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text(
-                            '屏蔽滚动弹幕',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 14,
-                            ),
-                          ),
-                          FluentSettingsSwitch(
-                            value: videoState.blockScrollDanmaku,
-                            onChanged: (value) {
-                              videoState.setBlockScrollDanmaku(value);
-                            },
-                          ),
-                        ],
-                      ),
-                      const SettingsHintText('选择屏蔽特定类型的弹幕，对应类型的弹幕将不会显示'),
-                    ],
-                  );
-                }),
-              ),
-              // 时间轴告知开关（移到最底部）
-              Padding(
-                padding: const EdgeInsets.only(left: 16, right: 16, top: 8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text(
-                          '时间轴告知',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 14,
-                          ),
-                        ),
-                        FluentSettingsSwitch(
-                          value: videoState.isTimelineDanmakuEnabled,
-                          onChanged: (value) {
-                            videoState.toggleTimelineDanmaku(value);
-                          },
-                        ),
-                      ],
-                    ),
-                    const SettingsHintText('在视频特定进度(25%/50%/75%/90%)显示弹幕提示'),
-                  ],
-                ),
-              ),
             ],
           ),
         );
@@ -1121,323 +1344,89 @@ class _DanmakuSettingsMenuState extends State<DanmakuSettingsMenu> {
   }
 
   Widget _buildDesktopBlockWordInput() {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(8),
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 5, sigmaY: 5),
-        child: Container(
-          height: 80,
-          decoration: BoxDecoration(
-            color: Colors.white.withOpacity(0.1),
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(
-              color: _hasBlockWordError
-                  ? Colors.redAccent.withOpacity(0.8)
-                  : Colors.white.withOpacity(0.3),
-              width: 1,
-            ),
+    final menuColors = PlayerMenuTheme.colorsOf(context);
+    final borderColor = _hasBlockWordError
+        ? Colors.redAccent.withOpacity(0.8)
+        : menuColors.controlBorder;
+
+    return SizedBox(
+      height: 80,
+      child: TextField(
+        controller: _blockWordController,
+        style: TextStyle(color: menuColors.foreground, fontSize: 13),
+        textAlignVertical: TextAlignVertical.center,
+        maxLines: 3,
+        decoration: InputDecoration(
+          hintText: '输入要屏蔽的关键词\n（支持正则，以"规则名称/表达式/"形式输入；支持逗号分隔批量添加）',
+          hintStyle: TextStyle(
+            color: menuColors.disabledForeground,
+            fontSize: 13,
           ),
-          child: Center(
-            child: TextField(
-              controller: _blockWordController,
-              style: const TextStyle(color: Colors.white, fontSize: 13),
-              textAlignVertical: TextAlignVertical.center,
-              maxLines: 3,
-              decoration: InputDecoration(
-                hintText: '输入要屏蔽的关键词\n（支持正则，以"规则名称/表达式/"形式输入；支持逗号分隔批量添加）',
-                hintStyle: TextStyle(
-                    color: Colors.white.withOpacity(0.5), fontSize: 13),
-                border: InputBorder.none,
-                contentPadding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 0),
-                isDense: true,
-                suffixIcon: IconButton(
-                  icon: const Icon(Icons.clear, color: Colors.white, size: 18),
-                  onPressed: () => _blockWordController.clear(),
-                  tooltip: '',
-                  padding: EdgeInsets.zero,
-                  visualDensity: VisualDensity.compact,
-                  constraints: const BoxConstraints(),
-                ),
-              ),
-              onSubmitted: (_) => _addBlockWord(),
+          filled: true,
+          fillColor: menuColors.controlBackground,
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          isDense: true,
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: BorderSide(color: borderColor, width: 1),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: BorderSide(color: menuColors.accent, width: 1),
+          ),
+          errorBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: BorderSide(color: borderColor, width: 1),
+          ),
+          focusedErrorBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: BorderSide(color: borderColor, width: 1),
+          ),
+          suffixIcon: IconButton(
+            icon: Icon(
+              Icons.clear,
+              color: menuColors.secondaryForeground,
+              size: 18,
             ),
+            onPressed: () => _blockWordController.clear(),
+            tooltip: '',
+            padding: EdgeInsets.zero,
+            visualDensity: VisualDensity.compact,
+            constraints: const BoxConstraints(),
           ),
         ),
+        onSubmitted: (_) => _addBlockWord(),
       ),
     );
   }
 
   Widget _buildMobileBlockWordInput() {
+    final menuColors = PlayerMenuTheme.colorsOf(context);
     return GestureDetector(
       onTap: _showBlockWordInputDialog,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(8),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 5, sigmaY: 5),
-          child: Container(
-            height: 80,
-            decoration: BoxDecoration(
-              color: Colors.white.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(
-                color: _hasBlockWordError
-                    ? Colors.redAccent.withOpacity(0.8)
-                    : Colors.white.withOpacity(0.3),
-                width: 1,
-              ),
-            ),
-            child: Center(
-              child: Text(
-                '点击输入屏蔽词',
-                style: TextStyle(
-                  color: Colors.white.withOpacity(0.5),
-                  fontSize: 13,
-                ),
-              ),
+      child: Container(
+        height: 80,
+        decoration: BoxDecoration(
+          color: menuColors.controlBackground,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: _hasBlockWordError
+                ? Colors.redAccent.withOpacity(0.8)
+                : menuColors.controlBorder,
+            width: 1,
+          ),
+        ),
+        child: Center(
+          child: Text(
+            '点击输入屏蔽词',
+            style: TextStyle(
+              color: menuColors.disabledForeground,
+              fontSize: 13,
             ),
           ),
         ),
       ),
-    );
-  }
-}
-
-class _DanmakuOpacitySlider extends StatefulWidget {
-  final VideoPlayerState videoState;
-  const _DanmakuOpacitySlider({required this.videoState});
-
-  @override
-  State<_DanmakuOpacitySlider> createState() => _DanmakuOpacitySliderState();
-}
-
-class _DanmakuOpacitySliderState extends State<_DanmakuOpacitySlider> {
-  final GlobalKey _sliderKey = GlobalKey();
-  bool _isHovering = false;
-  bool _isThumbHovered = false;
-  bool _isDragging = false;
-  OverlayEntry? _overlayEntry;
-
-  @override
-  void dispose() {
-    _removeOverlay();
-    super.dispose();
-  }
-
-  void _removeOverlay() {
-    _overlayEntry?.remove();
-    _overlayEntry = null;
-  }
-
-  void _showOverlay(BuildContext context, double progress) {
-    _removeOverlay();
-    final RenderBox? sliderBox =
-        _sliderKey.currentContext?.findRenderObject() as RenderBox?;
-    if (sliderBox == null) return;
-    final position = sliderBox.localToGlobal(Offset.zero);
-    final size = sliderBox.size;
-    final bubbleX = position.dx + (progress * size.width) - 20;
-    final bubbleY = position.dy - 40;
-    _overlayEntry = OverlayEntry(
-      builder: (context) => Material(
-        type: MaterialType.transparency,
-        child: Stack(
-          children: [
-            Positioned(
-              left: bubbleX,
-              top: bubbleY,
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: BackdropFilter(
-                  filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
-                  child: Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.2),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(
-                        color: Colors.white.withOpacity(0.3),
-                        width: 0.5,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withOpacity(0.2),
-                          blurRadius: 8,
-                          offset: const Offset(0, 2),
-                        ),
-                      ],
-                    ),
-                    child: Text(
-                      '${(widget.videoState.danmakuOpacity * 100).toInt()}%',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-    Overlay.of(context).insert(_overlayEntry!);
-  }
-
-  void _updateOpacityFromPosition(Offset localPosition) {
-    final RenderBox? sliderBox =
-        _sliderKey.currentContext?.findRenderObject() as RenderBox?;
-    if (sliderBox != null) {
-      final width = sliderBox.size.width;
-      final progress = (localPosition.dx / width).clamp(0.0, 1.0);
-      widget.videoState.setDanmakuOpacity(progress);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text(
-          '弹幕不透明度',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 14,
-          ),
-        ),
-        const SizedBox(height: 8),
-        MouseRegion(
-          onEnter: (_) {
-            setState(() {
-              _isHovering = true;
-            });
-          },
-          onExit: (_) {
-            setState(() {
-              _isHovering = false;
-              _isThumbHovered = false;
-            });
-          },
-          onHover: (event) {
-            if (!_isHovering || _isDragging) return;
-            final RenderBox? sliderBox =
-                _sliderKey.currentContext?.findRenderObject() as RenderBox?;
-            if (sliderBox != null) {
-              final localPosition = sliderBox.globalToLocal(event.position);
-              final width = sliderBox.size.width;
-              final progress = (localPosition.dx / width).clamp(0.0, 1.0);
-              final thumbRect = Rect.fromLTWH(
-                  (widget.videoState.danmakuOpacity * width) - 8, 16, 16, 16);
-              setState(() {
-                _isThumbHovered = thumbRect.contains(localPosition);
-              });
-            }
-          },
-          child: GestureDetector(
-            onHorizontalDragStart: (details) {
-              setState(() => _isDragging = true);
-              _updateOpacityFromPosition(details.localPosition);
-              _showOverlay(context, widget.videoState.danmakuOpacity);
-            },
-            onHorizontalDragUpdate: (details) {
-              _updateOpacityFromPosition(details.localPosition);
-              if (_overlayEntry != null) {
-                _showOverlay(context, widget.videoState.danmakuOpacity);
-              }
-            },
-            onHorizontalDragEnd: (details) {
-              setState(() => _isDragging = false);
-              _removeOverlay();
-            },
-            onTapDown: (details) {
-              setState(() => _isDragging = true);
-              _updateOpacityFromPosition(details.localPosition);
-              _showOverlay(context, widget.videoState.danmakuOpacity);
-            },
-            onTapUp: (details) {
-              setState(() => _isDragging = false);
-              _removeOverlay();
-            },
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                return Stack(
-                  key: _sliderKey,
-                  clipBehavior: Clip.none,
-                  // 背景轨道
-                  children: [
-                    Container(
-                      height: 4,
-                      margin: const EdgeInsets.symmetric(vertical: 20),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.2),
-                        borderRadius: BorderRadius.circular(2),
-                      ),
-                    ),
-                    // 进度轨道
-                    Positioned(
-                      left: 0,
-                      right: 0,
-                      top: 20,
-                      child: FractionallySizedBox(
-                        widthFactor: widget.videoState.danmakuOpacity,
-                        alignment: Alignment.centerLeft,
-                        child: Container(
-                          height: 4,
-                          decoration: BoxDecoration(
-                            color: Colors.white.withOpacity(0.5),
-                            borderRadius: BorderRadius.circular(2),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.white.withOpacity(0.3),
-                                blurRadius: 2,
-                                spreadRadius: 0.5,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                    // 滑块
-                    Positioned(
-                      left: (widget.videoState.danmakuOpacity *
-                              constraints.maxWidth) -
-                          (_isThumbHovered || _isDragging ? 8 : 6),
-                      top: 22 - (_isThumbHovered || _isDragging ? 8 : 6),
-                      child: MouseRegion(
-                        cursor: SystemMouseCursors.click,
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 200),
-                          curve: Curves.easeOutBack,
-                          width: _isThumbHovered || _isDragging ? 16 : 12,
-                          height: _isThumbHovered || _isDragging ? 16 : 12,
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            shape: BoxShape.circle,
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withOpacity(0.2),
-                                blurRadius:
-                                    _isThumbHovered || _isDragging ? 6 : 4,
-                                offset: const Offset(0, 2),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                );
-              },
-            ),
-          ),
-        ),
-        const SizedBox(height: 4),
-        const SettingsHintText('拖动滑块调整弹幕不透明度'),
-      ],
     );
   }
 }

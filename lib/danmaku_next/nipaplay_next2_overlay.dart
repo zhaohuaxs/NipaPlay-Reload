@@ -2,7 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:nipaplay/danmaku_abstraction/positioned_danmaku_item.dart';
 import 'package:nipaplay/providers/settings_provider.dart';
-import 'package:nipaplay/utils/video_player_state.dart';
+import 'package:nipaplay/utils/danmaku/style.dart';
 import 'package:provider/provider.dart';
 
 import 'next2_emoji_pipeline.dart';
@@ -72,9 +72,6 @@ class _NipaPlayNext2OverlayState extends State<NipaPlayNext2Overlay> {
   int _lastTextureWidth = 0;
   int _lastTextureHeight = 0;
   String _lastTextureSurfaceId = '';
-
-  /// Low-DPR screens render at 2x then downscale to fix aliasing.
-  static const double _supersampleMultiplier = 2.0;
 
   @override
   void initState() {
@@ -161,7 +158,7 @@ class _NipaPlayNext2OverlayState extends State<NipaPlayNext2Overlay> {
             final needsSupersample =
                 context.watch<SettingsProvider>().danmakuSupersample;
             final filterQuality =
-                needsSupersample ? FilterQuality.low : FilterQuality.none;
+                needsSupersample > 0.0 ? FilterQuality.low : FilterQuality.none;
             final Widget content = hasTexture
                 ? Texture(
                     textureId: _textureId!,
@@ -247,11 +244,16 @@ class _NipaPlayNext2OverlayState extends State<NipaPlayNext2Overlay> {
     // ensureTexture → isNewEngine → resetScene → flicker.
     final dpr = _lastDevicePixelRatio;
 
-    final needsSupersample =
-        context.read<SettingsProvider>().danmakuSupersample;
-    final supersample = needsSupersample ? _supersampleMultiplier : 1.0;
-    final double pixelRatio =
-        (dpr.isFinite ? dpr.clamp(1.0, 4.0).toDouble() : 1.0) * supersample;
+    final supersample = context
+        .read<SettingsProvider>()
+        .danmakuSupersample;
+    // True supersampling: texture = backing × supersample (backing = layout ×
+    // dpr). Flutter downsamples on display → anti-aliased edges. Must be
+    // dpr × supersample (NOT max) or 1.5x/2x silently no-op on DPR≥2 devices.
+    // The 1.5x setting is the lighter alternative. Clamp only guards extremes.
+    final baseDpr = dpr.isFinite ? dpr.clamp(1.0, 4.0).toDouble() : 1.0;
+    final ss = supersample > 0.0 ? supersample : 1.0;
+    final double pixelRatio = (baseDpr * ss).clamp(1.0, 6.0);
 
     final int pixelWidth =
         (_layoutSize.width * pixelRatio).round().clamp(1, 16384).toInt();

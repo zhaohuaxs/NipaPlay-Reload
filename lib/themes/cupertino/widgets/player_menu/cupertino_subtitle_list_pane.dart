@@ -1,30 +1,30 @@
 import 'dart:async';
+import 'package:flutter/rendering.dart';
 
 import 'package:nipaplay/themes/cupertino/cupertino_imports.dart';
+import 'package:nipaplay/themes/cupertino/cupertino_adaptive_platform_ui.dart'
+    show AdaptiveButton, AdaptiveButtonSize, AdaptiveButtonStyle;
+import 'package:nipaplay/themes/cupertino/widgets/player_menu/adaptive_player_menu_primitives.dart';
 
 import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
 import 'package:nipaplay/services/subtitle_service.dart';
 import 'package:nipaplay/utils/subtitle_parser.dart';
-import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_pane_back_button.dart';
 import 'package:nipaplay/utils/video_player_state.dart';
 
 class CupertinoSubtitleListPane extends StatefulWidget {
   const CupertinoSubtitleListPane({
     super.key,
     required this.videoState,
-    required this.onBack,
   });
 
   final VideoPlayerState videoState;
-  final VoidCallback onBack;
 
   @override
   State<CupertinoSubtitleListPane> createState() =>
       _CupertinoSubtitleListPaneState();
 }
 
-class _CupertinoSubtitleListPaneState
-    extends State<CupertinoSubtitleListPane> {
+class _CupertinoSubtitleListPaneState extends State<CupertinoSubtitleListPane> {
   final SubtitleService _subtitleService = SubtitleService();
   final ScrollController _scrollController = ScrollController();
 
@@ -43,7 +43,11 @@ class _CupertinoSubtitleListPaneState
 
   static const int _windowSize = 120;
   static const int _bufferSize = 60;
-  static const double _estimatedItemHeight = 74;
+  // 预估每项高度（首次定位后按真实布局校准）
+  double _estimatedItemHeight = 74;
+  // 当前高亮条目的 Key，用于基于真实 RenderBox 精确定位（估算高度存在偏差）
+  final GlobalKey _currentItemKey = GlobalKey();
+  bool _locatingUnbuiltItem = false;
 
   @override
   void initState() {
@@ -63,7 +67,7 @@ class _CupertinoSubtitleListPaneState
   }
 
   void _handleScroll() {
-    if (_isWindowLoading || _allEntries.isEmpty) return;
+    if (_isWindowLoading || _locatingUnbuiltItem || _allEntries.isEmpty) return;
     final position = _scrollController.position.pixels;
     final isNearTop = position < 400;
     final isNearBottom =
@@ -169,8 +173,9 @@ class _CupertinoSubtitleListPaneState
   }
 
   void _initializeVisibleWindow(int centerIndex) {
-    int start =
-        (centerIndex - _windowSize ~/ 2).clamp(0, _allEntries.length - 1).toInt();
+    int start = (centerIndex - _windowSize ~/ 2)
+        .clamp(0, _allEntries.length - 1)
+        .toInt();
     int end = (start + _windowSize).clamp(0, _allEntries.length).toInt();
 
     setState(() {
@@ -180,19 +185,137 @@ class _CupertinoSubtitleListPaneState
     });
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scrollController.hasClients) return;
-      final target = (_currentLocalIndex.clamp(0, _visibleEntries.length - 1) *
-          _estimatedItemHeight);
-      _scrollController.jumpTo(target);
+      _scrollToCurrentItem(centerIndex, animated: false);
     });
+  }
+
+  // 精确定位到当前高亮条目（与 nipaplay subtitle_list_menu 同策略）：
+  // 估算高度与真实条目高度存在偏差（估算 74px，多行台词约 85~110px），
+  // 且随窗口内索引线性放大，直接按估算偏移 jumpTo 会把高亮定位到可视区
+  // 之外（用户反馈"需要再滑动才能看到高亮"）。
+  // 先用估算高度粗定位，真实布局完成后用 Scrollable.ensureVisible 校正；
+  // 若目标条目尚未构建，用实测内容高度校准估算值后重跳一次再校正。
+  void _scrollToCurrentItem(int globalIndex, {required bool animated}) {
+    if (_visibleEntries.isEmpty) return;
+    final localIndex = (globalIndex - _windowStartIndex)
+        .clamp(0, _visibleEntries.length - 1)
+        .toInt();
+
+    // 1) 粗定位：按当前估算高度跳转
+    if (_scrollController.hasClients) {
+      final target = (localIndex * _estimatedItemHeight)
+          .clamp(0.0, _scrollController.position.maxScrollExtent);
+      if ((_scrollController.offset - target).abs() > 1) {
+        _scrollController.jumpTo(target);
+      }
+    }
+
+    // 2) 下一帧基于真实布局精确校正
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _calibrateItemHeight();
+      final itemContext = _currentItemKey.currentContext;
+      if (itemContext != null) {
+        Scrollable.ensureVisible(
+          itemContext,
+          alignment: 0.3,
+          duration:
+              animated ? const Duration(milliseconds: 240) : Duration.zero,
+          curve: Curves.easeInOut,
+        );
+        return;
+      }
+
+      // 3) 目标条目仍未构建：用校准后的高度重跳，再等一帧做最终校正。
+      if (!_scrollController.hasClients) return;
+      final target = (localIndex * _estimatedItemHeight)
+          .clamp(0.0, _scrollController.position.maxScrollExtent);
+      _scrollController.jumpTo(target);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final ctx = _currentItemKey.currentContext;
+        if (ctx != null) {
+          Scrollable.ensureVisible(
+            ctx,
+            alignment: 0.3,
+            duration:
+                animated ? const Duration(milliseconds: 240) : Duration.zero,
+            curve: Curves.easeInOut,
+          );
+        } else {
+          _locateUnbuiltItem(globalIndex);
+        }
+      });
+    });
+  }
+
+  // Variable-height rows can defeat both estimated jumps. Put the target at
+  // the start of a new window so SliverList must build it, then reveal it.
+  void _locateUnbuiltItem(int globalIndex) {
+    if (_locatingUnbuiltItem || !_scrollController.hasClients) return;
+    _locatingUnbuiltItem = true;
+    _updateVisibleWindow(globalIndex);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) {
+        _locatingUnbuiltItem = false;
+        return;
+      }
+      _scrollController.jumpTo(0);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          final itemContext = _currentItemKey.currentContext;
+          if (itemContext != null) {
+            Scrollable.ensureVisible(itemContext, alignment: 0.3);
+          }
+        }
+        _locatingUnbuiltItem = false;
+      });
+    });
+  }
+
+  void _keepCurrentItemVisible(int globalIndex) {
+    if (!_scrollController.hasClients) return;
+    final itemContext = _currentItemKey.currentContext;
+    if (itemContext == null) {
+      _locateUnbuiltItem(globalIndex);
+      return;
+    }
+    final item = itemContext.findRenderObject();
+    final viewport = RenderAbstractViewport.maybeOf(item);
+    if (item == null || viewport == null) return;
+    final pixels = _scrollController.position.pixels;
+    final leading = viewport.getOffsetToReveal(item, 0).offset;
+    final trailing = viewport.getOffsetToReveal(item, 1).offset;
+    if (leading >= pixels - 1 && trailing <= pixels + 1) return;
+    Scrollable.ensureVisible(
+      itemContext,
+      alignment: 0.3,
+      duration: const Duration(milliseconds: 240),
+      curve: Curves.easeInOut,
+    );
+  }
+
+  // 用列表实际内容高度校准估算条目高度：
+  // 内容高度 = maxScrollExtent + 视口高度，平均条目高度 = 内容高度 / 条目数。
+  void _calibrateItemHeight() {
+    if (!_scrollController.hasClients || _visibleEntries.isEmpty) return;
+    final position = _scrollController.position;
+    if (position.viewportDimension <= 0 || position.maxScrollExtent <= 0) {
+      return;
+    }
+    final contentHeight = position.maxScrollExtent + position.viewportDimension;
+    final measured = contentHeight / _visibleEntries.length;
+    if (measured > 0 &&
+        (measured - _estimatedItemHeight).abs() / _estimatedItemHeight > 0.05) {
+      _estimatedItemHeight = measured;
+    }
   }
 
   void _updateVisibleWindow(int newStartIndex) {
     if (_isWindowLoading || _allEntries.isEmpty) return;
     setState(() => _isWindowLoading = true);
 
-    final int maxStart =
-        (_allEntries.length - _windowSize).clamp(0, _allEntries.length).toInt();
+    final int maxStart = _allEntries.length - 1;
     newStartIndex = newStartIndex.clamp(0, maxStart).toInt();
     final int newEndIndex =
         (newStartIndex + _windowSize).clamp(0, _allEntries.length).toInt();
@@ -209,12 +332,25 @@ class _CupertinoSubtitleListPaneState
 
   int _findNearestSubtitleIndex(int positionMs) {
     if (_allEntries.isEmpty) return 0;
+    // 语义：高亮"正在显示/刚刚播过"的台词。
+    // 1) 播放位置落在某条 [start,end] 区间内 → 该条；
+    // 2) 处于台词间隙 → 已开始(start<=position)的最后一条。
+    // 旧实现返回首条 startTimeMs>=position 的字幕，会跳过正在播的那条；
+    // 台词稀疏时（如乐器段 19:00→21:00 无对白）高亮跑到几分钟后（用户反馈）。
+    int lastIndex = 0;
     for (int i = 0; i < _allEntries.length; i++) {
-      if (_allEntries[i].startTimeMs >= positionMs) {
+      final entry = _allEntries[i];
+      if (positionMs >= entry.startTimeMs && positionMs <= entry.endTimeMs) {
         return i;
       }
+      if (entry.startTimeMs <= positionMs) {
+        lastIndex = i;
+      } else {
+        // 字幕按起始时间升序；遇到第一条还没开始的即结束扫描
+        return lastIndex;
+      }
     }
-    return _allEntries.length - 1;
+    return lastIndex;
   }
 
   void _updateCurrentSubtitle() {
@@ -229,6 +365,12 @@ class _CupertinoSubtitleListPaneState
 
     if (!insideWindow) {
       _updateVisibleWindow(globalIndex - _windowSize ~/ 2);
+      // 窗口更新后重新定位到当前条目（相对滚动位置保持依赖估算高度，需校正）
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _scrollToCurrentItem(globalIndex, animated: true);
+        }
+      });
       return;
     }
 
@@ -237,21 +379,11 @@ class _CupertinoSubtitleListPaneState
         _currentLocalIndex = localIndex;
       });
 
-      if (_scrollController.hasClients) {
-        final itemOffset = localIndex * _estimatedItemHeight;
-        final visibleStart = _scrollController.offset;
-        final visibleEnd =
-            visibleStart + _scrollController.position.viewportDimension;
-
-        if (itemOffset < visibleStart ||
-            itemOffset > visibleEnd - _estimatedItemHeight) {
-          _scrollController.animateTo(
-            itemOffset,
-            duration: const Duration(milliseconds: 240),
-            curve: Curves.easeInOut,
-          );
-        }
-      }
+      // 切句后只在高亮条目超出视口时滚动，避免每句都重新对齐。
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _currentLocalIndex != localIndex) return;
+        _keepCurrentItemVisible(globalIndex);
+      });
     }
   }
 
@@ -272,37 +404,26 @@ class _CupertinoSubtitleListPaneState
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '字幕预览',
-                          style: CupertinoTheme.of(context)
-                              .textTheme
-                              .navTitleTextStyle,
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          _allEntries.isEmpty
-                              ? '正在解析字幕文件…'
-                              : '共 ${_allEntries.length} 条字幕，点击任意条目跳转播放位置',
-                          style: CupertinoTheme.of(context)
-                              .textTheme
-                              .textStyle
-                              .copyWith(
-                                fontSize: 13,
-                                color: CupertinoColors.secondaryLabel
-                                    .resolveFrom(context),
-                              ),
-                        ),
-                      ],
+                    child: Text(
+                      _allEntries.isEmpty
+                          ? '正在解析字幕文件…'
+                          : '共 ${_allEntries.length} 条字幕，点击任意条目跳转播放位置',
+                      style: CupertinoTheme.of(context)
+                          .textTheme
+                          .textStyle
+                          .copyWith(
+                            fontSize: 13,
+                            color: CupertinoColors.secondaryLabel.resolveFrom(
+                              context,
+                            ),
+                          ),
                     ),
                   ),
-                  CupertinoButton(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  AdaptiveButton(
+                    label: '重新解析',
+                    style: AdaptiveButtonStyle.glass,
+                    size: AdaptiveButtonSize.small,
                     onPressed: _isLoading ? null : _loadSubtitles,
-                    child: const Text('重新解析'),
                   ),
                 ],
               ),
@@ -315,7 +436,7 @@ class _CupertinoSubtitleListPaneState
             const SliverFillRemaining(
               hasScrollBody: false,
               child: Center(
-                child: CupertinoActivityIndicator(radius: 16),
+                child: AdaptivePlayerMenuProgressIndicator(size: 32),
               ),
             ),
           );
@@ -371,9 +492,10 @@ class _CupertinoSubtitleListPaneState
                     final entry = _visibleEntries[index];
                     final bool isCurrent = index == _currentLocalIndex;
                     return Padding(
-                      padding:
-                          const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
-                      child: GestureDetector(
+                      key: isCurrent ? _currentItemKey : null,
+                      padding: const EdgeInsets.symmetric(
+                          vertical: 4, horizontal: 4),
+                      child: AdaptivePlayerMenuActionSurface(
                         onTap: () => _seekToTime(entry.startTimeMs),
                         child: Container(
                           padding: const EdgeInsets.all(12),
@@ -381,7 +503,7 @@ class _CupertinoSubtitleListPaneState
                             color: isCurrent
                                 ? CupertinoTheme.of(context)
                                     .primaryColor
-                                    .withOpacity(0.12)
+                                    .withValues(alpha: 0.12)
                                 : CupertinoColors.systemGrey6
                                     .resolveFrom(context),
                             borderRadius: BorderRadius.circular(12),
@@ -466,18 +588,12 @@ class _CupertinoSubtitleListPaneState
               child: Padding(
                 padding: EdgeInsets.only(bottom: 8),
                 child: Center(
-                  child: CupertinoActivityIndicator(radius: 10),
+                  child: AdaptivePlayerMenuProgressIndicator(size: 20),
                 ),
               ),
             ),
           );
         }
-
-        slivers.add(
-          SliverToBoxAdapter(
-            child: CupertinoPaneBackButton(onPressed: widget.onBack),
-          ),
-        );
 
         return slivers;
       },

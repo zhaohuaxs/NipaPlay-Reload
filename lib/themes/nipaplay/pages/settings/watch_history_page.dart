@@ -2,13 +2,12 @@ import 'dart:io';
 import 'dart:ui';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/cupertino.dart' as cupertino;
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:cached_network_image/cached_network_image.dart';
-import 'package:glassmorphism/glassmorphism.dart';
 import 'package:nipaplay/models/watch_history_model.dart';
-import 'package:nipaplay/providers/appearance_settings_provider.dart';
 import 'package:nipaplay/providers/watch_history_provider.dart';
+import 'package:nipaplay/providers/settings_provider.dart';
 import 'package:nipaplay/services/playback_service.dart';
 import 'package:nipaplay/services/jellyfin_service.dart';
 import 'package:nipaplay/services/emby_service.dart';
@@ -18,14 +17,21 @@ import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 import 'package:kmbal_ionicons/kmbal_ionicons.dart';
 import 'package:provider/provider.dart';
 import 'package:path/path.dart' as path;
+import 'package:nipaplay/widgets/media_server_network_image.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_dialog.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/hover_scale_text_button.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/history_like_list_card.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/keyboard_activatable.dart';
 import 'package:nipaplay/utils/watch_history_auto_match_helper.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
 
 class WatchHistoryPage extends StatefulWidget {
-  const WatchHistoryPage({super.key});
+  const WatchHistoryPage({
+    super.key,
+    this.phoneLayout = false,
+  });
+
+  final bool phoneLayout;
 
   @override
   State<WatchHistoryPage> createState() => _WatchHistoryPageState();
@@ -45,6 +51,10 @@ class _WatchHistoryPageState extends State<WatchHistoryPage> {
 
   @override
   Widget build(BuildContext context) {
+    if (widget.phoneLayout) {
+      return _buildPhonePage();
+    }
+
     final colorScheme = Theme.of(context).colorScheme;
     return Scaffold(
       backgroundColor: Colors.transparent,
@@ -78,6 +88,175 @@ class _WatchHistoryPageState extends State<WatchHistoryPage> {
             separatorBuilder: (context, index) => SizedBox(height: 8),
           );
         },
+      ),
+    );
+  }
+
+  Widget _buildPhonePage() {
+    final background = cupertino.CupertinoDynamicColor.resolve(
+      cupertino.CupertinoColors.systemGroupedBackground,
+      context,
+    );
+    return ColoredBox(
+      color: background,
+      child: Consumer<WatchHistoryProvider>(
+        builder: (context, historyProvider, child) {
+          if (historyProvider.isLoading && historyProvider.history.isEmpty) {
+            return const Center(
+              child: cupertino.CupertinoActivityIndicator(radius: 13),
+            );
+          }
+
+          final validHistory = _getValidHistory(historyProvider.history);
+          if (validHistory.isEmpty) {
+            return _buildPhoneEmptyState();
+          }
+
+          return ListView.separated(
+            padding: const EdgeInsets.fromLTRB(16, 72, 16, 28),
+            itemCount: validHistory.length,
+            itemBuilder: (context, index) {
+              return _buildPhoneWatchHistoryItem(validHistory[index]);
+            },
+            separatorBuilder: (_, __) => const SizedBox(height: 10),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildPhoneWatchHistoryItem(WatchHistoryItem item) {
+    final label = cupertino.CupertinoDynamicColor.resolve(
+      cupertino.CupertinoColors.label,
+      context,
+    );
+    final secondaryLabel = cupertino.CupertinoDynamicColor.resolve(
+      cupertino.CupertinoColors.secondaryLabel,
+      context,
+    );
+    final cardColor = cupertino.CupertinoDynamicColor.resolve(
+      cupertino.CupertinoColors.secondarySystemGroupedBackground,
+      context,
+    );
+    final accent = cupertino.CupertinoTheme.of(context).primaryColor;
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: cardColor,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: cupertino.CupertinoButton(
+              padding: const EdgeInsets.all(10),
+              borderRadius: BorderRadius.circular(8),
+              onPressed:
+                  _isAutoMatching ? null : () => _onWatchHistoryItemTap(item),
+              child: Row(
+                children: [
+                  _buildThumbnail(item),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          item.animeName.isNotEmpty
+                              ? item.animeName
+                              : path.basename(item.filePath),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: label,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          item.episodeTitle ?? '未知集数',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: secondaryLabel,
+                            fontSize: 12,
+                          ),
+                        ),
+                        if (item.watchProgress > 0) ...[
+                          const SizedBox(height: 7),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(1),
+                            child: SizedBox(
+                              height: 2,
+                              child: ColoredBox(
+                                color: secondaryLabel.withValues(alpha: 0.15),
+                                child: FractionallySizedBox(
+                                  alignment: Alignment.centerLeft,
+                                  widthFactor:
+                                      item.watchProgress.clamp(0.0, 1.0),
+                                  child: ColoredBox(color: accent),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    _formatTime(item.lastWatchTime),
+                    style: TextStyle(color: secondaryLabel, fontSize: 11),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          cupertino.CupertinoButton(
+            padding: const EdgeInsets.only(right: 10),
+            minimumSize: const Size.square(34),
+            onPressed: () => _showDeleteConfirmDialog(item),
+            child: const Icon(
+              cupertino.CupertinoIcons.delete,
+              size: 18,
+              color: cupertino.CupertinoColors.systemRed,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPhoneEmptyState() {
+    final secondaryLabel = cupertino.CupertinoDynamicColor.resolve(
+      cupertino.CupertinoColors.secondaryLabel,
+      context,
+    );
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              cupertino.CupertinoIcons.time,
+              size: 48,
+              color: secondaryLabel,
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              '暂无观看记录',
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '开始播放视频后，这里会显示观看记录',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: secondaryLabel, fontSize: 13),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -168,7 +347,7 @@ class _WatchHistoryPageState extends State<WatchHistoryPage> {
       if (lowerPath.startsWith('http://') || lowerPath.startsWith('https://')) {
         return ClipRRect(
           borderRadius: BorderRadius.circular(6),
-          child: Image.network(
+          child: MediaServerAwareNetworkImage(
             path,
             width: 80,
             height: 45,
@@ -259,7 +438,7 @@ class _WatchHistoryPageState extends State<WatchHistoryPage> {
                 Container(color: Colors.white),
                 ImageFiltered(
                   imageFilter: ImageFilter.blur(sigmaX: 40, sigmaY: 40),
-                  child: CachedNetworkImage(
+                  child: MediaServerAwareCachedNetworkImage(
                     imageUrl: imageUrl,
                     fit: BoxFit.cover,
                     errorWidget: (context, url, error) =>
@@ -335,6 +514,9 @@ class _WatchHistoryPageState extends State<WatchHistoryPage> {
       BlurSnackBar.show(context, '正在自动匹配，请稍候');
       return;
     }
+
+    final skipDanmakuMatching =
+        context.read<SettingsProvider>().skipDanmakuMatching;
 
     debugPrint(
         '[WatchHistoryPage] _onWatchHistoryItemTap: Received item: $item');
@@ -422,7 +604,8 @@ class _WatchHistoryPageState extends State<WatchHistoryPage> {
       return;
     }
 
-    if (WatchHistoryAutoMatchHelper.shouldAutoMatch(currentItem)) {
+    if (!skipDanmakuMatching &&
+        WatchHistoryAutoMatchHelper.shouldAutoMatch(currentItem)) {
       String matchablePath = currentItem.filePath;
       if (currentItem.filePath.startsWith('jellyfin://')) {
         final itemId = currentItem.filePath.replaceFirst('jellyfin://', '');
@@ -495,6 +678,30 @@ class _WatchHistoryPageState extends State<WatchHistoryPage> {
   void _showAutoMatchingDialog() {
     if (_autoMatchDialogVisible || !mounted) return;
     _autoMatchDialogVisible = true;
+    if (widget.phoneLayout) {
+      cupertino
+          .showCupertinoDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => const cupertino.CupertinoAlertDialog(
+          title: Text('正在自动匹配'),
+          content: Padding(
+            padding: EdgeInsets.only(top: 14),
+            child: Column(
+              children: [
+                cupertino.CupertinoActivityIndicator(radius: 12),
+                SizedBox(height: 12),
+                Text('正在为历史记录匹配弹幕，请稍候…'),
+              ],
+            ),
+          ),
+        ),
+      )
+          .whenComplete(() {
+        _autoMatchDialogVisible = false;
+      });
+      return;
+    }
     BlurDialog.show(
       context: context,
       title: '正在自动匹配',
@@ -531,15 +738,43 @@ class _WatchHistoryPageState extends State<WatchHistoryPage> {
   }
 
   void _showDeleteConfirmDialog(WatchHistoryItem item) {
+    if (widget.phoneLayout) {
+      cupertino.showCupertinoDialog<void>(
+        context: context,
+        builder: (dialogContext) => cupertino.CupertinoAlertDialog(
+          title: const Text('删除观看记录'),
+          content: Text('确定要删除 ${item.animeName} 的观看记录吗？'),
+          actions: [
+            cupertino.CupertinoDialogAction(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('取消'),
+            ),
+            cupertino.CupertinoDialogAction(
+              isDestructiveAction: true,
+              onPressed: () async {
+                final watchHistoryProvider =
+                    Provider.of<WatchHistoryProvider>(context, listen: false);
+                await watchHistoryProvider.removeHistory(item.filePath);
+                if (dialogContext.mounted) {
+                  Navigator.of(dialogContext).pop();
+                }
+              },
+              child: const Text('删除'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
     BlurDialog.show(
       context: context,
       title: '删除观看记录',
       content: '确定要删除 ${item.animeName} 的观看记录吗？',
-      actions: [
+      actionsBuilder: (dialogContext) => [
         HoverScaleTextButton(
           child: const Text('取消'),
           onPressed: () {
-            Navigator.of(context).pop();
+            Navigator.of(dialogContext).pop();
           },
         ),
         HoverScaleTextButton(
@@ -551,7 +786,7 @@ class _WatchHistoryPageState extends State<WatchHistoryPage> {
             final watchHistoryProvider =
                 Provider.of<WatchHistoryProvider>(context, listen: false);
             await watchHistoryProvider.removeHistory(item.filePath);
-            Navigator.of(context).pop();
+            Navigator.of(dialogContext).pop();
           },
         ),
       ],
@@ -610,35 +845,42 @@ class _AnimatedTrashButton extends StatefulWidget {
 
 class _AnimatedTrashButtonState extends State<_AnimatedTrashButton> {
   bool _isHovered = false;
+  bool _isFocused = false;
 
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final Color nipaColor = AppAccentColors.current;
+    final bool isActive = _isHovered || _isFocused;
 
-    return MouseRegion(
-      onEnter: (_) => setState(() => _isHovered = true),
-      onExit: (_) => setState(() => _isHovered = false),
-      cursor: SystemMouseCursors.click,
-      child: GestureDetector(
-        onTap: widget.onTap,
-        child: AnimatedScale(
-          scale: _isHovered ? 1.2 : 1.0,
-          duration: const Duration(milliseconds: 150),
-          curve: Curves.easeInOut,
-          child: AnimatedDefaultTextStyle(
+    return KeyboardActivatable(
+      onActivate: widget.onTap,
+      onFocusChange: (focused) => setState(() => _isFocused = focused),
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _isHovered = true),
+        onExit: (_) => setState(() => _isHovered = false),
+        cursor: SystemMouseCursors.click,
+        child: GestureDetector(
+          onTap: widget.onTap,
+          behavior: HitTestBehavior.opaque,
+          child: AnimatedScale(
+            scale: isActive ? 1.2 : 1.0,
             duration: const Duration(milliseconds: 150),
-            style: TextStyle(
-              color: _isHovered
-                  ? nipaColor
-                  : colorScheme.onSurface.withOpacity(0.4),
-            ),
-            child: Icon(
-              Ionicons.trash_outline,
-              size: 16,
-              color: _isHovered
-                  ? nipaColor
-                  : colorScheme.onSurface.withOpacity(0.4),
+            curve: Curves.easeInOut,
+            child: AnimatedDefaultTextStyle(
+              duration: const Duration(milliseconds: 150),
+              style: TextStyle(
+                color: isActive
+                    ? nipaColor
+                    : colorScheme.onSurface.withOpacity(0.4),
+              ),
+              child: Icon(
+                Ionicons.trash_outline,
+                size: 16,
+                color: isActive
+                    ? nipaColor
+                    : colorScheme.onSurface.withOpacity(0.4),
+              ),
             ),
           ),
         ),

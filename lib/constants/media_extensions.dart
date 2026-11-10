@@ -9,6 +9,7 @@ const Set<String> subtitleExtensions = {
   '.srt',
   '.sub',
   '.sup',
+  '.idx',
 };
 
 /// 支持的外挂音轨扩展名
@@ -26,3 +27,15 @@ const Set<String> fontExtensions = {
   '.otf',
   '.ttc',
 };
+
+
+/// 外部播放器类型,
+/// 决定弹幕 ASS 字幕的注入参数
+enum ExternalPlayerType {
+  unset,
+  mpv,
+  mpvNet,
+  potPlayer,
+  vlc,
+  generic,
+}

@@ -29,4 +29,19 @@ class SystemShareService {
       'subject': subject,
     });
   }
+
+  /// Exports a local file through iOS Files or Android's create-document UI.
+  /// iOS reports that the picker opened; Android also reports cancellation.
+  static Future<bool> exportFile(String filePath, {String? mimeType}) async {
+    if (kIsWeb ||
+        (defaultTargetPlatform != TargetPlatform.iOS &&
+            defaultTargetPlatform != TargetPlatform.android)) {
+      throw UnsupportedError('System file export is not supported here');
+    }
+    return await _channel.invokeMethod<bool>('exportFile', <String, dynamic>{
+          'filePath': filePath,
+          'mimeType': mimeType,
+        }) ??
+        false;
+  }
 }

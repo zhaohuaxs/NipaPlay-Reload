@@ -21,24 +21,43 @@
 
 ## Linux
 
-- Arch Linux（x86_64）：
-  
+- Arch Linux (AUR)：从 AUR 下载 二进制包 [`nipaplay-reload-bin`](https://aur.archlinux.org/packages/nipaplay-reload-bin) 或源码包 [`nipaplay-reload`](https://aur.archlinux.org/packages/nipaplay-reload)：
   ```bash
-  paru -S nipaplay-reload-bin
-  # 或
   yay -S nipaplay-reload-bin
   ```
-
-- Gentoo Linux (x86_64) :
+  或
   ```bash
-  ebuild gentoo/media-video/nipaplay-bin/nipaplay-bin-1.8.11.ebuild merge
+  yay -S nipaplay-reload
   ```
-  
-- 其他发行版：从 [Release 页面](https://github.com/AimesSoft/NipaPlay-Reload/releases) 下载对应构建包并按常规方式安装/运行。
+
+- Gentoo Linux (x86_64)：
+  ```bash
+  # 将版本号替换为当前最新版本
+  ebuild gentoo/media-video/nipaplay-bin/nipaplay-bin-<版本号>.ebuild merge
+  ```
+
+- 其他发行版：从 [Release 页面](https://github.com/AimesSoft/NipaPlay-Reload/releases) 下载对应构建包（AppImage / deb 等）并按常规方式安装/运行。
 
 ## Android
 
 - 从 [Release 页面](https://github.com/AimesSoft/NipaPlay-Reload/releases) 下载匹配架构的 APK（常见 arm64），启用"未知来源"后安装。
+
+## HarmonyOS
+
+HarmonyOS 当前主要面向开发者和测试用户，需要从源码构建 HAP，并使用 DevEco Studio 配置开发者签名；这不是 GitHub Release 中的通用安装包。开发者请参考
+[HarmonyOS 依赖与构建说明](../docs/HARMONYOS_MIGRATION_STATUS.md#harmonyos-依赖启用与恢复)。
+
+安装前请确认：
+
+- 已安装与仓库说明匹配的 OpenHarmony Native SDK 和 DevEco Studio。
+- 设备允许开发者模式和调试签名，且应用包的签名证书与设备匹配。
+- 当前构建可能缺少商店分发、自动更新和全部硬件能力；遇到播放问题请先切换内核并保留日志。
+
+## tvOS
+
+tvOS 当前是开发者预览路径，不提供面向普通用户的 App Store 安装包。需要 macOS、Xcode、tvOS 设备或模拟器以及项目指定的 tvOS Flutter fork。
+
+构建和签名说明见 [Apple TV 开发指南](../docs/TVOS_DEVELOPMENT.md)。真机安装需要 Apple Developer 签名；模拟器只能验证 UI 和部分播放流程，不能代表所有硬解、HDR 或遥控器行为。
 
 ## iOS
 

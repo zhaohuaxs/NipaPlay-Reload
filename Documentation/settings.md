@@ -6,11 +6,21 @@ NipaPlay 提供多种播放器内核，各有特点：
 
 ### 内核对比
 
-- **Libmpv（推荐）**：
+- **Erika（自研内核）**：
+  - ✅ NipaPlay 自研播放内核，Rust 实现
+  - ✅ macOS/iOS 使用 VideoToolbox + Metal；Linux 使用 NVDEC / VA-API
+  - ✅ 原生 HDR/EDR 支持，PQ (BT.2020) tone mapping
+  - ✅ AI 超分 (ArtCNN 2x)、弹幕 GPU 原生渲染
+  - ✅ 覆盖所有当前原生客户端平台，Linux 从 1.11.9 起内置并默认使用；tvOS 会强制使用 Erika，Android TV 仍可选择其它已支持内核
+  - ⚠️ 各平台的 HDR、硬解、surface 合成和真机验证状态不同，请查看 [平台能力矩阵](platform-matrix.md)
+  - 🔬 可在 设置 → 实验室 中选择；Linux 新安装默认启用，tvOS 固定使用
+
+- **Media Kit（libmpv）**：
+  - ℹ️ Media Kit 是 Flutter 接入层，实际后端为 libmpv；设置页中的“Libmpv”和文档中的“Media Kit”是同一个内核选项
   - ✅ 支持硬件解码，性能优异
   - ✅ 兼容性强，支持各种视频格式和字幕
   - ✅ 解码能力完整（官方 Windows 包已自动集成完整版 libmpv，手动构建可参考下文）
-  - 🎯 **最推荐使用**，特别是性能受限的设备
+  - 🎯 **全平台推荐使用**，特别是性能受限的设备
 
 - **MDK**：
   - ✅ 跨平台支持良好
@@ -24,9 +34,10 @@ NipaPlay 提供多种播放器内核，各有特点：
 
 ### 切换建议
 
-- **首选**：Libmpv（性能和兼容性最佳）
-- **问题排查**：如遇播放问题，可尝试切换到其他内核进行对比
-- **性能考虑**：低配置设备务必使用 Libmpv 以获得硬件解码支持
+- **macOS/iOS/Windows/Android/HarmonyOS 用户**：均可在实验室功能中尝试 Erika；HDR、硬解和超分取决于设备与平台路径
+- **tvOS 用户**：播放器固定为 Erika，不能切换到其他内核
+- **Linux 用户**：1.11.9 起默认使用 Erika，也可选择 Media Kit（libmpv）或 MDK
+- **问题排查**：除 tvOS 外，可在 Erika、Media Kit（libmpv）和 MDK 之间切换对比
 
 ## Windows 平台解码器优化
 
@@ -80,9 +91,41 @@ NipaPlay 提供多种播放器内核，各有特点：
 
 ## 弹幕引擎配置
 
-NipaPlay 支持GPU与CPU渲染的弹幕引擎：
-- GPU渲染更高效，不过现阶段还有部分不完善的地方
-- CPU渲染更稳定，性能开销较大
+NipaPlay 提供多种弹幕渲染引擎，可在 设置 → 弹幕设置 中切换：
+
+- **NipaPlay Next（默认）**：NipaPlay 自研弹幕逻辑内核，平衡性能与效果
+- **NipaPlay Next++**：Next 的激进优化版本，牺牲部分精度换取更高性能（实验室功能）
+- **Next2**：NipaPlay Next2 逻辑 + Rust 原生渲染，平台有限制（实验室功能）
+- **DFM+**：基于 B 站 DanmakuFlameMaster 算法，Rust + GPU 渲染
+- **GPU**：GPU 加速渲染引擎，支持 MSDF 字体渲染
+- **Canvas**：Canvas 弹幕渲染
+- **CPU**：传统 CPU 渲染，兼容性最好但性能开销较大
+
+大部分用户使用默认的 NipaPlay Next 即可。如果弹幕量很大且设备性能允许，可以尝试 GPU 或 DFM+ 引擎。
+
+### 弹幕超采样
+
+弹幕超采样以 2x 分辨率渲染弹幕文本，在低 DPI 屏幕或平板上可以显著提升弹幕清晰度。默认对平板和低 DPR 桌面设备自动开启，可在 设置 → 弹幕设置 中手动切换。
+
+## 实验室功能
+
+设置 → 实验室 中提供了一些正在开发中的实验性功能：
+
+- **Erika 播放器内核**：各原生客户端平台均可使用 Erika，Linux 新安装默认启用；仅 tvOS 始终使用 Erika。HDR 路径和回退行为见 [平台能力矩阵](platform-matrix.md)
+- **Next2 弹幕内核**：启用 Next2 弹幕渲染引擎
+- **Next++ 激进优化**：启用 NipaPlay Next++ 弹幕引擎
+- **大屏幕模式**：针对平板/电视等大屏设备优化布局
+
+实验室功能可能不稳定，遇到问题可随时关闭回到默认设置。
+
+## AI 防剧透
+
+NipaPlay 支持通过 AI 智能识别并屏蔽弹幕中可能包含剧透的内容：
+
+- 支持 **OpenAI 兼容接口** 和 **Google Gemini** 两种 AI API
+- 在 设置 → AI 防剧透 中配置 API 地址、密钥和模型
+- 加载弹幕后自动发送给 AI 分析，屏蔽疑似剧透弹幕
+- 可调节温度参数和最大提示字符数
 
 ## 其他设置选项
 
@@ -146,7 +189,6 @@ NipaPlay 支持GPU与CPU渲染的弹幕引擎：
 
 - **壁纸设置**：自定义应用背景
 - **透明度调整**：界面透明效果控制
-- **毛玻璃效果**：现代化界面视觉效果强度调节
 
 ---
 

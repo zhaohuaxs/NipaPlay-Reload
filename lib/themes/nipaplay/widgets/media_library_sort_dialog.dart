@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'dart:ui';
+import 'package:nipaplay/widgets/in_view_dialog.dart';
 
 /// 媒体库类型枚举
 enum MediaLibraryType {
@@ -25,6 +26,11 @@ const List<MediaSortOption> jellyfinSortOptions = [
     value: 'DateCreated,SortName',
     label: '创建时间',
     description: '按文件创建时间排序',
+  ),
+  MediaSortOption(
+    value: 'DateLastContentAdded',
+    label: '剧集添加日期',
+    description: '按最新剧集添加时间排序，最近更新的番剧排在前面',
   ),
   MediaSortOption(
     value: 'SortName',
@@ -68,6 +74,11 @@ const List<MediaSortOption> embySortOptions = [
     value: 'DateCreated',
     label: '创建时间',
     description: '按文件创建时间排序',
+  ),
+  MediaSortOption(
+    value: 'DateLastContentAdded',
+    label: '最后一集添加时间',
+    description: '按最后一集添加时间排序',
   ),
   MediaSortOption(
     value: 'SortName',
@@ -150,7 +161,7 @@ class MediaLibrarySortDialog extends StatefulWidget {
     required String currentSortOrder,
     required MediaLibraryType libraryType,
   }) {
-    return showDialog<Map<String, String>>(
+    return showInViewDialog<Map<String, String>>(
       context: context,
       builder: (context) => MediaLibrarySortDialog(
         currentSortBy: currentSortBy,

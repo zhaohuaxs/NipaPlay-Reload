@@ -1,10 +1,9 @@
+import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
 import 'dart:async';
 import 'dart:io';
-import 'dart:ui';
-import 'package:nipaplay/providers/appearance_settings_provider.dart';
-import 'package:provider/provider.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/player_menu_theme.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/player_overlay_surface.dart';
 
 class TooltipBubble extends StatefulWidget {
   final String text;
@@ -38,6 +37,7 @@ class _TooltipBubbleState extends State<TooltipBubble> {
   bool _isHovered = false;
   final GlobalKey _childKey = GlobalKey();
   OverlayEntry? _overlayEntry;
+  DesktopTooltipWindowController? _tooltipWindowController;
   Offset? _mousePosition;
 
   // Cached overlay position for in-place updates
@@ -48,27 +48,53 @@ class _TooltipBubbleState extends State<TooltipBubble> {
   Timer? _enterTimer;
   Timer? _exitTimer;
 
-  void _recalculatePosition() {
-    final RenderBox renderBox =
-        _childKey.currentContext?.findRenderObject() as RenderBox;
-    final position = renderBox.localToGlobal(Offset.zero);
-    final size = renderBox.size;
+  RenderBox? _overlayRenderBox() {
+    final renderObject = Overlay.maybeOf(context)?.context.findRenderObject();
+    if (renderObject is RenderBox && renderObject.hasSize) {
+      return renderObject;
+    }
+    return null;
+  }
+
+  Offset _toOverlayPosition(Offset globalPosition, RenderBox? overlayBox) {
+    if (overlayBox == null) {
+      return globalPosition;
+    }
+    return overlayBox.globalToLocal(globalPosition);
+  }
+
+  bool _recalculatePosition() {
+    final RenderObject? renderObject =
+        _childKey.currentContext?.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) {
+      return false;
+    }
+
+    final overlayBox = _overlayRenderBox();
+    final position = overlayBox == null
+        ? renderObject.localToGlobal(Offset.zero)
+        : renderObject.localToGlobal(Offset.zero, ancestor: overlayBox);
+    final size = renderObject.size;
     final bubbleWidth = _getBubbleWidth();
     final bubbleHeight = _getBubbleHeight();
+    final mousePosition = _mousePosition == null
+        ? null
+        : _toOverlayPosition(_mousePosition!, overlayBox);
 
     double left;
     double top;
 
     if (widget.position != null) {
-      left = widget.position! - bubbleWidth / 2;
+      left = _toOverlayPosition(Offset(widget.position!, 0), overlayBox).dx -
+          bubbleWidth / 2;
       top = widget.showOnTop
           ? position.dy - bubbleHeight - widget.verticalOffset
           : position.dy + size.height + widget.verticalOffset;
-    } else if (widget.followMouse && _mousePosition != null) {
-      left = _mousePosition!.dx - bubbleWidth / 2;
+    } else if (widget.followMouse && mousePosition != null) {
+      left = mousePosition.dx - bubbleWidth / 2;
       top = widget.showOnTop
-          ? _mousePosition!.dy - bubbleHeight - widget.verticalOffset
-          : _mousePosition!.dy + widget.verticalOffset;
+          ? mousePosition.dy - bubbleHeight - widget.verticalOffset
+          : mousePosition.dy + widget.verticalOffset;
     } else if (widget.showOnRight) {
       left = position.dx + size.width + widget.verticalOffset;
       top = position.dy + (size.height - bubbleHeight) / 2;
@@ -79,7 +105,7 @@ class _TooltipBubbleState extends State<TooltipBubble> {
           : position.dy + size.height + widget.verticalOffset;
     }
 
-    final screenSize = MediaQuery.of(context).size;
+    final screenSize = overlayBox?.size ?? MediaQuery.of(context).size;
     final maxLeft = screenSize.width - bubbleWidth - 10.0;
     if (maxLeft <= 10.0) {
       left = 10.0;
@@ -95,6 +121,7 @@ class _TooltipBubbleState extends State<TooltipBubble> {
 
     _overlayOffset = Offset(left, top);
     _overlayWidth = bubbleWidth;
+    return true;
   }
 
   void _updateOverlay(BuildContext context, [Offset? newMousePosition]) {
@@ -107,7 +134,14 @@ class _TooltipBubbleState extends State<TooltipBubble> {
       return;
     }
 
-    _recalculatePosition();
+    if (_updateDesktopTooltipWindow()) {
+      return;
+    }
+
+    if (!_recalculatePosition()) {
+      _hideOverlay();
+      return;
+    }
 
     if (_overlayEntry != null) {
       // Overlay already exists — update in place without removing/reinserting
@@ -117,14 +151,119 @@ class _TooltipBubbleState extends State<TooltipBubble> {
         builder: (context) => Positioned(
           left: _overlayOffset.dx,
           top: _overlayOffset.dy,
-          child: Material(
-            color: Colors.transparent,
-            child: _buildBubble(_overlayWidth),
+          // 气泡纯展示：不能拦截指针事件，否则它悬浮在菜单/按钮上方时
+          // 会挡住下方内容的点击。
+          child: IgnorePointer(
+            child: Material(
+              color: Colors.transparent,
+              child: _buildBubble(_overlayWidth),
+            ),
           ),
         ),
       );
       Overlay.of(context).insert(_overlayEntry!);
     }
+  }
+
+  bool _updateDesktopTooltipWindow() {
+    if (!DesktopMultiWindow.isSecondaryWindow(context) ||
+        !DesktopMultiWindow.supportsTooltipWindows) {
+      return false;
+    }
+    final anchorRect = _desktopTooltipAnchorRect();
+    if (anchorRect == null) return false;
+
+    final placement = widget.showOnRight
+        ? DesktopTransientWindowPlacement.right
+        : widget.showOnTop
+            ? DesktopTransientWindowPlacement.above
+            : DesktopTransientWindowPlacement.below;
+    final existing = _tooltipWindowController;
+    if (existing != null && !existing.isClosed) {
+      existing.updatePosition(
+        anchorRect: anchorRect,
+        placement: placement,
+        gap: widget.verticalOffset,
+      );
+      return true;
+    }
+
+    final width = _getBubbleWidth();
+    final height = _getBubbleHeight();
+    late DesktopTooltipWindowController controller;
+    final created = DesktopMultiWindow.createTooltipWindow(
+      context: context,
+      anchorRect: anchorRect,
+      size: Size(width, height),
+      placement: placement,
+      gap: widget.verticalOffset,
+      onClosed: () {
+        if (!identical(_tooltipWindowController, controller)) return;
+        DesktopMultiWindow.detachTransientView(controller);
+        _tooltipWindowController = null;
+      },
+    );
+    if (created == null) return false;
+    controller = created;
+    _tooltipWindowController = controller;
+    unawaited(_mountDesktopTooltipWhenReady(controller, width, height));
+    return true;
+  }
+
+  Future<void> _mountDesktopTooltipWhenReady(
+    DesktopTooltipWindowController controller,
+    double width,
+    double height,
+  ) async {
+    await controller.ready;
+    if (!mounted ||
+        controller.isClosed ||
+        !identical(_tooltipWindowController, controller)) {
+      return;
+    }
+    debugPrint(
+      '[TooltipBubble] mount native tooltip text="${widget.text}" '
+      'view=${controller.flutterView.viewId} '
+      'size=${width.toStringAsFixed(1)}x${height.toStringAsFixed(1)} '
+      'physicalSize='
+      '${controller.flutterView.physicalSize.width.toStringAsFixed(1)}x'
+      '${controller.flutterView.physicalSize.height.toStringAsFixed(1)}',
+    );
+    DesktopMultiWindow.attachTransientView(
+      controller,
+      DesktopTooltipWindow(
+        controller: controller,
+        child: DesktopMultiWindow.inheritTransientViewContext(
+          context,
+          _buildBubble(width),
+        ),
+      ),
+    );
+  }
+
+  Rect? _desktopTooltipAnchorRect() {
+    if (widget.followMouse && _mousePosition != null) {
+      return Rect.fromLTWH(
+        _mousePosition!.dx,
+        _mousePosition!.dy,
+        1,
+        1,
+      );
+    }
+    final renderObject = _childKey.currentContext?.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) {
+      return null;
+    }
+    final position = renderObject.localToGlobal(Offset.zero);
+    if (widget.position != null) {
+      return Rect.fromLTWH(
+        widget.position!,
+        position.dy,
+        1,
+        renderObject.size.height,
+      );
+    }
+    return position & renderObject.size;
   }
 
   double _getBubbleWidth() {
@@ -134,7 +273,7 @@ class _TooltipBubbleState extends State<TooltipBubble> {
     );
     final screenWidth = MediaQuery.of(context).size.width;
     final maxWidth = (screenWidth - 20).clamp(80.0, 320.0);
-    final textScaleFactor = MediaQuery.of(context).textScaleFactor;
+    final textScaler = MediaQuery.textScalerOf(context);
     final textPainter = TextPainter(
       text: TextSpan(
         text: widget.text,
@@ -142,7 +281,7 @@ class _TooltipBubbleState extends State<TooltipBubble> {
       ),
       textDirection: TextDirection.ltr,
       maxLines: 1,
-      textScaleFactor: textScaleFactor,
+      textScaler: textScaler,
     )..layout(minWidth: 0, maxWidth: maxWidth - widget.padding * 2);
 
     // 增加额外的宽度，确保组合键能够完整显示
@@ -171,19 +310,25 @@ class _TooltipBubbleState extends State<TooltipBubble> {
       fontSize: 12,
       fontWeight: FontWeight.w500,
     );
-    final textScaleFactor = MediaQuery.of(context).textScaleFactor;
+    final textScaler = MediaQuery.textScalerOf(context);
     final textPainter = TextPainter(
       text: TextSpan(text: widget.text, style: textStyle),
       textDirection: TextDirection.ltr,
       maxLines: 2,
-      textScaleFactor: textScaleFactor,
+      textScaler: textScaler,
     )..layout(maxWidth: _getBubbleWidth() - widget.padding * 2);
     return (textPainter.height + 12).clamp(30.0, 48.0);
   }
 
   void _hideOverlay() {
+    final tooltipWindow = _tooltipWindowController;
+    _tooltipWindowController = null;
+    if (tooltipWindow != null) {
+      DesktopMultiWindow.detachTransientView(tooltipWindow);
+    }
     _overlayEntry?.remove();
     _overlayEntry = null;
+    tooltipWindow?.close();
   }
 
   @override
@@ -198,6 +343,7 @@ class _TooltipBubbleState extends State<TooltipBubble> {
   void didUpdateWidget(covariant TooltipBubble oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.text != oldWidget.text && _isHovered) {
+      _hideOverlay();
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         _updateOverlay(context);
@@ -237,80 +383,26 @@ class _TooltipBubbleState extends State<TooltipBubble> {
   }
 
   Widget _buildBubble(double width) {
-    const textStyle = TextStyle(
-      color: Colors.white,
+    final colors = PlayerMenuTheme.colorsOf(context);
+    final textStyle = TextStyle(
+      color: colors.foreground,
       fontSize: 12,
       fontWeight: FontWeight.w500,
     );
 
-    if (kIsWeb) {
-      return Container(
-        width: width,
-        height: _getBubbleHeight(),
-        decoration: BoxDecoration(
-          color: const Color(0xFF202020),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-            color: Colors.white.withValues(alpha: 0.2),
-            width: 0.5,
-          ),
-        ),
-        child: Center(
-          child: Padding(
-            padding: EdgeInsets.symmetric(horizontal: widget.padding),
-            child: Text(
-              widget.text,
-              style: textStyle,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              textAlign: TextAlign.center,
-            ),
-          ),
-        ),
-      );
-    }
-
-    return Container(
+    return PlayerOverlaySurface(
       width: width,
       height: _getBubbleHeight(),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(8),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(
-              sigmaX: context
-                      .watch<AppearanceSettingsProvider>()
-                      .enableWidgetBlurEffect
-                  ? 10
-                  : 0,
-              sigmaY: context
-                      .watch<AppearanceSettingsProvider>()
-                      .enableWidgetBlurEffect
-                  ? 10
-                  : 0),
-          child: Container(
-            decoration: BoxDecoration(
-              color: Colors.black.withValues(alpha: 0.58),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.2),
-                width: 0.5,
-              ),
-            ),
-            child: Center(
-              child: Padding(
-                padding: EdgeInsets.symmetric(horizontal: widget.padding),
-                child: Text(
-                  widget.text,
-                  style: textStyle,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  textAlign: TextAlign.center,
-                ),
-              ),
-            ),
+      borderRadius: 8,
+      child: Center(
+        child: Padding(
+          padding: EdgeInsets.symmetric(horizontal: widget.padding),
+          child: Text(
+            widget.text,
+            style: textStyle,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
           ),
         ),
       ),

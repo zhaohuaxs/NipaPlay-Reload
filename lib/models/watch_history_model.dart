@@ -1,11 +1,14 @@
+import 'dart:async';
 import 'dart:io' as io;
 import 'package:path/path.dart' as path;
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'watch_history_database.dart'; // 添加引入数据库类
 import 'package:nipaplay/utils/storage_service.dart';
+import 'package:nipaplay/services/anime_deletion_tombstones.dart';
 import 'package:nipaplay/services/auto_sync_service.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
+import 'package:nipaplay/utils/media_identity_resolver.dart';
 
 class WatchHistoryItem {
   String filePath;
@@ -20,6 +23,7 @@ class WatchHistoryItem {
   String? thumbnailPath;
   bool isFromScan;
   String? videoHash; // 添加视频哈希值字段，用于弹幕匹配
+  String? mediaKey;
   bool get isDandanplayRemote {
     final normalized = filePath.toLowerCase();
     return normalized.startsWith('dandanplay://') ||
@@ -39,6 +43,7 @@ class WatchHistoryItem {
     this.thumbnailPath,
     this.isFromScan = false,
     this.videoHash,  // 添加哈希值参数
+    this.mediaKey,
   });
 
   Map<String, dynamic> toJson() {
@@ -55,6 +60,7 @@ class WatchHistoryItem {
       'thumbnailPath': thumbnailPath,
       'isFromScan': isFromScan,
       'videoHash': videoHash, // 添加视频哈希值
+      'mediaKey': mediaKey,
     };
   }
 
@@ -63,17 +69,18 @@ class WatchHistoryItem {
       filePath: json['filePath'],
       animeName: json['animeName'] ?? path.basename(json['filePath']),
       episodeTitle: json['episodeTitle'],
-      episodeId: json['episodeId'],
-      animeId: json['animeId'],
-      watchProgress: json['watchProgress'] ?? 0.0,
-      lastPosition: json['lastPosition'] ?? 0,
-      duration: json['duration'] ?? 0,
+      episodeId: (json['episodeId'] as num?)?.toInt(),
+      animeId: (json['animeId'] as num?)?.toInt(),
+      watchProgress: (json['watchProgress'] as num?)?.toDouble() ?? 0.0,
+      lastPosition: (json['lastPosition'] as num?)?.toInt() ?? 0,
+      duration: (json['duration'] as num?)?.toInt() ?? 0,
       lastWatchTime: json['lastWatchTime'] != null
           ? DateTime.parse(json['lastWatchTime'])
           : DateTime.now(),
       thumbnailPath: json['thumbnailPath'],
       isFromScan: json['isFromScan'] ?? false,
       videoHash: json['videoHash'], // 添加视频哈希值
+      mediaKey: json['mediaKey']?.toString(),
     );
   }
 
@@ -90,6 +97,7 @@ class WatchHistoryItem {
     String? thumbnailPath,
     bool? isFromScan,
     String? videoHash,
+    String? mediaKey,
   }) {
     return WatchHistoryItem(
       filePath: filePath ?? this.filePath,
@@ -104,14 +112,33 @@ class WatchHistoryItem {
       thumbnailPath: thumbnailPath ?? this.thumbnailPath,
       isFromScan: isFromScan ?? this.isFromScan,
       videoHash: videoHash ?? this.videoHash,
+      mediaKey: mediaKey ?? this.mediaKey,
     );
   }
+
+  /// Clears the visible match while retaining episode IDs for progress recovery.
+  WatchHistoryItem withoutMatchInfo() => WatchHistoryItem(
+        filePath: filePath,
+        animeName: '',
+        episodeTitle: null,
+        episodeId: episodeId,
+        animeId: animeId,
+        watchProgress: watchProgress,
+        lastPosition: lastPosition,
+        duration: duration,
+        lastWatchTime: lastWatchTime,
+        thumbnailPath: thumbnailPath,
+        isFromScan: false,
+        videoHash: videoHash,
+        mediaKey: mediaKey,
+      );
 }
 
 class WatchHistoryManager {
   static const String _historyFileName = 'watch_history.json';
   static late String _historyFilePath;
   static bool _initialized = false;
+  static Future<void>? _initializing;
   static bool _isWriting = false; // 添加写入锁标志
   static final List<WatchHistoryItem> _cachedItems = []; // 添加内存缓存
   static DateTime _lastWriteTime = DateTime.now(); // 记录最后写入时间
@@ -127,6 +154,15 @@ class WatchHistoryManager {
   // 初始化历史记录管理器
   static Future<void> initialize() async {
     if (_initialized) return;
+    final pending = _initializing ??= _initialize();
+    try {
+      await pending;
+    } finally {
+      if (identical(_initializing, pending)) _initializing = null;
+    }
+  }
+
+  static Future<void> _initialize() async {
     if (kIsWeb) {
       try {
         _migratedToDatabase = true;
@@ -420,7 +456,10 @@ class WatchHistoryManager {
 
   // 获取所有历史记录
   static Future<List<WatchHistoryItem>> getAllHistory() async {
-    if (!_initialized) await initialize();
+    if (!_initialized) {
+      await initialize();
+      return List.from(_cachedItems);
+    }
     
     // 如果已迁移到数据库，则直接从数据库获取
     if (_migratedToDatabase) {
@@ -506,7 +545,18 @@ class WatchHistoryManager {
   // 添加或更新历史记录
   static Future<void> addOrUpdateHistory(WatchHistoryItem item) async {
     if (!_initialized) await initialize();
-    
+
+    // 已删除番剧的写入拦截：animeName 为空的写入视为云端残留或扫描
+    // 脏数据倒灌，直接丢弃；animeName 非空说明是用户主动产生的数据
+    // （重新匹配/观看），解除墓碑并正常写入。
+    if (item.animeId != null &&
+        await AnimeDeletionTombstones.isDeleted(item.animeId)) {
+      if (item.animeName.trim().isEmpty) {
+        return;
+      }
+      await AnimeDeletionTombstones.clear(item.animeId!);
+    }
+
     // 如果已迁移到数据库，则直接使用数据库API
     if (_migratedToDatabase) {
       try {
@@ -526,17 +576,7 @@ class WatchHistoryManager {
         
         _cachedItems.sort((a, b) => b.lastWatchTime.compareTo(a.lastWatchTime));
         _lastWriteTime = DateTime.now();
-        
-        // 触发自动同步（仅桌面端）
-        if (globals.isDesktop) {
-          Future.microtask(() async {
-            try {
-              await AutoSyncService.instance.manualSync();
-            } catch (e) {
-              debugPrint('自动同步触发失败: $e');
-            }
-          });
-        }
+        _scheduleIncrementalSyncAfterChange();
         
         return;
       } catch (e) {
@@ -589,6 +629,7 @@ class WatchHistoryManager {
 
       await file.writeAsString(jsonString);
       _lastWriteTime = DateTime.now();
+      _scheduleIncrementalSyncAfterChange();
       
       // 验证保存后新文件的大小
       final newFileSize = await file.length();
@@ -693,6 +734,7 @@ class WatchHistoryManager {
         
         // 更新内存缓存，保持同步
         _cachedItems.removeWhere((item) => item.filePath == filePath);
+        _scheduleIncrementalSyncAfterChange();
         return;
       } catch (e) {
         debugPrint('使用数据库删除历史记录失败: $e');
@@ -719,6 +761,7 @@ class WatchHistoryManager {
       final file = io.File(_historyFilePath);
       await file.writeAsString(jsonString);
       _lastWriteTime = DateTime.now();
+      _scheduleIncrementalSyncAfterChange();
     } finally {
       _isWriting = false;
     }
@@ -736,6 +779,7 @@ class WatchHistoryManager {
         
         // 清空内存缓存，保持同步
         _cachedItems.clear();
+        _scheduleIncrementalSyncAfterChange();
         return;
       } catch (e) {
         debugPrint('使用数据库清空历史记录失败: $e');
@@ -752,6 +796,12 @@ class WatchHistoryManager {
       await file.writeAsString('[]'); 
     }
     _lastWriteTime = DateTime.now();
+    _scheduleIncrementalSyncAfterChange();
+  }
+
+  static void _scheduleIncrementalSyncAfterChange() {
+    if (!globals.isDesktop) return;
+    unawaited(AutoSyncService.instance.scheduleSyncAfterLocalChange());
   }
 
   // New method to get history item by animeId and episodeId
@@ -778,6 +828,77 @@ class WatchHistoryManager {
       );
     } catch (e) {
       return null;
+    }
+  }
+
+  static Future<List<WatchHistoryItem>> getMatchedItemsForEpisode(
+      int animeId, int episodeId) async {
+    if (!_initialized) await initialize();
+    if (_migratedToDatabase) {
+      return WatchHistoryDatabase.instance
+          .getMatchedHistoriesByEpisode(animeId, episodeId);
+    }
+    return _cachedItems
+        .where((item) =>
+            item.animeId == animeId &&
+            item.episodeId == episodeId &&
+            item.animeName.trim().isNotEmpty &&
+            item.filePath.trim().isNotEmpty)
+        .toList()
+      ..sort((a, b) => b.lastWatchTime.compareTo(a.lastWatchTime));
+  }
+
+  static Future<WatchHistoryItem?> getClearedHistoryItemByEpisode(
+      int animeId, int episodeId) async {
+    if (!_initialized) await initialize();
+    if (_migratedToDatabase) {
+      return WatchHistoryDatabase.instance
+          .getClearedHistoryByEpisode(animeId, episodeId);
+    }
+    final cleared = _cachedItems
+        .where((item) =>
+            item.animeId == animeId &&
+            item.episodeId == episodeId &&
+            item.animeName.trim().isEmpty)
+        .toList()
+      ..sort((a, b) => b.lastWatchTime.compareTo(a.lastWatchTime));
+    return cleared.isEmpty ? null : cleared.first;
+  }
+
+  /// Unlinks this file only. A concurrent rematch to another episode is retained.
+  static Future<bool> clearMatchInfoForFile(WatchHistoryItem expected) async {
+    if (!_initialized) await initialize();
+    if (_migratedToDatabase) {
+      final changed = await WatchHistoryDatabase.instance
+          .clearMatchInfoForFile(expected);
+      if (!changed) return false;
+      final index = _cachedItems.indexWhere(
+          (item) => item.filePath == expected.filePath);
+      if (index >= 0) _cachedItems[index] = _cachedItems[index].withoutMatchInfo();
+      _scheduleIncrementalSyncAfterChange();
+      return true;
+    }
+    // Serialize with the legacy JSON writer, and propagate write failures.
+    while (_isWriting) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    final index = _cachedItems.indexWhere((item) =>
+        item.filePath == expected.filePath &&
+        item.animeId == expected.animeId &&
+        item.episodeId == expected.episodeId);
+    if (index < 0) return false;
+    _isWriting = true;
+    try {
+      final updated = List<WatchHistoryItem>.of(_cachedItems);
+      updated[index] = updated[index].withoutMatchInfo();
+      await io.File(_historyFilePath)
+          .writeAsString(jsonEncode(updated.map((item) => item.toJson()).toList()));
+      _cachedItems[index] = updated[index];
+      _lastWriteTime = DateTime.now();
+      _scheduleIncrementalSyncAfterChange();
+      return true;
+    } finally {
+      _isWriting = false;
     }
   }
 
@@ -871,8 +992,33 @@ class WatchHistoryManager {
     return _cachedItems.where((item) => item.animeId == animeId).toList();
   }
 
-  // Clear scan results for a specific animeId while preserving watch progress
-  static Future<int> clearScanResultsByAnimeId(int animeId) async {
+  /// 按 filePath 删除单条历史记录（用于进度迁移后清理旧记录）
+  static Future<void> removeHistoryItem(String filePath) async {
+    if (!_initialized) await initialize();
+
+    if (_migratedToDatabase) {
+      try {
+        final db = WatchHistoryDatabase.instance;
+        await db.deleteHistory(filePath);
+        _cachedItems.removeWhere((item) => item.filePath == filePath);
+        return;
+      } catch (e) {
+        debugPrint('从数据库删除历史记录失败: $e');
+      }
+    }
+
+    _cachedItems.removeWhere((item) => item.filePath == filePath);
+  }
+
+  // 清除指定 animeId 下的所有匹配信息，但保留播放进度和关联 ID。
+  // 清空的内容：animeName 置空串、episodeTitle 置 null、isFromScan 置 false。
+  // 保留的内容：animeId、episodeId、watchProgress、lastPosition、duration 等。
+  // 保留 animeId/episodeId 的原因：当用户更换文件路径重新匹配同一部番时，
+  // 路径变更后仅从已清除匹配的旧记录迁移进度；仍有效的同集其他版本不受影响。
+  // 注意：animeName 不再用文件名覆盖——在线媒体的 filePath 是 URL，
+  // 取 basename 会得到 URL 转义片段，并非"清空"。空串与未匹配状态一致，
+  // UI 显示时按既有逻辑自行 fallback。
+  static Future<int> clearMatchInfoByAnimeId(int animeId) async {
     if (!_initialized) await initialize();
 
     final items = await getAllItemsForAnime(animeId);
@@ -880,17 +1026,21 @@ class WatchHistoryManager {
 
     int updatedCount = 0;
     for (final item in items) {
-      if (!item.isFromScan) continue;
-      final fileName = path.basename(item.filePath);
-      final fallbackName =
-          fileName.isNotEmpty ? path.basenameWithoutExtension(fileName) : item.animeName;
-      final clearedHistory = item.copyWith(
-        animeName: fallbackName,
+      // 直接构造新记录而非 copyWith：copyWith 中 `null` 表示"保持原值"，
+      // 传 null 无法清空 episodeTitle 这些可空字段。
+      final clearedHistory = WatchHistoryItem(
+        filePath: item.filePath,
+        animeName: '',
         episodeTitle: null,
-        episodeId: null,
-        animeId: null,
+        episodeId: item.episodeId, // 保留 episodeId，用于重新匹配时迁移进度
+        animeId: item.animeId, // 保留 animeId，用于重新匹配时迁移进度
+        watchProgress: item.watchProgress, // 保留观看进度
+        lastPosition: item.lastPosition, // 保留观看位置
+        duration: item.duration,
         lastWatchTime: DateTime.now(),
+        thumbnailPath: item.thumbnailPath,
         isFromScan: false,
+        videoHash: item.videoHash,
       );
       await addOrUpdateHistory(clearedHistory);
       updatedCount++;
@@ -899,7 +1049,8 @@ class WatchHistoryManager {
   }
 
   // Remove all history items for a specific animeId
-  static Future<int> removeHistoryByAnimeId(int animeId) async {
+  static Future<int> removeHistoryByAnimeId(int animeId,
+      {bool recordTombstone = true}) async {
     if (!_initialized) await initialize();
 
     // 如果已迁移到数据库，则直接使用数据库API
@@ -910,6 +1061,9 @@ class WatchHistoryManager {
 
         if (count > 0) {
           _cachedItems.removeWhere((item) => item.animeId == animeId);
+          if (recordTombstone) {
+            await AnimeDeletionTombstones.record(animeId);
+          }
         }
         return count;
       } catch (e) {
@@ -920,7 +1074,7 @@ class WatchHistoryManager {
 
     if (_isWriting) {
       await Future.delayed(const Duration(seconds: 1));
-      return removeHistoryByAnimeId(animeId);
+      return removeHistoryByAnimeId(animeId, recordTombstone: recordTombstone);
     }
 
     try {
@@ -936,6 +1090,9 @@ class WatchHistoryManager {
         final file = io.File(_historyFilePath);
         await file.writeAsString(jsonString);
         _lastWriteTime = DateTime.now();
+        if (recordTombstone) {
+          await AnimeDeletionTombstones.record(animeId);
+        }
       }
 
       return removedCount;
@@ -967,7 +1124,14 @@ class WatchHistoryManager {
       // 使用原有的JSON逻辑
       final items = await getAllHistory();
       try {
-        return items.firstWhere((item) => item.filePath == filePath);
+        final mediaKey = MediaIdentityResolver.forPath(filePath);
+        return items.firstWhere(
+          (item) =>
+              item.filePath == filePath ||
+              (item.mediaKey ??
+                      MediaIdentityResolver.forPath(item.filePath)) ==
+                  mediaKey,
+        );
       } catch (e) {
         // 如果在iOS上没找到，尝试使用替代路径
         if (io.Platform.isIOS) {

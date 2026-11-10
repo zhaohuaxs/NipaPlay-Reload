@@ -1,30 +1,149 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
 import '../player_abstraction/player_factory.dart';
 import '../player_abstraction/player_abstraction.dart';
 import '../danmaku_abstraction/danmaku_kernel_factory.dart';
 import '../danmaku_next/next2_platform_support.dart';
+import 'globals.dart' as globals;
+import 'package:nipaplay/constants/settings_keys.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:nipaplay/utils/storage_service.dart';
 import 'video_player_state.dart';
 import '../models/watch_history_model.dart';
 
 /// 播放器内核管理器
 /// 提供多内核支持的静态工具方法
 class PlayerKernelManager {
-  /// 为VideoPlayerState执行播放器内核热切换
+  static const Duration defaultHotSwapPlayerDisposalTimeout =
+      Duration(seconds: 10);
+
+  // ── 热切换同步落盘 trace ────────────────────────────────────────────
+  // FileLogService 每 1s 才从内存缓冲刷盘，主 isolate 被原生 FFI 阻塞或
+  // 崩溃时缓冲全部丢失（用户实测：app 卡死后日志中断，无法定位卡死点）。
+  // 这里在每个阶段【之前】同步 writeAsStringSync(flush:true)——app 卡死后
+  // 日志文件的最后一行即精确卡死步骤。仅热切换期间写入，开销可忽略。
+  static String? _hotSwapTraceFilePath;
+
+  static Future<void> _prepareHotSwapTraceFile() async {
+    if (_hotSwapTraceFilePath != null) return;
+    try {
+      final appDir = await StorageService.getAppStorageDirectory();
+      final logDir = Directory(p.join(appDir.path, 'logs'));
+      if (!logDir.existsSync()) {
+        logDir.createSync(recursive: true);
+      }
+      _hotSwapTraceFilePath = p.join(logDir.path, 'kernel_swap_trace.txt');
+    } catch (_) {
+      // 落盘不可用时静默降级：trace 仍会输出到 debugPrint
+    }
+  }
+
+  /// 同步写入一条热切换阶段 trace（可被各内核适配器调用）。
+  static void traceHotSwapStage(String message) {
+    final line = '[${DateTime.now().toIso8601String()}] $message';
+    debugPrint('[KernelSwapTrace] $line');
+    final file = _hotSwapTraceFilePath;
+    if (file == null) return;
+    try {
+      File(file).writeAsStringSync(
+        '$line\n',
+        mode: FileMode.append,
+        flush: true,
+      );
+    } catch (_) {
+      // trace 失败不影响热切换本身
+    }
+  }
+
+  /// Serialize swaps and create a replacement only after native teardown succeeds.
   static Future<void> performPlayerKernelHotSwap(
-      VideoPlayerState videoPlayerState) async {
+    VideoPlayerState videoPlayerState, {
+    Duration playerDisposalTimeout = defaultHotSwapPlayerDisposalTimeout,
+  }) {
+    final task = _hotSwapQueue.catchError((Object _) {}).then(
+          (_) => _performPlayerKernelHotSwapLocked(
+            videoPlayerState,
+            playerDisposalTimeout: playerDisposalTimeout,
+          ),
+        );
+    _hotSwapQueue = task;
+    return task;
+  }
+
+  /// 热切换排队链：前一轮完成前，后续切换一律等待。
+  static Future<void> _hotSwapQueue = Future<void>.value();
+
+  static Future<void> _performPlayerKernelHotSwapLocked(
+    VideoPlayerState videoPlayerState, {
+    required Duration playerDisposalTimeout,
+  }) async {
+    if (videoPlayerState.isDisposed) {
+      return;
+    }
+    await _prepareHotSwapTraceFile();
+    traceHotSwapStage(
+        'swap begin kernel=${videoPlayerState.player.getPlayerKernelName()}');
+    // surface 代数自增 → 渲染层 ValueKey 变化 → 旧 Texture/PlatformView 子树
+    // 被强制销毁重建（等效"关闭重开"）。必须在创建新 Player 之前发生，
+    // 保证新 surface 挂载时平台线程上只有新内核实例。
+    traceHotSwapStage('stage=surfaceSwap begin');
+    videoPlayerState.beginKernelSurfaceSwap();
+    traceHotSwapStage('stage=surfaceSwap done');
+    await performPlayerKernelHotSwapSteps(
+      videoPlayerState,
+      playerDisposalTimeout: playerDisposalTimeout,
+    );
+  }
+
+  static Future<void> _disposePlayerForHotSwap(
+    Player player, {
+    required Duration timeout,
+  }) async {
+    final kernelName = player.getPlayerKernelName();
+    traceHotSwapStage('old teardown start kernel=$kernelName');
+    try {
+      await player.disposeAsync().timeout(timeout);
+      traceHotSwapStage('old teardown completed kernel=$kernelName');
+    } catch (error) {
+      // A timeout does not cancel teardown. Leave the old player assigned so
+      // retries await the same future instead of overlapping native instances.
+      traceHotSwapStage('old teardown failed kernel=$kernelName $error');
+      rethrow;
+    }
+  }
+
+  /// Save playback state, release the old kernel, then initialize its replacement.
+  static Future<void> performPlayerKernelHotSwapSteps(
+    VideoPlayerState videoPlayerState, {
+    required Duration playerDisposalTimeout,
+  }) async {
+    if (videoPlayerState.isDisposed) {
+      return;
+    }
     debugPrint('[PlayerKernelManager] 开始执行播放器内核热切换...');
 
     // 1. 保存当前播放状态
     final currentPath = videoPlayerState.currentVideoPath;
     final currentPosition = videoPlayerState.position;
+    debugPrint(
+        '[PlayerKernelManager] 切换捕获 position=${currentPosition.inMilliseconds}ms');
     final currentDuration = videoPlayerState.duration;
     final currentProgress = videoPlayerState.progress;
-    final currentVolume = videoPlayerState.player.volume;
     final currentPlaybackRate = videoPlayerState.playbackRate;
     final wasPlaying = videoPlayerState.status == PlayerStatus.playing;
+
+    // 1.1 主动写进度到 PlaybackPositionStore：initializePlayer 内部
+    // _getVideoPosition 会 flush + 读同一个 store，确保切换后从精确
+    // 位置恢复，不依赖周期性保存的 ~650ms 误差。
+    if (currentPath != null && currentPath.isNotEmpty) {
+      await videoPlayerState.persistCurrentPositionForHotSwap(
+        path: currentPath,
+        positionMs: currentPosition.inMilliseconds,
+      );
+    }
+
     final historyItem = WatchHistoryItem(
       filePath: currentPath ?? '',
       animeName: videoPlayerState.animeTitle ?? '',
@@ -38,63 +157,94 @@ class PlayerKernelManager {
     );
 
     if (currentPath == null) {
-      debugPrint('[PlayerKernelManager] 没有正在播放的视频，仅创建新播放器实例');
+      await _disposePlayerForHotSwap(
+        videoPlayerState.player,
+        timeout: playerDisposalTimeout,
+      );
+      debugPrint('[PlayerKernelManager] 没有正在播放的视频，旧播放器已释放');
       // 如果没有视频在播放，只需要创建一个新的播放器实例以备后用
-      videoPlayerState.player.dispose();
+      if (videoPlayerState.isDisposed) {
+        return;
+      }
       videoPlayerState.player = Player();
       videoPlayerState.subtitleManager.updatePlayer(videoPlayerState.player);
       videoPlayerState.audioTrackManager.updatePlayer(videoPlayerState.player);
       videoPlayerState.decoderManager.updatePlayer(videoPlayerState.player);
       await videoPlayerState.applyAnime4KProfileToCurrentPlayer();
+      if (videoPlayerState.isDisposed) return;
       await videoPlayerState.applyHardwareDecoderPreference();
+      if (videoPlayerState.isDisposed) return;
       await videoPlayerState.applyPrecacheBufferSettings();
+      if (videoPlayerState.isDisposed) return;
       await videoPlayerState.applySubtitleStylePreference();
+      // 恢复音量到新播放器，避免默认 1.0 导致下次播放音量异常
+      videoPlayerState.applyPlayerVolume();
       debugPrint('[PlayerKernelManager] 已创建新的空播放器实例');
       return;
     }
 
-    // 2. 释放旧播放器资源
-    await videoPlayerState.resetPlayer();
+    // 2. 捕获旧播放器实例：resetPlayer 会置空状态，先持有引用以便随后强制退出。
+    final previousPlayer = videoPlayerState.player;
 
-    // 3. 创建新的播放器实例（Player()工厂会自动使用新的内核）
+    // 3. 停止旧播放器：resetPlayer 把内核置 stopped 空态、断开 media 与纹理，
+    // 旧内核不再解码/占音频。
+    await videoPlayerState.resetPlayer();
+    if (videoPlayerState.isDisposed) {
+      return;
+    }
+
+    // 3.1 强制退出旧内核：立即彻底销毁（stop + dispose），而不是留给 wrapper 在
+    // 切换完成后延后销毁。播放中切换时若旧内核还活着，新内核随即创建并起播，
+    // 新旧两个原生实例（解码线程、GL 上下文、音频输出）会在平台线程并存导致
+    // 死锁卡死（实测播放中切 libmpv 冻死，而主页无视频怎么切都不闪退，正源于此）。
+    // 此刻旧内核已 stopped + 媒体纹理已释放，同步 dispose 快速非阻塞。
+    await _disposePlayerForHotSwap(
+      previousPlayer,
+      timeout: playerDisposalTimeout,
+    );
+    if (videoPlayerState.isDisposed) {
+      return;
+    }
+
+    // 4. 创建新的播放器实例（Player()工厂会自动使用新的内核）
     videoPlayerState.player = Player();
     videoPlayerState.subtitleManager.updatePlayer(videoPlayerState.player);
     videoPlayerState.audioTrackManager.updatePlayer(videoPlayerState.player);
     videoPlayerState.decoderManager.updatePlayer(videoPlayerState.player);
     await videoPlayerState.applyAnime4KProfileToCurrentPlayer();
+    if (videoPlayerState.isDisposed) return;
     await videoPlayerState.applyHardwareDecoderPreference();
+    if (videoPlayerState.isDisposed) return;
     await videoPlayerState.applyPrecacheBufferSettings();
+    if (videoPlayerState.isDisposed) return;
     await videoPlayerState.applySubtitleStylePreference();
+    if (videoPlayerState.isDisposed) return;
 
-    // 4. 重新初始化播放
+    // 5. 重新初始化播放（沿用上游流程：内部 _getVideoPosition 读
+    // PlaybackPositionStore → seekAndWait(lastPosition) → play，
+    // 媒体就绪后 seek 自然生效，不会丢进度）
     await videoPlayerState.initializePlayer(
       currentPath,
       historyItem: historyItem,
       resetManualDanmakuOffset: false,
+      episodeFileSelectionHandled: true,
     );
+    if (videoPlayerState.isDisposed) return;
 
-    // 5. 恢复播放状态
+    // 6. 恢复播放状态（initializePlayer 内部已 seek + play，
+    // 不再外部 seekTo 避免双 seek 竞态；只处理暂停场景）
     if (videoPlayerState.hasVideo) {
-      if (Platform.isAndroid || Platform.isIOS) {
-        // 移动端使用系统音量时，播放器内部音量保持 1.0，避免与系统音量叠乘
-        try {
-          videoPlayerState.player.volume = 1.0;
-        } catch (_) {}
-      } else {
-        videoPlayerState.player.volume = currentVolume;
-      }
+      videoPlayerState.applyPlayerVolume();
       // 恢复播放速度设置
       if (currentPlaybackRate != 1.0) {
         videoPlayerState.player.setPlaybackRate(currentPlaybackRate);
         debugPrint('[PlayerKernelManager] 恢复播放速度设置: ${currentPlaybackRate}x');
       }
-      videoPlayerState.seekTo(currentPosition);
-      if (wasPlaying) {
-        videoPlayerState.play();
-      } else {
+      if (!wasPlaying) {
         videoPlayerState.pause();
       }
-      debugPrint('[PlayerKernelManager] 播放器内核热切换完成，已恢复播放状态');
+      debugPrint(
+          '[PlayerKernelManager] 播放器内核热切换完成，恢复状态 wasPlaying=$wasPlaying position=${videoPlayerState.position.inMilliseconds}ms 内核=${videoPlayerState.player.getPlayerKernelName()}');
     } else {
       debugPrint('[PlayerKernelManager] 播放器内核热切换完成，但未能恢复播放（可能视频加载失败）');
     }
@@ -119,6 +269,7 @@ class PlayerKernelManager {
     }
 
     // 通知UI刷新，以便DanmakuOverlay可以重建
+    // ignore: invalid_use_of_protected_member, invalid_use_of_visible_for_testing_member
     videoPlayerState.notifyListeners();
   }
 
@@ -145,12 +296,20 @@ class PlayerKernelManager {
     if (kIsWeb) {
       // Web平台只支持特定内核
       return ['Video Player'];
+    } else if (globals.isTvOS) {
+      return ['Erika'];
+    } else if (PlayerFactory.isHarmonyOS) {
+      return ['FVP', 'Erika'];
     } else if (Platform.isIOS) {
       // iOS平台支持的内核
       return ['FVP', 'Video Player', 'Erika'];
     } else if (Platform.isAndroid) {
       // Android平台支持的内核
-      return ['FVP', 'Media Kit', 'Video Player'];
+      final androidKernels = ['FVP', 'Media Kit', 'Video Player'];
+      if (PlayerFactory.isErikaKernelSupported) {
+        androidKernels.add('Erika');
+      }
+      return androidKernels;
     } else if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
       // 桌面平台支持所有内核
       if (PlayerFactory.isErikaKernelSupported) {
@@ -164,18 +323,20 @@ class PlayerKernelManager {
 
   /// 获取当前播放器内核
   static Future<String> getCurrentPlayerKernel() async {
+    if (globals.isTvOS) return 'Erika';
     final prefs = await SharedPreferences.getInstance();
     return prefs.getString('player_kernel') ?? 'FVP';
   }
 
   /// 设置播放器内核
   static Future<void> setPlayerKernel(String kernel) async {
+    final resolvedKernel = globals.isTvOS ? 'Erika' : kernel;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('player_kernel', kernel);
+    await prefs.setString('player_kernel', resolvedKernel);
 
     // 转换为枚举值
     PlayerKernelType kernelType;
-    switch (kernel) {
+    switch (resolvedKernel) {
       case 'FVP':
         kernelType = PlayerKernelType.mdk;
         break;
@@ -198,9 +359,15 @@ class PlayerKernelManager {
 
   /// 获取支持的弹幕内核列表
   static List<String> getSupportedDanmakuKernels() {
-    final kernels = <String>['Canvas 弹幕', 'GPU渲染', 'CPU渲染', DanmakuKernelFactory.nipaplayNextDisplayName];
+    final kernels = <String>[
+      'Canvas 弹幕',
+      'GPU渲染',
+      'CPU渲染',
+      DanmakuKernelFactory.nipaplayNextDisplayName,
+    ];
     if (Next2PlatformSupport.isKernelSupported) {
       kernels.add('NipaPlay Next2');
+      kernels.add('DFM+');
     }
     return kernels;
   }
@@ -208,13 +375,16 @@ class PlayerKernelManager {
   /// 获取当前弹幕内核
   static Future<String> getCurrentDanmakuKernel() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getString('danmaku_kernel') ?? 'Canvas 弹幕';
+    return prefs.getString(SettingsKeys.legacyDanmakuKernel) ??
+        (Next2PlatformSupport.isKernelSupported
+            ? 'NipaPlay Next2'
+            : 'NipaPlay Next');
   }
 
   /// 设置弹幕内核
   static Future<void> setDanmakuKernel(String kernel) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('danmaku_kernel', kernel);
+    await prefs.setString(SettingsKeys.legacyDanmakuKernel, kernel);
 
     // 转换为枚举值
     DanmakuRenderEngine engine;
@@ -234,6 +404,10 @@ class PlayerKernelManager {
       case 'NipaPlay Next2 (实验性)':
         engine = DanmakuRenderEngine.next2;
         break;
+      case 'DFM+':
+      case 'DFM+ (实验性)':
+        engine = DanmakuRenderEngine.dfmPlus;
+        break;
       case 'Canvas弹幕':
       case 'Canvas 弹幕':
         engine = DanmakuRenderEngine.canvas;
@@ -242,7 +416,8 @@ class PlayerKernelManager {
         engine = DanmakuRenderEngine.canvas;
     }
 
-    if (engine == DanmakuRenderEngine.next2 &&
+    if ((engine == DanmakuRenderEngine.next2 ||
+            engine == DanmakuRenderEngine.dfmPlus) &&
         !Next2PlatformSupport.isKernelSupported) {
       engine = DanmakuRenderEngine.canvas;
     }
@@ -268,8 +443,6 @@ class PlayerKernelManager {
       case PlayerKernelType.erika:
         playerKernelName = 'Erika';
         break;
-      default:
-        playerKernelName = 'Unknown';
     }
 
     return {
@@ -305,6 +478,9 @@ class PlayerKernelManager {
   static String _getPlatformInfo() {
     if (kIsWeb) return 'Web';
     if (Platform.isAndroid) return 'Android';
+    if (globals.isTelevision) {
+      return globals.isAndroidTv ? 'Android TV' : 'tvOS';
+    }
     if (Platform.isIOS) return 'iOS';
     if (Platform.isWindows) return 'Windows';
     if (Platform.isMacOS) return 'macOS';

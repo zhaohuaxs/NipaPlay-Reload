@@ -12,12 +12,12 @@
 
 ![GitHub release](https://img.shields.io/github/v/release/aimessoft/nipaplay-reload?style=flat-square&color=blue)
 ![GitHub downloads](https://img.shields.io/github/downloads/aimessoft/nipaplay-reload/total?style=flat-square&color=green)
-![Platform support](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-lightgrey?style=flat-square)
+![Platform support](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS%20%7C%20tvOS%20%7C%20HarmonyOS-lightgrey?style=flat-square)
 ![License](https://img.shields.io/github/license/aimessoft/nipaplay-reload?style=flat-square)
 
 <br>
 
-<img src="https://api.star-history.com/svg?repos=aimessoft/nipaplay-reload&type=Date&theme=moebooru" alt="Star History Chart" width="80%">
+<img src="https://star-history.dera.page/svg?repos=aimessoft/nipaplay-reload&type=Date&theme=moebooru" alt="Star History Chart" width="80%">
 </div>
 
 <div align="center">
@@ -25,7 +25,7 @@
     一个现代化的跨平台视频播放器应用
   </h3>
   <p>
-    支持 Windows、macOS、Linux、Android 和 iOS 五大操作系统。
+    支持 Windows、macOS、Linux、Android、iOS，并提供 tvOS 与 HarmonyOS 构建。
     <br>
     打造您的个人媒体中心，享受极致的追番体验。
   </p>
@@ -41,7 +41,7 @@ NipaPlay 不仅仅是一个播放器，更是您的二次元媒体管家：
 * **强大的弹幕系统**：自动匹配网络弹幕，支持弹弹play，让看番不再孤单。
 * **媒体库集成**：支持 Emby、Jellyfin、SMB、WebDAV，轻松挂载远程资源。
 * **番剧管理**：同步 Bangumi 观看进度，查看新番时间表，打分评论一站式搞定。
-* **现代 UI**：毛玻璃风格设计，支持自动黑夜模式，美观与易用并重。
+* **现代 UI**：清爽的浅色/深色界面，支持自动黑夜模式，美观与易用并重。
 
 ## 应用截图
 
@@ -89,7 +89,7 @@ NipaPlay 不仅仅是一个播放器，更是您的二次元媒体管家：
 
 ## 下载安装
 
-支持 **Windows (x64)**、**Linux (amd64/arm64)**、**macOS (Intel/Apple Silicon)**、**Android** 和 **iOS**。
+支持 **Windows (x64)**、**Linux (amd64/arm64)**、**macOS (Intel/Apple Silicon)**、**Android** 和 **iOS**；Windows ARM64、tvOS 和 HarmonyOS 的可用构建状态请查看 [平台矩阵](Documentation/platform-matrix.md)。
 
 ### 快速下载
 
@@ -107,6 +107,13 @@ NipaPlay 不仅仅是一个播放器，更是您的二次元媒体管家：
   <img src="https://get.microsoft.com/images/zh-cn%20dark.svg" width="200"/>
   </a>
 
+- **Linux（Spark Store 星火应用商店）**
+
+  <a href="https://spk-resolv.spark-app.store/?spk=spk://store/video/nipaplay" target="_blank"  rel="noopener noreferrer">
+  <img src="http://spk-json.spark-app.store/install-from-spark-store.png" width="200"/>
+  </a>
+
+  
 ### 包管理器安装
 
 #### macOS (Homebrew)
@@ -118,11 +125,18 @@ brew install --cask nipaplay-reload
 
 #### Arch Linux (AUR)
 
+从 AUR 下载 二进制包 [`nipaplay-reload-bin`](https://aur.archlinux.org/packages/nipaplay-reload-bin) 或源码包 [`nipaplay-reload`](https://aur.archlinux.org/packages/nipaplay-reload)：
+
 ```bash
-paru -S nipaplay-reload-bin
-# 或
 yay -S nipaplay-reload-bin
 ```
+或
+```bash
+yay -S nipaplay-reload
+```
+
+> **⚠️ 安全警告**
+> Arch Linux AUR 中的 `misuzu-music-bin` 包已被恶意用户接管，**请勿安装**。
 
 #### Gentoo Linux
 
@@ -130,11 +144,62 @@ yay -S nipaplay-reload-bin
 ebuild gentoo/media-video/nipaplay-bin/nipaplay-bin-1.8.11.ebuild merge
 ```
 
+
+## NipaPlay Next · Developer Preview
+
+> [!CAUTION]
+> **⚠️ 高风险实验性软件 · 仅供具备相关技术经验的用户测试**
+>
+> NipaPlay Next 2.0 是一项探索 Agentic Software 的
+> 实验性项目，目前不面向普通用户。
+>
+> Next 引入具有完整用户级系统权限的 AI Agent。
+> 启用后，Agent 可以在当前账户权限范围内：
+>
+> - 读取、修改、覆盖和删除媒体库之外的文件；
+> - 执行程序、访问网络及使用已有账号登录状态；
+> - 通过 Mesh 调用其他设备的能力，并在额外授权后执行远程程序。
+>
+> Agent 可能因模型误判、软件缺陷或外部恶意内容作出错误操作。
+> **这些操作可能造成不可恢复的数据丢失、隐私泄露或其他损失，
+> 且不一定每次执行前都会要求用户确认。**
+>
+> **我们强烈建议仅在隔离的测试环境中使用，
+> 不要在存有唯一重要数据的主力电脑或生产环境中启用。**
+>
+> 如果你不具备必要的系统管理和数据恢复能力，
+> 请使用稳定的 **NipaPlay Classic**。
+
+### 关于 NipaPlay Next
+
+NipaPlay Next 探索一种不同的软件交互方式：
+
+用户通过自然语言表达意图，AI Agent 根据实际环境
+查询信息、选择工具并执行操作，执行结果直接呈现在
+媒体库、播放器、书架和其他图形界面中。
+
+Next 还引入个人 Git Harness、跨设备 Mesh、
+可扩展的 Agent 工具及持久任务系统。
+
+这是一次关于 Agentic Native Software 的公开实验，
+其行为、可靠性和安全边界仍在持续研究和验证中。
+
+
+### 参与开发者预览
+
+当前版本为 **2.0.0-alpha.4 · Developer Preview**。Alpha 4 升级 Erika 0.3.5，修复 Windows 播放控件遮挡和部分外挂字幕导致播放失败的问题，改善超分加速兼容性，并补充 Mesh 恢复与手动刷新。
+
+- [Alpha 4 下载与发行说明](https://github.com/AimesSoft/NipaPlay-Reload/releases/tag/v2.0.0-alpha.4)
+- [Next 使用文档](https://github.com/AimesSoft/NipaPlay-Reload/blob/next/docs/next/README.md)：从安装、配置梨花到第一次使用，以及日常使用、进阶和排障
+- [下载与开启 Next](https://github.com/AimesSoft/NipaPlay-Reload/blob/next/docs/next/start/install.md) · [配置梨花](https://github.com/AimesSoft/NipaPlay-Reload/blob/next/docs/next/start/setup-nipa.md)
+- [常见问题](https://github.com/AimesSoft/NipaPlay-Reload/blob/next/docs/next/help/faq.md) · [已知问题](https://github.com/AimesSoft/NipaPlay-Reload/blob/next/docs/next/help/known-issues.md)
+- [开发者文档](https://github.com/AimesSoft/NipaPlay-Reload/blob/next/docs/next/development/README.md)
+
 ## 功能列表
 
 ### 播放体验
 
-* **内核支持**：基于 fvp (libmdk) / media_kit / video_player / libmpv，性能强劲。
+* **内核支持**：自研 [Erika](https://github.com/AimesSoft/Erika) 内核（Rust，按平台使用 Metal、D3D11、WGPU 或 Vulkan）、FVP (libmdk)、Media Kit（libmpv）和 Video Player。详见 [平台矩阵](Documentation/platform-matrix.md) 与 [播放器内核说明](Documentation/player-kernels.md)。
 * **视频支持**：本地播放、Emby/Jellyfin/SMB 流媒体、WebDAV 挂载。
 * **画质增强**：支持 Anime4K 超分、CRT 着色器效果。
 * **音频控制**：多音轨切换、倍速播放。
@@ -167,6 +232,7 @@ ebuild gentoo/media-video/nipaplay-bin/nipaplay-bin-1.8.11.ebuild merge
 
 * **[完整使用文档](Documentation/index.md)**：安装配置、Emby 连接教程、故障排查。
 * **[贡献者指南](CONTRIBUTING_GUIDE/00-Introduction.md)**：如何参与开发、添加新功能。
+* **[Apple TV 开发指南](docs/TVOS_DEVELOPMENT.md)**：独立 tvOS Flutter SDK、模拟器构建与当前能力边界。
 * **反馈问题**：请在软件内的“开发者选项”中导出日志，或在 GitHub Issues 中提交。
 
 ## 技术栈
@@ -176,7 +242,7 @@ ebuild gentoo/media-video/nipaplay-bin/nipaplay-bin-1.8.11.ebuild merge
 | 类别 | 技术/库 |
 | :--- | :--- |
 | **核心框架** | Flutter, Dart |
-| **播放引擎** | FVP, Media Kit, libmpv |
+| **播放引擎** | Erika（自研 Rust）、FVP（MDK）、Media Kit（libmpv）、Video Player |
 | **UI/UX** | Material Design, Glassmorphism, Hugeicons |
 | **状态管理** | Provider |
 | **数据存储** | SQLite, SharedPreferences |
@@ -187,14 +253,16 @@ ebuild gentoo/media-video/nipaplay-bin/nipaplay-bin-1.8.11.ebuild merge
 ## 开发计划 (Roadmap)
 
 - [x] 评论区功能完善
-- [ ] 云媒体库挂载 (FTP)
-- [ ] 视频片段导出 (GIF)
+- [x] 视频片段导出 (GIF)
 - [x] 内置下载器及远程控制
 - [x] 在线 URL 播放优化
 - [ ] Webview 弹幕刮削
 - [ ] 补帧功能 (SVP/Other)
-- [ ] HDR 和杜比视界支持
-- [ ] 鸿蒙 OS / Vision Pro / Apple TV 移植
+- [x] macOS HDR 支持（Erika 内核 EDR 原生 + Media Kit）
+- [ ] 跨平台 HDR 和杜比视界支持（Windows/Linux/Android）
+- [ ] Vision Pro 移植
+- [ ] HarmonyOS 商店发行版
+- [x] Apple TV（tvOS）开发者预览构建
 
 ## 赞助与鸣谢
 
@@ -210,7 +278,7 @@ ebuild gentoo/media-video/nipaplay-bin/nipaplay-bin-1.8.11.ebuild merge
 ### 鸣谢
 
 感谢以下贡献者和支持者：
-EmoSakura, Mr.果仁, 姬田诗乃, 微光, 大祥老师, 卡拜, JMT, 无之将, 博易伯伯, 千葉あおい, Kean
+EmoSakura, Mr.果仁, 姬田诗乃, 微光, 大祥老师, 卡拜, JMT, 无之将, 博易伯伯, 千葉あおい, Kean, SKYWOW, 爱跑步的男孩, Bassman, 银蓝_Yl, 小石絹代, 泉こなた
 
 ### 看板娘 
 

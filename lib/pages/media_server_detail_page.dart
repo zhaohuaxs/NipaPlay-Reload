@@ -1,12 +1,26 @@
+import 'package:nipaplay/models/media_library_scope.dart';
+import 'dart:async';
+import 'dart:ui' show ImageFilter;
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:nipaplay/models/emby_media_selection.dart';
 import 'package:nipaplay/models/jellyfin_model.dart';
 import 'package:nipaplay/models/emby_model.dart';
 import 'package:nipaplay/services/jellyfin_service.dart';
 import 'package:nipaplay/services/emby_service.dart';
+import 'package:nipaplay/services/emby_media_preference_store.dart';
+import 'package:nipaplay/services/emby_media_selection_controller.dart';
+import 'package:nipaplay/services/emby_media_selection_resolver.dart';
+import 'package:nipaplay/services/emby_media_source_catalog.dart';
+import 'package:nipaplay/services/emby_media_source_selection.dart';
 import 'package:nipaplay/models/playable_item.dart';
 import 'package:nipaplay/models/watch_history_model.dart';
 import 'package:nipaplay/models/media_server_playback.dart';
-import 'package:nipaplay/services/external_player_service.dart';
+import 'package:nipaplay/services/playback_service.dart';
+import 'package:nipaplay/services/episode_file_selection_service.dart';
+import 'package:nipaplay/utils/media_identity_resolver.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/cached_network_image_widget.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_dialog.dart';
@@ -18,14 +32,35 @@ import 'package:nipaplay/services/jellyfin_dandanplay_matcher.dart';
 import 'package:nipaplay/services/emby_dandanplay_matcher.dart';
 import 'package:nipaplay/utils/video_player_state.dart';
 import 'package:nipaplay/utils/tab_change_notifier.dart';
+import 'package:nipaplay/app/app_page_ids.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_button.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/network_media_server_dialog.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/anime_detail_shell.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_focusable_action.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_mode_scope.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_page_scaffold.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/settings_no_ripple_theme.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/nipaplay_window.dart';
+import 'package:nipaplay/widgets/media_server_network_image.dart';
+import 'package:nipaplay/widgets/emby_media_source_selector.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
 import 'package:nipaplay/providers/settings_provider.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
+
+@visibleForTesting
+Future<void> startEmbyPlaybackAndCloseDetail({
+  required NavigatorState detailNavigator,
+  required Future<void> Function() startPlayback,
+}) async {
+  if (detailNavigator.mounted) {
+    detailNavigator.pop();
+  }
+  await startPlayback();
+}
 
 class MediaServerDetailPage extends StatefulWidget {
   final String mediaId;
@@ -35,7 +70,10 @@ class MediaServerDetailPage extends StatefulWidget {
     super.key,
     required this.mediaId,
     required this.serverType,
+    this.embedded = false,
   });
+
+  final bool embedded;
 
   @override
   State<MediaServerDetailPage> createState() => _MediaServerDetailPageState();
@@ -52,6 +90,20 @@ class MediaServerDetailPage extends StatefulWidget {
 
   static Future<WatchHistoryItem?> show(
       BuildContext context, String mediaId, MediaServerType serverType) {
+    if (AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone) {
+      final label =
+          serverType == MediaServerType.jellyfin ? 'Jellyfin' : 'Emby';
+      return CupertinoBottomSheet.show<WatchHistoryItem>(
+        context: context,
+        title: '$label 详情',
+        floatingTitle: true,
+        child: MediaServerDetailPage(
+          mediaId: mediaId,
+          serverType: serverType,
+          embedded: true,
+        ),
+      );
+    }
     // 获取外观设置Provider
     final appearanceSettings =
         Provider.of<AppearanceSettingsProvider>(context, listen: false);
@@ -78,7 +130,9 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
   String? _selectedSeasonId;
   bool _isLoading = true;
   String? _error;
-  bool _isMovie = false; // 新增状态，判断是否为电影
+  bool _isMovie = false;
+  bool _isEpisode = false;
+  bool get _isPlayableItem => _isMovie || _isEpisode;
 
   bool _isDetailAutoMatching = false;
   bool _detailAutoMatchDialogVisible = false;
@@ -86,6 +140,20 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
 
   TabController? _tabController;
   String? _hoveredEpisodeId;
+  final FocusNode _largeScreenPlayFocusNode =
+      FocusNode(debugLabel: 'media_detail_play');
+  final FocusNode _largeScreenCloseFocusNode =
+      FocusNode(debugLabel: 'media_detail_close');
+  final FocusNode _largeScreenSeasonFocusNode =
+      FocusNode(debugLabel: 'media_detail_selected_season');
+  final FocusNode _largeScreenEpisodeFocusNode =
+      FocusNode(debugLabel: 'media_detail_first_episode');
+  final FocusNode _largeScreenRetryFocusNode =
+      FocusNode(debugLabel: 'media_detail_retry');
+  late final CachedEmbyMediaSourceCatalog _embyMediaSourceCatalog;
+  late final Future<EmbyMediaPreferenceStore> _embyPreferenceStore;
+  late final String _embyPageCacheScope;
+  final Map<String, String> _embySavedSourceLabels = <String, String>{};
 
   // 辅助方法：获取演员头像URL
   String? _getActorImageUrl(dynamic actor) {
@@ -155,6 +223,12 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
   @override
   void initState() {
     super.initState();
+    _embyMediaSourceCatalog = CachedEmbyMediaSourceCatalog(
+      loader: EmbyService.instance.getPlaybackMediaSources,
+    );
+    _embyPreferenceStore = SharedPreferences.getInstance()
+        .then((preferences) => EmbyMediaPreferenceStore(preferences));
+    _embyPageCacheScope = 'detail:${identityHashCode(this)}';
     _loadMediaDetail();
     // _tabController = TabController(length: 2, vsync: this); // 延迟到加载后初始化
     // _tabController!.addListener(() {
@@ -169,7 +243,46 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
   @override
   void dispose() {
     _tabController?.dispose();
+    _largeScreenPlayFocusNode.dispose();
+    _largeScreenCloseFocusNode.dispose();
+    _largeScreenSeasonFocusNode.dispose();
+    _largeScreenEpisodeFocusNode.dispose();
+    _largeScreenRetryFocusNode.dispose();
     super.dispose();
+  }
+
+  void _requestLargeScreenContentFocus({String? seasonId}) {
+    if (!mounted || !NipaplayLargeScreenModeScope.isActiveOf(context)) return;
+
+    // Async content must be mounted before focus moves from the loading state.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          !NipaplayLargeScreenModeScope.isActiveOf(context) ||
+          ModalRoute.of(context)?.isCurrent == false ||
+          (seasonId != null && seasonId != _selectedSeasonId)) {
+        return;
+      }
+
+      final episodes = _episodesBySeasonId[_selectedSeasonId] ?? [];
+      final FocusNode target;
+      if (_error != null) {
+        target = _largeScreenRetryFocusNode;
+      } else if (_isPlayableItem) {
+        target = _largeScreenPlayFocusNode;
+      } else if (!_isLoading && episodes.isNotEmpty) {
+        target = _largeScreenEpisodeFocusNode;
+      } else if (_seasons.isNotEmpty) {
+        target = _largeScreenSeasonFocusNode;
+      } else {
+        target = _largeScreenCloseFocusNode;
+      }
+
+      if (target.context != null && target.canRequestFocus) {
+        target.requestFocus();
+      } else if (_largeScreenCloseFocusNode.context != null) {
+        _largeScreenCloseFocusNode.requestFocus();
+      }
+    });
   }
 
   Future<void> _loadMediaDetail() async {
@@ -192,38 +305,44 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
         detail = await service.getMediaItemDetails(widget.mediaId);
       }
 
-      if (mounted) {
-        setState(() {
-          _mediaDetail = detail;
-          _isMovie = detail.type == 'Movie'; // 判断是否为电影
+      if (!mounted) return;
+      setState(() {
+        _mediaDetail = detail;
+        _isMovie = detail.type == 'Movie';
+        _isEpisode = detail.type == 'Episode';
+        _tabController?.dispose();
+        _tabController = null;
 
-          if (_isMovie) {
-            _isLoading = false;
-            // 对于电影，我们不需要 TabController
-          } else {
-            // 对于剧集，初始化 TabController
-            _tabController = TabController(
-                length: 2,
-                vsync: this,
-                initialIndex: Provider.of<AppearanceSettingsProvider>(context,
-                                listen: false)
-                            .animeCardAction ==
-                        AnimeCardAction.synopsis
-                    ? 0
-                    : 1);
-            _tabController!.addListener(() {
-              if (mounted && !_tabController!.indexIsChanging) {
-                setState(() {
-                  // 当 TabController 的索引稳定改变后，触发重建以更新 SwitchableView 的 currentIndex
-                });
-              }
-            });
-          }
-        });
+        if (_isPlayableItem) {
+          _isLoading = false;
+          // 电影和单集直接播放，不需要系列的季/集切换栏
+        } else {
+          // 对于剧集，初始化 TabController
+          _tabController = TabController(
+              length: 2,
+              vsync: this,
+              initialIndex: Provider.of<AppearanceSettingsProvider>(context,
+                              listen: false)
+                          .animeCardAction ==
+                      AnimeCardAction.synopsis
+                  ? 0
+                  : 1);
+          _tabController!.addListener(() {
+            if (mounted && !_tabController!.indexIsChanging) {
+              setState(() {
+                // 当 TabController 的索引稳定改变后，触发重建以更新 SwitchableView 的 currentIndex
+              });
+            }
+          });
+        }
+      });
+
+      if (_isPlayableItem) {
+        _requestLargeScreenContentFocus();
       }
 
       // 如果是剧集，才加载季节信息
-      if (!_isMovie) {
+      if (!_isPlayableItem) {
         dynamic seasons;
         if (widget.serverType == MediaServerType.jellyfin) {
           seasons = await (service as JellyfinService)
@@ -237,12 +356,13 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
             _seasons = seasons;
             _isLoading = false;
 
-            // 如果有季，选择第一个季
-            if (seasons.isNotEmpty) {
-              _selectedSeasonId = seasons.first.id;
-              _loadEpisodesForSeason(seasons.first.id);
-            }
+            _selectedSeasonId = seasons.isNotEmpty ? seasons.first.id : null;
           });
+          if (_selectedSeasonId != null) {
+            unawaited(_loadEpisodesForSeason(_selectedSeasonId!));
+          } else {
+            _requestLargeScreenContentFocus();
+          }
         }
       }
     } catch (e) {
@@ -251,16 +371,21 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
           _error = e.toString();
           _isLoading = false;
         });
+        _requestLargeScreenContentFocus();
       }
     }
   }
 
   Future<void> _loadEpisodesForSeason(String seasonId) async {
+    if (!mounted) return;
     // 如果已经加载过，不重复加载
     if (_episodesBySeasonId.containsKey(seasonId)) {
       setState(() {
         _selectedSeasonId = seasonId;
+        _isLoading = false;
+        _error = null;
       });
+      _requestLargeScreenContentFocus(seasonId: seasonId);
       return;
     }
 
@@ -269,6 +394,7 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
       _error = null;
       _selectedSeasonId = seasonId;
     });
+    _requestLargeScreenContentFocus(seasonId: seasonId);
 
     try {
       // 确保_mediaDetail不为null且有有效id
@@ -278,6 +404,7 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
             _error = '无法获取剧集详情，无法加载剧集列表。';
             _isLoading = false;
           });
+          _requestLargeScreenContentFocus(seasonId: seasonId);
         }
         return;
       }
@@ -294,20 +421,114 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
       if (mounted) {
         setState(() {
           _episodesBySeasonId[seasonId] = episodes;
-          _isLoading = false;
+          if (_selectedSeasonId == seasonId) {
+            _isLoading = false;
+          }
         });
+        if (_selectedSeasonId == seasonId) {
+          _requestLargeScreenContentFocus(seasonId: seasonId);
+        }
+        if (widget.serverType == MediaServerType.emby) {
+          unawaited(_loadSavedEmbySourceLabels(List<dynamic>.from(episodes)));
+        }
       }
     } catch (e) {
-      if (mounted) {
+      if (mounted && _selectedSeasonId == seasonId) {
         setState(() {
           _error = e.toString();
           _isLoading = false;
         });
+        _requestLargeScreenContentFocus(seasonId: seasonId);
       }
     }
   }
 
+  EmbySelectionContext? _embySelectionContextFor(dynamic episode) {
+    final service = EmbyService.instance;
+    final rawSeriesId = episode.seriesId?.toString().trim();
+    final fallbackSeriesId =
+        _mediaDetail?.id?.toString().trim() ?? widget.mediaId.trim();
+    return buildEmbySelectionContext(
+      profile: service.currentProfile,
+      userId: service.userId,
+      seriesId:
+          rawSeriesId?.isNotEmpty == true ? rawSeriesId! : fallbackSeriesId,
+      episodeId: episode.id.toString(),
+    );
+  }
+
+  Future<void> _loadSavedEmbySourceLabels(List<dynamic> episodes) async {
+    final store = await _embyPreferenceStore;
+    final labels = <String, String>{};
+    for (final episode in episodes) {
+      final selectionContext = _embySelectionContextFor(episode);
+      if (selectionContext == null) continue;
+      final layers = await store.load(selectionContext);
+      final series = layers.series;
+      final displayName = layers.episode?.displayName?.trim();
+      if (displayName?.isNotEmpty == true) {
+        labels[episode.id.toString()] = displayName!;
+        continue;
+      }
+      final fullName = series?.normalizedFullName?.trim();
+      if (fullName?.isNotEmpty == true) {
+        labels[episode.id.toString()] = fullName!;
+        continue;
+      }
+      final families = series?.families.isNotEmpty == true
+          ? series!.families
+          : layers.global?.families;
+      if (families != null && families.isNotEmpty) {
+        labels[episode.id.toString()] = families.first;
+      }
+    }
+    if (!mounted || labels.isEmpty) return;
+    setState(() => _embySavedSourceLabels.addAll(labels));
+  }
+
+  Future<void> _openEmbyMediaSelection(dynamic episode) async {
+    final store = await _embyPreferenceStore;
+    if (!mounted) return;
+
+    final selectionContext = _embySelectionContextFor(episode);
+    final controller = DefaultEmbyMediaSelectionController(
+      catalog: _embyMediaSourceCatalog,
+      store: store,
+      resolver: DefaultEmbyMediaSelectionResolver(),
+      context: selectionContext,
+      catalogScopeKey: selectionContext?.accountKey ?? _embyPageCacheScope,
+      itemId: episode.id.toString(),
+    );
+    final load = controller.load();
+    try {
+      final result = await showEmbyMediaSelection(
+        context: context,
+        useCupertino: !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS,
+        controller: controller,
+      );
+      if (!mounted) return;
+      updateEmbySavedSourceLabelAfterSelection(
+        result,
+        controller,
+        (label) => setState(() {
+          _embySavedSourceLabels[episode.id.toString()] = label;
+        }),
+      );
+    } finally {
+      try {
+        await load;
+      } catch (_) {
+        // The panel already exposes loading failures and retry controls.
+      }
+      controller.dispose();
+    }
+  }
+
   Future<WatchHistoryItem?> _createWatchHistoryItem(dynamic episode) async {
+    if (context.read<SettingsProvider>().skipDanmakuMatching) {
+      return episode.toWatchHistoryItem();
+    }
+
     // 根据服务器类型使用相应的匹配器创建可播放的历史记录项
     try {
       dynamic matcher;
@@ -383,10 +604,34 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
     }
   }
 
+  Future<void> _playMediaItem() async {
+    if (!_isEpisode) {
+      await _playMovie();
+      return;
+    }
+    try {
+      final dynamic episode = widget.serverType == MediaServerType.emby
+          ? await EmbyService.instance.getEpisodeDetails(widget.mediaId)
+          : await JellyfinService.instance.getEpisodeDetails(widget.mediaId);
+      if (!mounted) return;
+      if (episode == null) {
+        throw Exception('无法获取单集详情，请重试');
+      }
+      await _playEpisode(episode);
+    } catch (e) {
+      if (mounted) BlurSnackBar.show(context, '播放失败: $e');
+    }
+  }
+
   Future<void> _playMovie() async {
     if (_mediaDetail == null || !_isMovie) return;
     if (_isDetailAutoMatching) {
       BlurSnackBar.show(context, '正在自动匹配，请稍候');
+      return;
+    }
+
+    if (context.read<SettingsProvider>().skipDanmakuMatching) {
+      Navigator.of(context).pop(_mediaDetail!.toWatchHistoryItem());
       return;
     }
 
@@ -571,8 +816,8 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
         mainAxisSize: MainAxisSize.min,
         children: [
           SizedBox(height: 8),
-          CircularProgressIndicator(
-            valueColor: AlwaysStoppedAnimation<Color>(textColor),
+          AdaptiveMediaActivityIndicator(
+            color: textColor,
           ),
           SizedBox(height: 16),
           Text(
@@ -607,8 +852,595 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
     Navigator.of(context, rootNavigator: true).pop();
   }
 
+  bool get _isLargeScreenDarkMode {
+    return Theme.of(context).brightness == Brightness.dark;
+  }
+
+  Color get _largeScreenTextColor {
+    return _isLargeScreenDarkMode ? Colors.white : const Color(0xFF171A22);
+  }
+
+  Color get _largeScreenMutedTextColor {
+    return _largeScreenTextColor.withValues(alpha: 0.64);
+  }
+
+  Color get _largeScreenChipColor {
+    return _isLargeScreenDarkMode
+        ? Colors.white.withValues(alpha: 0.10)
+        : Colors.white.withValues(alpha: 0.72);
+  }
+
+  Color get _largeScreenChipBorderColor {
+    return _largeScreenTextColor.withValues(alpha: 0.10);
+  }
+
+  /// 按需为详情页背景图套一层模糊，并在电视上跳过。
+  ///
+  /// [enabled] 为 false 时直接返回 child，不再挂 σ0 的 ImageFilter 图层
+  /// （那会白白引入一次离屏合成）。
+  Widget _wrapDetailBackdropBlur({
+    required bool enabled,
+    required Widget child,
+  }) {
+    if (!enabled) return child;
+    if (globals.isTelevision) return child;
+    return ImageFiltered(
+      imageFilter: ImageFilter.blur(sigmaX: 34, sigmaY: 34),
+      child: child,
+    );
+  }
+
+  Widget _buildLargeScreenBackdrop({required Widget child}) {
+    final backdropUrl = _getBackdropUrl();
+    final posterUrl = _getPosterUrl(width: 900);
+    final imageUrl = backdropUrl.isNotEmpty ? backdropUrl : posterUrl;
+    final blurImage = backdropUrl.isEmpty && imageUrl.isNotEmpty;
+    final isDark = _isLargeScreenDarkMode;
+
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: ColoredBox(
+            color: isDark ? Colors.black : const Color(0xFFF3F5F8),
+          ),
+        ),
+        if (imageUrl.isNotEmpty)
+          Positioned.fill(
+            // 三点修复：
+            // 1) blurImage 为 false 时原实现仍会挂一个 σ0 的 ImageFilter 图层
+            //    （一次无意义的离屏合成），这里直接退化为普通图片；
+            // 2) 电视上跳过 σ34 的全屏模糊 —— 每帧重算，纯填充率开销；
+            // 3) 限制解码尺寸：这张图要么被 σ34 抹平、要么只做背景，
+            //    没有理由按原始分辨率解码。
+            child: _wrapDetailBackdropBlur(
+              enabled: blurImage,
+              child: CachedNetworkImageWidget(
+                imageUrl: imageUrl,
+                fit: BoxFit.cover,
+                // 保持原契约：详情页的大图走统一加载通道（见
+                // test/media_server_image_loader_test.dart 的源码级断言）。
+                shouldCompress: false,
+                memCacheWidth: 480,
+                loadMode: CachedImageLoadMode.hybrid,
+              ),
+            ),
+          ),
+        Positioned.fill(
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: isDark
+                    ? [
+                        Colors.black.withValues(alpha: 0.42),
+                        Colors.black.withValues(alpha: 0.82),
+                      ]
+                    : [
+                        Colors.white.withValues(alpha: 0.70),
+                        Colors.white.withValues(alpha: 0.90),
+                      ],
+              ),
+            ),
+          ),
+        ),
+        Positioned.fill(child: child),
+      ],
+    );
+  }
+
+  Widget _buildLargeScreenDetailPage() {
+    final title = _mediaDetail?.name?.toString() ?? '媒体详情';
+    final sourceLabel =
+        widget.serverType == MediaServerType.jellyfin ? 'Jellyfin' : 'Emby';
+
+    Widget child;
+    if (_isLoading && _mediaDetail == null) {
+      child = const Center(child: AdaptiveMediaActivityIndicator());
+    } else if (_error != null && _mediaDetail == null) {
+      child = NipaplayLargeScreenEmptyState(
+        icon: Icons.error_outline_rounded,
+        title: '加载详情失败',
+        subtitle: _error!,
+        action: NipaplayLargeScreenActionButton(
+          icon: Icons.refresh_rounded,
+          label: '重试',
+          focusNode: _largeScreenRetryFocusNode,
+          onPressed: _loadMediaDetail,
+        ),
+      );
+    } else if (_mediaDetail == null) {
+      child = const NipaplayLargeScreenEmptyState(
+        icon: Icons.search_off_rounded,
+        title: '未找到媒体详情',
+        subtitle: '该媒体可能已被服务器移除，或当前账号没有访问权限',
+      );
+    } else {
+      child = Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SizedBox(
+            width: 350,
+            child: _buildLargeScreenInfoColumn(),
+          ),
+          const SizedBox(width: 24),
+          Expanded(
+            child: _isPlayableItem
+                ? _buildLargeScreenMoviePanel()
+                : _buildLargeScreenEpisodesPanel(),
+          ),
+        ],
+      );
+    }
+
+    return _buildLargeScreenBackdrop(
+      child: NipaplayLargeScreenPageScaffold(
+        title: title,
+        subtitle: _mediaDetail?.originalTitle != null &&
+                _mediaDetail!.originalTitle!.isNotEmpty &&
+                _mediaDetail!.originalTitle != _mediaDetail!.name
+            ? '$sourceLabel · ${_mediaDetail!.originalTitle}'
+            : sourceLabel,
+        actions: [
+          if (_mediaDetail != null && _isPlayableItem)
+            NipaplayLargeScreenActionButton(
+              icon: Icons.play_arrow_rounded,
+              label: '播放',
+              focusNode: _largeScreenPlayFocusNode,
+              onPressed: _isDetailAutoMatching ? null : _playMediaItem,
+            ),
+          NipaplayLargeScreenIconButton(
+            icon: Icons.close_rounded,
+            tooltip: '关闭',
+            focusNode: _largeScreenCloseFocusNode,
+            autofocus: _mediaDetail == null,
+            onPressed: () => Navigator.of(context).maybePop(),
+          ),
+        ],
+        child: child,
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenInfoColumn() {
+    final posterUrl = _getPosterUrl(width: 700);
+    final ratingValue = double.tryParse(_mediaDetail!.communityRating ?? '');
+
+    return NipaplayLargeScreenPanel(
+      padding: const EdgeInsets.all(18),
+      child: ListView(
+        padding: EdgeInsets.zero,
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: AspectRatio(
+              aspectRatio: 2 / 3,
+              child: posterUrl.isEmpty
+                  ? Container(
+                      color: _largeScreenChipColor,
+                      child: Icon(
+                        Icons.movie_creation_outlined,
+                        size: 72,
+                        color: _largeScreenMutedTextColor,
+                      ),
+                    )
+                  : CachedNetworkImageWidget(
+                      imageUrl: posterUrl,
+                      fit: BoxFit.cover,
+                      loadMode: CachedImageLoadMode.hybrid,
+                      // 海报 URL 为 700 宽；限制解码尺寸避免电视上整图解码。
+                      memCacheWidth: 700,
+                      memCacheHeight: 1050,
+                    ),
+            ),
+          ),
+          const SizedBox(height: 18),
+          if (ratingValue != null && ratingValue > 0) ...[
+            Row(
+              children: [
+                Icon(Ionicons.star, color: Colors.yellow[600], size: 22),
+                const SizedBox(width: 8),
+                Text(
+                  ratingValue.toStringAsFixed(1),
+                  style: TextStyle(
+                    color: _largeScreenTextColor,
+                    fontSize: 22,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+          ],
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              if (_formatPremiereDate(_mediaDetail!.premiereDate) != null)
+                _buildLargeScreenMetaChip(
+                  Icons.calendar_month_rounded,
+                  _formatPremiereDate(_mediaDetail!.premiereDate)!,
+                ),
+              if (_mediaDetail!.productionYear != null)
+                _buildLargeScreenMetaChip(
+                  Icons.history_rounded,
+                  _mediaDetail!.productionYear.toString(),
+                ),
+              if (_formatRuntime(_mediaDetail!.runTimeTicks).isNotEmpty)
+                _buildLargeScreenMetaChip(
+                  Icons.timer_rounded,
+                  _formatRuntime(_mediaDetail!.runTimeTicks),
+                ),
+              if (_mediaDetail!.officialRating != null &&
+                  _mediaDetail!.officialRating!.trim().isNotEmpty)
+                _buildLargeScreenMetaChip(
+                  Icons.verified_user_outlined,
+                  _mediaDetail!.officialRating!,
+                ),
+            ],
+          ),
+          if (_mediaDetail!.genres.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: _mediaDetail!.genres
+                  .map<Widget>((genre) =>
+                      _buildLargeScreenMetaChip(Icons.sell_outlined, genre))
+                  .toList(),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenMetaChip(IconData icon, String label) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: _largeScreenChipColor,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: _largeScreenChipBorderColor),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 15, color: _largeScreenMutedTextColor),
+          const SizedBox(width: 6),
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: _largeScreenTextColor,
+              fontSize: 13,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenMoviePanel() {
+    final summaryText = (_mediaDetail!.overview != null &&
+                _mediaDetail!.overview!.trim().isNotEmpty
+            ? _mediaDetail!.overview!
+            : '暂无简介')
+        .replaceAll('<br>', ' ')
+        .replaceAll('<br/>', ' ')
+        .replaceAll('<br />', ' ')
+        .replaceAll('```', '');
+
+    return NipaplayLargeScreenPanel(
+      padding: const EdgeInsets.all(22),
+      child: ListView(
+        padding: EdgeInsets.zero,
+        children: [
+          const NipaplayLargeScreenSectionHeader(title: '简介'),
+          const SizedBox(height: 14),
+          Text(
+            summaryText,
+            style: TextStyle(
+              color: _largeScreenTextColor,
+              fontSize: 16,
+              height: 1.55,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 22),
+          NipaplayLargeScreenActionButton(
+            icon: Icons.play_arrow_rounded,
+            label: _isDetailAutoMatching ? '正在匹配' : '播放',
+            onPressed: _isDetailAutoMatching ? null : _playMediaItem,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenEpisodesPanel() {
+    final episodes = _episodesBySeasonId[_selectedSeasonId] ?? [];
+    dynamic service = widget.serverType == MediaServerType.jellyfin
+        ? JellyfinService.instance
+        : EmbyService.instance;
+
+    return NipaplayLargeScreenPanel(
+      padding: const EdgeInsets.all(18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          NipaplayLargeScreenSectionHeader(
+            title: '剧集',
+            subtitle:
+                _selectedSeasonId == null ? '选择一个季后开始播放' : '选择剧集即可自动匹配弹幕并播放',
+          ),
+          if (_seasons.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            SizedBox(
+              height: 48,
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                itemCount: _seasons.length,
+                separatorBuilder: (_, __) => const SizedBox(width: 10),
+                itemBuilder: (context, index) {
+                  final season = _seasons[index];
+                  final selected = season.id == _selectedSeasonId;
+                  return NipaplayLargeScreenFocusableAction(
+                    key: ValueKey('media_detail_season_${season.id}'),
+                    focusNode: selected ? _largeScreenSeasonFocusNode : null,
+                    onActivate: () => _loadEpisodesForSeason(season.id),
+                    borderRadius: BorderRadius.circular(8),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 14, vertical: 10),
+                    style: NipaplayLargeScreenFocusableStyle(
+                      idleBackgroundDark: selected
+                          ? AppAccentColors.current.withValues(alpha: 0.72)
+                          : Colors.white.withValues(alpha: 0.08),
+                      idleBackgroundLight: selected
+                          ? AppAccentColors.current.withValues(alpha: 0.72)
+                          : _largeScreenChipColor,
+                      contentColorDark: Colors.white,
+                      contentColorLight:
+                          selected ? Colors.white : const Color(0xFF161922),
+                    ),
+                    child: Text(
+                      season.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+          const SizedBox(height: 18),
+          Expanded(
+            child: _buildLargeScreenEpisodeGrid(episodes, service),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenEpisodeGrid(List<dynamic> episodes, dynamic service) {
+    if (_selectedSeasonId == null && _seasons.isNotEmpty) {
+      return const NipaplayLargeScreenEmptyState(
+        icon: Icons.video_library_outlined,
+        title: '请选择一个季',
+        subtitle: '使用方向键移动到上方季节后按确认',
+      );
+    }
+    if (_isLoading &&
+        (_episodesBySeasonId[_selectedSeasonId ?? ''] == null ||
+            _episodesBySeasonId[_selectedSeasonId ?? '']!.isEmpty)) {
+      return const Center(child: AdaptiveMediaActivityIndicator());
+    }
+    if (_error != null && _selectedSeasonId != null) {
+      return NipaplayLargeScreenEmptyState(
+        icon: Icons.error_outline_rounded,
+        title: '加载剧集失败',
+        subtitle: _error!,
+        action: NipaplayLargeScreenActionButton(
+          icon: Icons.refresh_rounded,
+          label: '重试',
+          focusNode: _largeScreenRetryFocusNode,
+          onPressed: () => _loadEpisodesForSeason(_selectedSeasonId!),
+        ),
+      );
+    }
+    if (episodes.isEmpty) {
+      return const NipaplayLargeScreenEmptyState(
+        icon: Icons.movie_filter_outlined,
+        title: '没有可播放剧集',
+        subtitle: '当前季没有返回剧集内容',
+      );
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final columns =
+            (constraints.maxWidth / 310).floor().clamp(2, 5).toInt();
+        return GridView.builder(
+          key: ValueKey('media_detail_episodes_$_selectedSeasonId'),
+          padding: const EdgeInsets.only(bottom: 18),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: columns,
+            crossAxisSpacing: 12,
+            mainAxisSpacing: 12,
+            childAspectRatio: 1.42,
+          ),
+          itemCount: episodes.length,
+          itemBuilder: (context, index) {
+            return _buildLargeScreenEpisodeCard(
+              episodes[index],
+              service,
+              focusNode: index == 0 ? _largeScreenEpisodeFocusNode : null,
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildLargeScreenEpisodeCard(dynamic episode, dynamic service,
+      {FocusNode? focusNode}) {
+    final episodeImageUrl = episode.imagePrimaryTag != null
+        ? _getEpisodeImageUrl(episode, service)
+        : '';
+    final title = episode.indexNumber != null
+        ? '${episode.indexNumber}. ${episode.name}'
+        : episode.name;
+    final runtime = episode.runTimeTicks != null
+        ? _formatRuntime(episode.runTimeTicks)
+        : '';
+    final overview = (episode.overview ?? '')
+        .replaceAll('<br>', ' ')
+        .replaceAll('<br/>', ' ')
+        .replaceAll('<br />', ' ');
+
+    return NipaplayLargeScreenFocusableAction(
+      key: ValueKey('media_detail_episode_${episode.id}'),
+      focusNode: focusNode,
+      onActivate: _isDetailAutoMatching ? null : () => _playEpisode(episode),
+      borderRadius: BorderRadius.circular(8),
+      focusScale: 1.025,
+      style: NipaplayLargeScreenFocusableStyle(
+        idleBackgroundDark: Colors.white.withValues(alpha: 0.08),
+        idleBackgroundLight: Colors.white.withValues(alpha: 0.78),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  episodeImageUrl.isNotEmpty
+                      ? CachedNetworkImageWidget(
+                          imageUrl: episodeImageUrl,
+                          fit: BoxFit.cover,
+                          // 剧集缩略图 URL 为 300 宽；限制解码尺寸，
+                          // 避免网格里每张缩略图都按原始分辨率解码。
+                          memCacheWidth: 300,
+                        )
+                      : ColoredBox(
+                          color: _largeScreenChipColor,
+                          child: Icon(
+                            Icons.movie_outlined,
+                            size: 42,
+                            color: _largeScreenMutedTextColor,
+                          ),
+                        ),
+                  Positioned.fill(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [
+                            Colors.transparent,
+                            Colors.black.withValues(alpha: 0.58),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (episode.userData?.played == true)
+                    Positioned(
+                      top: 10,
+                      right: 10,
+                      child: Icon(
+                        Ionicons.checkmark_circle,
+                        color: AppAccentColors.current,
+                        size: 24,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  if (runtime.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      runtime,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: _largeScreenMutedTextColor,
+                      ),
+                    ),
+                  ],
+                  if (overview.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      overview,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        height: 1.22,
+                        color: _largeScreenMutedTextColor,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (NipaplayLargeScreenModeScope.isActiveOf(context)) {
+      return _buildLargeScreenDetailPage();
+    }
+
     final bool isDark = Theme.of(context).brightness == Brightness.dark;
     final Color textColor = isDark ? Colors.white : Colors.black87;
     final Color secondaryTextColor = isDark ? Colors.white70 : Colors.black54;
@@ -617,8 +1449,9 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
 
     if (_isLoading && _mediaDetail == null) {
       pageContent = Center(
-        child: CircularProgressIndicator(
-            color: isDark ? Colors.white : Colors.black87),
+        child: AdaptiveMediaActivityIndicator(
+          color: isDark ? Colors.white : Colors.black87,
+        ),
       );
     } else if (_error != null && _mediaDetail == null) {
       pageContent = Center(
@@ -649,11 +1482,10 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
                 fontSize: 16,
               ),
               SizedBox(height: 10),
-              TextButton(
+              AdaptiveMediaActionButton(
+                label: '关闭',
                 onPressed: () => Navigator.of(context).pop(),
-                child: Text('关闭',
-                    locale: Locale("zh-Hans", "zh"),
-                    style: TextStyle(color: secondaryTextColor)),
+                compact: true,
               ),
             ],
           ),
@@ -671,7 +1503,8 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
           Provider.of<AppearanceSettingsProvider>(context, listen: false);
       final enableAnimation = appearanceSettings.enablePageAnimation;
       final subtitle = _mediaDetail!.originalTitle;
-      final bool isDesktopOrTablet = globals.isDesktopOrTablet;
+      final bool isDesktopOrTablet =
+          AppDisplaySurfaceScope.of(context) != AppDisplaySurface.phone;
 
       pageContent = NipaplayAnimeDetailLayout(
         title: _mediaDetail!.name,
@@ -685,9 +1518,10 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
         enableAnimation: enableAnimation,
         isDesktopOrTablet: isDesktopOrTablet,
         infoView: RepaintBoundary(child: _buildInfoView()),
-        episodesView:
-            _isMovie ? null : RepaintBoundary(child: _buildEpisodesView()),
-        desktopView: (isDesktopOrTablet && !_isMovie)
+        episodesView: _isPlayableItem
+            ? null
+            : RepaintBoundary(child: _buildEpisodesView()),
+        desktopView: (isDesktopOrTablet && !_isPlayableItem)
             ? _buildDesktopTabletLayout()
             : null,
       );
@@ -698,6 +1532,7 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
     final hasBackdrop = backdropUrl.isNotEmpty;
 
     return NipaplayWindowScaffold(
+      embedded: widget.embedded,
       backgroundImageUrl:
           hasBackdrop ? backdropUrl : (posterUrl.isNotEmpty ? posterUrl : null),
       blurBackground: !hasBackdrop, // 如果没有横向图而使用竖向图，开启高斯模糊
@@ -718,7 +1553,6 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
         .replaceAll('<br />', ' ')
         .replaceAll('```', '');
     final posterUrl = _getPosterUrl();
-    final backdropUrl = _getBackdropUrl();
     final ratingValue = double.tryParse(_mediaDetail!.communityRating ?? '');
 
     final bool isDark = Theme.of(context).brightness == Brightness.dark;
@@ -878,15 +1712,14 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
                     padding: const EdgeInsets.only(right: 12),
                     child: Column(
                       children: [
-                        CircleAvatar(
-                          radius: 30,
+                        MediaServerActorAvatar(
+                          imageUrl: actorImage,
+                          size: 60,
                           backgroundColor: Colors.grey.shade800,
-                          backgroundImage: actorImage != null
-                              ? NetworkImage(actorImage)
-                              : null,
-                          child: actorImage == null
-                              ? Icon(Icons.person, color: secondaryTextColor)
-                              : null,
+                          placeholder: Icon(
+                            Icons.person,
+                            color: secondaryTextColor,
+                          ),
                         ),
                         SizedBox(height: 4),
                         SizedBox(
@@ -907,7 +1740,7 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
               ),
             ),
           ],
-          if (_isMovie) ...[
+          if (_isPlayableItem) ...[
             SizedBox(height: 16),
             Row(
               children: [
@@ -921,7 +1754,7 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
                       BlurSnackBar.show(context, '正在自动匹配，请稍候');
                       return;
                     }
-                    _playMovie();
+                    _playMediaItem();
                   },
                   padding:
                       const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
@@ -981,7 +1814,6 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
                 itemBuilder: (context, index) {
                   final season = _seasons[index];
                   final isSelected = season.id == _selectedSeasonId;
-                  final bool enableSeasonHover = !globals.isTouch;
                   final Color seasonTextColor =
                       isSelected ? accentColor : secondaryTextColor;
 
@@ -992,27 +1824,22 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
                       child: Tooltip(
                         message: season.name,
                         waitDuration: const Duration(milliseconds: 500),
-                        child: MouseRegion(
-                          cursor: enableSeasonHover
-                              ? SystemMouseCursors.click
-                              : SystemMouseCursors.basic,
-                          child: GestureDetector(
-                            onTap: () => _loadEpisodesForSeason(season.id),
-                            behavior: HitTestBehavior.opaque,
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 4, vertical: 4),
-                              child: Text(
-                                season.name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  color: seasonTextColor,
-                                  fontWeight: isSelected
-                                      ? FontWeight.w600
-                                      : FontWeight.w400,
-                                ),
-                              ),
+                        child: HoverScaleTextButton(
+                          onPressed: () => _loadEpisodesForSeason(season.id),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 4, vertical: 4),
+                          hoverScale: 1.04,
+                          idleColor: seasonTextColor,
+                          hoverColor: accentColor,
+                          child: Text(
+                            season.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: seasonTextColor,
+                              fontWeight: isSelected
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
                             ),
                           ),
                         ),
@@ -1037,6 +1864,247 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
           child: _buildEpisodesListForSelectedSeason(),
         ),
       ],
+    );
+  }
+
+  Future<void> _playEpisode(dynamic episode) async {
+    if (_isDetailAutoMatching) {
+      BlurSnackBar.show(context, '正在自动匹配，请稍候');
+      return;
+    }
+    try {
+      BlurSnackBar.show(context, '准备播放: ${episode.name}');
+
+      debugPrint('准备创建播放会话');
+
+      final skipDanmakuMatching =
+          context.read<SettingsProvider>().skipDanmakuMatching;
+      if (mounted && !skipDanmakuMatching) {
+        BlurSnackBar.show(context, '正在匹配弹幕信息...');
+      }
+
+      final historyItem = skipDanmakuMatching
+          ? episode.toWatchHistoryItem()
+          : await _runDetailAutoMatchTask<WatchHistoryItem?>(
+              () => _createWatchHistoryItem(episode),
+            );
+      if (historyItem == null) return;
+
+      debugPrint(
+          '成功获取历史记录项: ${historyItem.animeName} - ${historyItem.episodeTitle}, animeId=${historyItem.animeId}, episodeId=${historyItem.episodeId}');
+
+      if (historyItem.animeId == null || historyItem.episodeId == null) {
+        debugPrint('警告: 从 JellyfinDandanplayMatcher 获得的 historyItem 缺少弹幕 ID');
+        debugPrint('  animeId: ${historyItem.animeId}');
+        debugPrint('  episodeId: ${historyItem.episodeId}');
+      } else {
+        debugPrint('确认: historyItem 包含有效的弹幕 ID');
+        debugPrint('  animeId: ${historyItem.animeId}');
+        debugPrint('  episodeId: ${historyItem.episodeId}');
+      }
+
+      var playableHistoryItem = WatchHistoryItem(
+        filePath: historyItem.filePath,
+        animeName: historyItem.animeName,
+        episodeTitle: historyItem.episodeTitle,
+        episodeId: historyItem.episodeId,
+        animeId: historyItem.animeId,
+        watchProgress: historyItem.watchProgress,
+        lastPosition: historyItem.lastPosition,
+        duration: historyItem.duration,
+        lastWatchTime: historyItem.lastWatchTime,
+        thumbnailPath: historyItem.thumbnailPath,
+        isFromScan: false,
+        videoHash: historyItem.videoHash,
+      );
+
+      final selected = await EpisodeFileSelectionService.select(
+        context,
+        PlayableItem(
+          mediaLibraryScope: MediaLibraryScope(
+              widget.serverType == MediaServerType.jellyfin
+                  ? MediaLibraryScopeKind.jellyfin
+                  : MediaLibraryScopeKind.emby),
+          videoPath: playableHistoryItem.filePath,
+          historyItem: playableHistoryItem,
+          animeId: playableHistoryItem.animeId,
+          episodeId: playableHistoryItem.episodeId,
+        ),
+      );
+      if (selected == null || !mounted) return;
+      if (!MediaIdentityResolver.samePath(
+          selected.videoPath, playableHistoryItem.filePath)) {
+        final detailRoute = ModalRoute.of(context);
+        final detailNavigator = Navigator.of(context);
+        final started = await PlaybackService().play(
+          selected,
+          episodeFileSelectionHandled: true,
+        );
+        if (started && detailRoute?.isCurrent == true && detailNavigator.mounted) {
+          detailNavigator.pop();
+        }
+        return;
+      }
+      playableHistoryItem = selected.historyItem ?? playableHistoryItem;
+
+      final startPositionMs = playableHistoryItem.lastPosition > 0
+          ? playableHistoryItem.lastPosition
+          : null;
+
+      if (playableHistoryItem.filePath.startsWith('emby://')) {
+        final embyId = embyItemIdFromVideoPath(playableHistoryItem.filePath);
+        final selectionContext = _embySelectionContextFor(episode);
+        final sources = await _embyMediaSourceCatalog.load(
+          selectionContext?.accountKey ?? _embyPageCacheScope,
+          embyId,
+        );
+        final preferenceStore = await _embyPreferenceStore;
+        if (!mounted) return;
+
+        await startEmbyEpisodePlayback(
+          itemId: embyId,
+          context: selectionContext,
+          sources: sources,
+          loadPreferences: preferenceStore.load,
+          resolver: DefaultEmbyMediaSelectionResolver(),
+          startPositionMs: startPositionMs,
+          createSession: (request) =>
+              EmbyService.instance.createPlaybackSession(
+            itemId: request.itemId,
+            startPositionMs: request.startPositionMs,
+            audioStreamIndex: request.audioStreamIndex,
+            subtitleStreamIndex: request.subtitleStreamIndex,
+            burnInSubtitle: request.burnInSubtitle,
+            playSessionId: request.playSessionId,
+            mediaSourceId: request.mediaSourceId,
+          ),
+          startPlayback: (playback) async {
+            await _startEpisodePlayback(
+              playableHistoryItem,
+              playback.session,
+              embyTrackSelection: playback.tracks,
+              onPlaybackStarted: playback.didFallback
+                  ? () => BlurSnackBar.show(
+                        context,
+                        '首选 Emby 版本不可用，已自动切换到可播放版本',
+                      )
+                  : null,
+            );
+          },
+        );
+        return;
+      }
+
+      PlaybackSession? playbackSession;
+      if (playableHistoryItem.filePath.startsWith('jellyfin://')) {
+        final jellyfinId =
+            playableHistoryItem.filePath.replaceFirst('jellyfin://', '');
+        playbackSession = await JellyfinService.instance.createPlaybackSession(
+          itemId: jellyfinId,
+          startPositionMs: startPositionMs,
+        );
+      }
+      await _startEpisodePlayback(playableHistoryItem, playbackSession);
+    } catch (e) {
+      if (mounted) BlurSnackBar.show(context, '播放出错: $e');
+      debugPrint('播放Jellyfin媒体出错: $e');
+    }
+  }
+
+  Future<void> _startEpisodePlayback(
+    WatchHistoryItem historyItem,
+    PlaybackSession? playbackSession, {
+    EmbyResolvedTrackBundle? embyTrackSelection,
+    VoidCallback? onPlaybackStarted,
+  }) async {
+    if (!mounted) return;
+    final settingsProvider =
+        Provider.of<SettingsProvider>(context, listen: false);
+    if (settingsProvider.useExternalPlayer) {
+      final playableItem = PlayableItem(
+        mediaLibraryScope: MediaLibraryScope(
+            widget.serverType == MediaServerType.jellyfin
+                ? MediaLibraryScopeKind.jellyfin
+                : MediaLibraryScopeKind.emby),
+        videoPath: historyItem.filePath,
+        title: historyItem.animeName,
+        subtitle: historyItem.episodeTitle,
+        animeId: historyItem.animeId,
+        episodeId: historyItem.episodeId,
+        historyItem: historyItem,
+        playbackSession: playbackSession,
+      );
+      final handled =
+          await PlaybackService().tryPlayExternally(context, playableItem,
+              episodeFileSelectionHandled: true);
+      if (!mounted) return;
+      if (handled) {
+        onPlaybackStarted?.call();
+        Navigator.of(context).pop();
+        return;
+      }
+    }
+
+    if (!mounted) return;
+    final detailNavigator = Navigator.of(context);
+    final videoPlayerState =
+        Provider.of<VideoPlayerState>(context, listen: false);
+    TabChangeNotifier? tabChangeNotifier;
+    try {
+      tabChangeNotifier =
+          Provider.of<TabChangeNotifier>(context, listen: false);
+    } catch (e) {
+      debugPrint('无法获取TabChangeNotifier: $e');
+    }
+    tabChangeNotifier?.changePage(AppPageIds.video);
+
+    final isEmbyPlayback = historyItem.filePath.startsWith('emby://');
+    if (!isEmbyPlayback) {
+      Navigator.of(context).pop();
+      Future<void>.delayed(const Duration(milliseconds: 100), () async {
+        try {
+          await videoPlayerState.initializePlayer(
+            historyItem.filePath,
+            mediaLibraryScope: MediaLibraryScope(
+                widget.serverType == MediaServerType.jellyfin
+                    ? MediaLibraryScopeKind.jellyfin
+                    : MediaLibraryScopeKind.emby),
+            historyItem: historyItem,
+            playbackSession: playbackSession,
+            episodeFileSelectionHandled: true,
+          );
+          videoPlayerState.play();
+        } catch (playError) {
+          debugPrint('异步播放流媒体时出错: $playError');
+        }
+      });
+      return;
+    }
+
+    await startEmbyPlaybackAndCloseDetail(
+      detailNavigator: detailNavigator,
+      startPlayback: () async {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await initializeEmbyPlayerAttempt(
+          initialize: () => videoPlayerState.initializePlayer(
+            historyItem.filePath,
+            mediaLibraryScope: MediaLibraryScope(
+                widget.serverType == MediaServerType.jellyfin
+                    ? MediaLibraryScopeKind.jellyfin
+                    : MediaLibraryScopeKind.emby),
+            historyItem: historyItem,
+            playbackSession: playbackSession,
+            embyTrackSelection: embyTrackSelection,
+            episodeFileSelectionHandled: true,
+          ),
+          readError: () => videoPlayerState.error,
+          hasVideo: () => videoPlayerState.hasVideo,
+          play: () async => videoPlayerState.play(),
+        );
+        if (mounted) {
+          onPlaybackStarted?.call();
+        }
+      },
     );
   }
 
@@ -1067,7 +2135,7 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
         (_episodesBySeasonId[_selectedSeasonId ?? ''] == null ||
             _episodesBySeasonId[_selectedSeasonId ?? '']!.isEmpty)) {
       return Center(
-        child: CircularProgressIndicator(color: textColor),
+        child: AdaptiveMediaActivityIndicator(color: textColor),
       );
     }
 
@@ -1111,7 +2179,7 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
     }
     if (episodes.isEmpty && _isLoading) {
       // 如果仍在加载，显示加载指示器
-      return Center(child: CircularProgressIndicator(color: textColor));
+      return Center(child: AdaptiveMediaActivityIndicator(color: textColor));
     }
     if (episodes.isEmpty && _selectedSeasonId == null && _seasons.isEmpty) {
       // 处理没有季的情况
@@ -1144,6 +2212,13 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
           final Color playIconColor =
               isEpisodeHovered ? accentColor : secondaryTextColor;
           final Color titleColor = isEpisodeHovered ? accentColor : textColor;
+          final showMediaSelectionEntry = shouldShowEmbyMediaSelectionEntry(
+            isEmby: widget.serverType == MediaServerType.emby,
+            isWindows:
+                !kIsWeb && defaultTargetPlatform == TargetPlatform.windows,
+            isIOS: !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS,
+            isLargeScreen: NipaplayLargeScreenModeScope.isActiveOf(context),
+          );
 
           return MouseRegion(
             cursor: playHoverEnabled
@@ -1159,10 +2234,9 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
                     }
                   }
                 : null,
-            child: ListTile(
+            child: AdaptiveMediaListTile(
               contentPadding:
                   const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              enabled: !_isDetailAutoMatching,
               leading: SizedBox(
                 width: 100, // 调整图片宽度
                 height: 60, // 调整图片高度，保持宽高比
@@ -1240,6 +2314,16 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
               trailing: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  if (showMediaSelectionEntry)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 4),
+                      child: EmbyMediaSelectionEntry(
+                        savedSourceLabel:
+                            _embySavedSourceLabels[episode.id.toString()],
+                        onOpen: () =>
+                            unawaited(_openEmbyMediaSelection(episode)),
+                      ),
+                    ),
                   if (episode.userData?.played == true)
                     Padding(
                       padding: const EdgeInsets.only(right: 8.0),
@@ -1261,196 +2345,7 @@ class _MediaServerDetailPageState extends State<MediaServerDetailPage>
                   ),
                 ],
               ),
-              onTap: () async {
-                if (_isDetailAutoMatching) {
-                  BlurSnackBar.show(context, '正在自动匹配，请稍候');
-                  return;
-                }
-                try {
-                  BlurSnackBar.show(context, '准备播放: ${episode.name}');
-
-                  debugPrint('准备创建播放会话');
-
-                  // 显示加载指示器
-                  if (mounted) {
-                    BlurSnackBar.show(context, '正在匹配弹幕信息...');
-                  }
-
-                  // 使用JellyfinDandanplayMatcher创建增强的WatchHistoryItem
-                  // 这一步会显示匹配对话框，阻塞直到用户完成选择或跳过
-                  final historyItem =
-                      await _runDetailAutoMatchTask<WatchHistoryItem?>(
-                          () => _createWatchHistoryItem(episode));
-                  if (historyItem == null) return; // 用户关闭弹窗，什么都不做
-
-                  // 用户已完成匹配选择，现在可以继续播放流程
-                  debugPrint(
-                      '成功获取历史记录项: ${historyItem.animeName} - ${historyItem.episodeTitle}, animeId=${historyItem.animeId}, episodeId=${historyItem.episodeId}');
-
-                  // 调试：检查 historyItem 的弹幕 ID
-                  if (historyItem.animeId == null ||
-                      historyItem.episodeId == null) {
-                    debugPrint(
-                        '警告: 从 JellyfinDandanplayMatcher 获得的 historyItem 缺少弹幕 ID');
-                    debugPrint('  animeId: ${historyItem.animeId}');
-                    debugPrint('  episodeId: ${historyItem.episodeId}');
-                  } else {
-                    debugPrint('确认: historyItem 包含有效的弹幕 ID');
-                    debugPrint('  animeId: ${historyItem.animeId}');
-                    debugPrint('  episodeId: ${historyItem.episodeId}');
-                  }
-
-                  // 创建一个专门用于流媒体播放的历史记录项，使用稳定的jellyfin://或emby://协议
-                  final playableHistoryItem = WatchHistoryItem(
-                    filePath:
-                        historyItem.filePath, // 保持稳定的jellyfin://或emby://协议URL
-                    animeName: historyItem.animeName,
-                    episodeTitle: historyItem.episodeTitle,
-                    episodeId: historyItem.episodeId,
-                    animeId: historyItem.animeId,
-                    watchProgress: historyItem.watchProgress,
-                    lastPosition: historyItem.lastPosition,
-                    duration: historyItem.duration,
-                    lastWatchTime: historyItem.lastWatchTime,
-                    thumbnailPath: historyItem.thumbnailPath,
-                    isFromScan: false,
-                    videoHash: historyItem.videoHash, // 确保包含视频哈希值
-                  );
-
-                  final settingsProvider =
-                      Provider.of<SettingsProvider>(context, listen: false);
-                  if (settingsProvider.useExternalPlayer) {
-                    PlaybackSession? playbackSession;
-                    if (playableHistoryItem.filePath
-                        .startsWith('jellyfin://')) {
-                      final jellyfinId = playableHistoryItem.filePath
-                          .replaceFirst('jellyfin://', '');
-                      playbackSession =
-                          await JellyfinService.instance.createPlaybackSession(
-                        itemId: jellyfinId,
-                        startPositionMs: playableHistoryItem.lastPosition > 0
-                            ? playableHistoryItem.lastPosition
-                            : null,
-                      );
-                    } else if (playableHistoryItem.filePath
-                        .startsWith('emby://')) {
-                      final embyPath = playableHistoryItem.filePath
-                          .replaceFirst('emby://', '');
-                      final parts = embyPath.split('/');
-                      final embyId = parts.isNotEmpty ? parts.last : embyPath;
-                      playbackSession =
-                          await EmbyService.instance.createPlaybackSession(
-                        itemId: embyId,
-                        startPositionMs: playableHistoryItem.lastPosition > 0
-                            ? playableHistoryItem.lastPosition
-                            : null,
-                      );
-                    }
-
-                    final playableItem = PlayableItem(
-                      videoPath: playableHistoryItem.filePath,
-                      title: playableHistoryItem.animeName,
-                      subtitle: playableHistoryItem.episodeTitle,
-                      animeId: playableHistoryItem.animeId,
-                      episodeId: playableHistoryItem.episodeId,
-                      historyItem: playableHistoryItem,
-                      playbackSession: playbackSession,
-                    );
-                    if (await ExternalPlayerService.tryHandlePlayback(
-                        context, playableItem)) {
-                      Navigator.of(context).pop();
-                      return;
-                    }
-                  }
-
-                  // 获取必要的服务引用
-                  final videoPlayerState =
-                      Provider.of<VideoPlayerState>(context, listen: false);
-
-                  // 在页面关闭前，获取TabChangeNotifier
-                  // 注意：通过listen: false方式获取，避免建立依赖关系
-                  TabChangeNotifier? tabChangeNotifier;
-                  try {
-                    tabChangeNotifier =
-                        Provider.of<TabChangeNotifier>(context, listen: false);
-                  } catch (e) {
-                    debugPrint('无法获取TabChangeNotifier: $e');
-                  }
-
-                  // *** 关键修改：立即切换页面和关闭详情页，像本地视频播放一样 ***
-                  // 1. 立即切换到播放页面，显示加载中
-                  if (tabChangeNotifier != null) {
-                    debugPrint('立即切换到播放页面');
-                    tabChangeNotifier.changeTab(1);
-                  }
-
-                  // 2. 立即关闭详情页面
-                  Navigator.of(context).pop();
-                  debugPrint('详情页面已立即关闭');
-
-                  // 3. 显示开始播放的提示（这个提示会在播放页面显示）
-                  if (mounted) {
-                    BlurSnackBar.show(
-                        context, '开始播放: ${historyItem.episodeTitle}');
-                  }
-
-                  // 4. 异步初始化播放器（页面已切换，用户能看到加载中）
-                  debugPrint('开始异步初始化播放器...');
-
-                  // 使用异步方式初始化播放器，不阻塞UI
-                  Future.delayed(const Duration(milliseconds: 100), () async {
-                    try {
-                      debugPrint('异步初始化播放器 - 开始');
-                      // 基于 PlaybackInfo 创建播放会话
-                      PlaybackSession? playbackSession;
-                      if (playableHistoryItem.filePath
-                          .startsWith('jellyfin://')) {
-                        final jellyfinId = playableHistoryItem.filePath
-                            .replaceFirst('jellyfin://', '');
-                        playbackSession = await JellyfinService.instance
-                            .createPlaybackSession(
-                          itemId: jellyfinId,
-                          startPositionMs: playableHistoryItem.lastPosition > 0
-                              ? playableHistoryItem.lastPosition
-                              : null,
-                        );
-                      } else if (playableHistoryItem.filePath
-                          .startsWith('emby://')) {
-                        final embyPath = playableHistoryItem.filePath
-                            .replaceFirst('emby://', '');
-                        final parts = embyPath.split('/');
-                        final embyId = parts.isNotEmpty ? parts.last : embyPath;
-                        playbackSession =
-                            await EmbyService.instance.createPlaybackSession(
-                          itemId: embyId,
-                          startPositionMs: playableHistoryItem.lastPosition > 0
-                              ? playableHistoryItem.lastPosition
-                              : null,
-                        );
-                      }
-
-                      await videoPlayerState.initializePlayer(
-                        historyItem.filePath,
-                        historyItem: playableHistoryItem,
-                        playbackSession: playbackSession,
-                      );
-                      debugPrint('异步初始化播放器 - 完成');
-
-                      // 开始播放
-                      debugPrint('异步播放 - 开始播放视频');
-                      videoPlayerState.play();
-                      debugPrint(
-                          '异步播放 - 成功开始播放: ${playableHistoryItem.animeName} - ${playableHistoryItem.episodeTitle}');
-                    } catch (playError) {
-                      debugPrint('异步播放流媒体时出错: $playError');
-                      // 此时页面已关闭，无法显示错误提示，只记录日志
-                    }
-                  });
-                } catch (e) {
-                  BlurSnackBar.show(context, '播放出错: $e');
-                  debugPrint('播放Jellyfin媒体出错: $e');
-                }
-              },
+              onTap: _isDetailAutoMatching ? null : () => _playEpisode(episode),
             ),
           );
         },

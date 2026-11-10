@@ -159,18 +159,43 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
   void setExternalSubtitle(String path, {bool isManualSetting = false}) {
     _subtitleManager.setExternalSubtitle(path,
         isManualSetting: isManualSetting);
+    // Activation changes which kernel track owns the sid; the whole-block
+    // mode must step aside for a kernel-rendered external ASS (and resume
+    // for embedded tracks), so re-sync sub-visibility.
+    applyEmbeddedSubtitleOverlayKernelState();
+    _notifyListeners();
+  }
+
+  // 选内嵌字幕轨（>= 0）或关闭字幕（< 0），同时摘掉外挂字幕
+  void selectEmbeddedSubtitleTrack(int trackIndex) {
+    _subtitleManager.selectEmbeddedSubtitleTrack(trackIndex);
     _notifyListeners();
   }
 
   // 强制设置外部字幕（手动操作）
   void forceSetExternalSubtitle(String path) {
     _subtitleManager.forceSetExternalSubtitle(path);
+    applyEmbeddedSubtitleOverlayKernelState();
     _notifyListeners();
   }
 
   // 桥接方法：预加载字幕文件
   Future<void> preloadSubtitleFile(String path) async {
     await _subtitleManager.preloadSubtitleFile(path);
+  }
+
+  // 桥接方法：叠加挂载外部字幕到堆栈（多挂，可带显示名）
+  Future<void> addExternalSubtitleToStack(String path,
+      {String? displayName}) async {
+    await _subtitleManager.addExternalSubtitleToStack(path,
+        displayName: displayName);
+    _notifyListeners();
+  }
+
+  // 桥接方法：取消挂载外部字幕（从叠层/内核移除）
+  Future<void> removeExternalSubtitle(String path) async {
+    await _subtitleManager.removeExternalSubtitleFromStack(path);
+    _notifyListeners();
   }
 
   // 桥接方法：获取当前活跃的外部字幕文件路径
@@ -181,6 +206,59 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
   // 桥接方法：获取当前显示的字幕文本
   String getCurrentSubtitleText() {
     return _subtitleManager.getCurrentSubtitleText();
+  }
+
+  // ---- 多字幕分块渲染桥接：每条外挂字幕独立的时轴延迟/位置/边距 ----
+
+  /// 全部活跃的外挂字幕路径（有序，多挂时逐条叠加渲染）
+  List<String> get activeExternalSubtitlePaths =>
+      _subtitleManager.getAllActiveExternalSubtitlePaths();
+
+  /// 查询单条字幕在指定时间点的文本
+  String pathSubtitleTextAt(String path, int positionMs) =>
+      _subtitleManager.pathSubtitleTextAt(path, positionMs);
+
+  /// 叠层里这条外挂字幕的总偏移（毫秒）：SRT/VTT 含共用的 SRT 偏移
+  int overlaySubtitleDelayMs(String path) =>
+      _subtitleManager.overlayDelayMs(path);
+
+  /// 叠层此刻给出的这条外挂字幕的那一行（已按偏移）
+  String overlaySubtitleTextAt(String path, int playbackMs) =>
+      _subtitleManager.overlayTextAt(path, playbackMs);
+
+  /// 某条字幕的显示名（无登记时回退文件名）
+  String externalSubtitleDisplayName(String path) =>
+      _subtitleManager.displayNameForPath(path);
+
+  /// 某条字幕的时轴延迟（秒；正值延后，负值提前）
+  double pathSubtitleDelaySeconds(String path) =>
+      _subtitleManager.pathDelaySeconds(path);
+
+  void setPathSubtitleDelaySeconds(String path, double seconds) {
+    _subtitleManager.setPathDelaySeconds(path, seconds);
+    _notifyListeners();
+  }
+
+  /// 某条字幕的垂直位置（0=屏幕顶 100=屏幕底）
+  double pathSubtitlePosition(String path) =>
+      _subtitleManager.pathPosition(path);
+
+  /// 该外挂字幕是否走 App 叠层渲染（false = 内核轨，libmpv ASS）
+  bool externalSubtitleRenderedInApp(String path) =>
+      _subtitleManager.externalSubtitleRenderedInApp(path);
+
+  void setPathSubtitlePosition(String path, double position) {
+    _subtitleManager.setPathPosition(path, position);
+    _notifyListeners();
+  }
+
+  /// 某条字幕的水平边距（逻辑像素）
+  double pathSubtitleMarginX(String path) =>
+      _subtitleManager.pathMarginX(path);
+
+  void setPathSubtitleMarginX(String path, double marginX) {
+    _subtitleManager.setPathMarginX(path, marginX);
+    _notifyListeners();
   }
 
   // 桥接方法：判断当前外挂字幕是否使用应用内叠层渲染
@@ -196,6 +274,143 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
   // 桥接方法：当字幕轨道改变时调用
   void onSubtitleTrackChanged() {
     _subtitleManager.onSubtitleTrackChanged();
+  }
+
+  // ---- Whole-block embedded subtitle mode (bilingual, non-overlapping) ----
+
+  /// Whether whole-block mode is enabled. With it on, the kernel only
+  /// decodes (sub-visibility=no) while the app renders the whole block from
+  /// sub-text polling: the position slider moves the entire block so the
+  /// authored bilingual line gap never collapses, and the horizontal margin
+  /// applies in screen pixels regardless of the script's PlayRes.
+  ///
+  /// Exception: while a kernel-rendered external ASS/SSA is active the mode
+  /// steps aside (see [isKernelRenderedExternalAssActive]) so libass keeps
+  /// rendering that track with its script styles.
+  bool get embeddedSubtitleOverlayMode => _embeddedSubtitleOverlayMode;
+
+  /// Whether the currently active external subtitle is a kernel-track
+  /// ASS/SSA. Whole-block mode only serves embedded tracks — an external
+  /// ASS is rendered by libass with script-dominant styling; flattening it
+  /// through sub-visibility=no + a sub-text text block would strip \pos
+  /// positioning and colors.
+  bool get isKernelRenderedExternalAssActive =>
+      _subtitleManager.isKernelRenderedExternalAssActive();
+
+  Future<void> setEmbeddedSubtitleOverlayMode(bool enabled) async {
+    if (_embeddedSubtitleOverlayMode == enabled) return;
+    _embeddedSubtitleOverlayMode = enabled;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_embeddedSubtitleOverlayModeKey, enabled);
+    applyEmbeddedSubtitleOverlayKernelState();
+    _notifyListeners();
+  }
+
+  /// Whole-block text for the current position (kernel sub-text polling;
+  /// empty = no subtitle right now).
+  String get embeddedSubtitleOverlayText => _embeddedSubtitleOverlayText;
+
+  /// The text actually rendered: bilingual line order auto-correction.
+  /// The kernel orders sub-text lines by event order, which may put the
+  /// Japanese line first. Lines containing kana are treated as the original
+  /// (bottom), pure-Han lines as the translation (top); when there is no
+  /// kana evidence the kernel order is kept.
+  String get embeddedSubtitleOverlayDisplayText {
+    final text = _embeddedSubtitleOverlayText;
+    if (!text.contains('\n')) return text;
+    final lines = text.split('\n');
+    bool hasKana(String s) {
+      for (final r in s.runes) {
+        if ((r >= 0x3041 && r <= 0x309F) || // Hiragana
+            (r >= 0x30A0 && r <= 0x30FF) || // Katakana
+            (r >= 0x31F0 && r <= 0x31FF) || // Katakana phonetic extensions
+            (r >= 0xFF66 && r <= 0xFF9D)) {
+          // Halfwidth katakana
+          return true;
+        }
+      }
+      return false;
+    }
+
+    final kanaCount = lines.where(hasKana).length;
+    if (kanaCount == 0 || kanaCount == lines.length) return text;
+    final japanese = lines.where(hasKana).toList();
+    final chinese = lines.where((l) => !hasKana(l)).toList();
+    return [...chinese, ...japanese].join('\n');
+  }
+
+  /// Sync the kernel render switch with the current mode. Idempotent; call
+  /// after mode toggles, video open, kernel hot-swap, and external-subtitle
+  /// activation changes. Media Kit + mode on + no kernel-rendered external
+  /// ASS -> sub-visibility=no; otherwise yes (and residue text is cleared).
+  void applyEmbeddedSubtitleOverlayKernelState() {
+    if (kIsWeb || _isDisposed) return;
+    try {
+      if (player.getPlayerKernelName() == 'Media Kit' &&
+          _embeddedSubtitleOverlayMode &&
+          !isKernelRenderedExternalAssActive) {
+        player.setProperty('sub-visibility', 'no');
+      } else {
+        player.setProperty('sub-visibility', 'yes');
+        if (_embeddedSubtitleOverlayText.isNotEmpty) {
+          _embeddedSubtitleOverlayText = '';
+          _notifyListeners();
+        }
+      }
+    } catch (e) {
+      debugPrint('VideoPlayerState: sync whole-block kernel state failed: $e');
+    }
+  }
+
+  /// Throttled poll entry from the position ticker (~8Hz, notifies only on
+  /// text change).
+  void pollEmbeddedSubtitleOverlayText() {
+    if (!_embeddedSubtitleOverlayMode || kIsWeb || _isDisposed) return;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastEmbeddedSubTextPollMs < 120) return;
+    _lastEmbeddedSubTextPollMs = nowMs;
+    unawaited(_pollEmbeddedSubtitleOverlayText());
+  }
+
+  /// Reduced-frequency poll while paused (800ms): keeps the text fresh when
+  /// the user drags style sliders on a paused frame — otherwise the stale
+  /// line can be pushed off-frame by a kernel style recompute and the user
+  /// perceives "subtitle vanished until the next seek".
+  void pollEmbeddedSubtitleOverlayTextPaused() {
+    if (!_embeddedSubtitleOverlayMode || kIsWeb || _isDisposed) return;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastEmbeddedSubTextPollMs < 800) return;
+    _lastEmbeddedSubTextPollMs = nowMs;
+    unawaited(_pollEmbeddedSubtitleOverlayText());
+  }
+
+  Future<void> _pollEmbeddedSubtitleOverlayText() async {
+    try {
+      // While a kernel-rendered external ASS is active the whole block must
+      // not render (libass owns the styling); clear any residue collected
+      // before the switch so it never overlays the libass render.
+      if (isKernelRenderedExternalAssActive) {
+        if (_embeddedSubtitleOverlayText.isNotEmpty) {
+          _embeddedSubtitleOverlayText = '';
+          _notifyListeners();
+        }
+        return;
+      }
+      final text = await player.getLiveProperty('sub-text') ?? '';
+      if (_isDisposed) return;
+      final trimmed = text.trim();
+      if (trimmed == _embeddedSubtitleOverlayText) return;
+      _embeddedSubtitleOverlayText = trimmed;
+      _notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Test-only: inject the whole-block text directly (bypasses the real
+  /// clock throttle so widget tests on FakeAsync can drive it with pump).
+  @visibleForTesting
+  void debugSetEmbeddedSubtitleOverlayText(String text) {
+    _embeddedSubtitleOverlayText = text;
+    _notifyListeners();
   }
 
   // 桥接方法：获取缓存的字幕内容
@@ -217,6 +432,10 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
     _subtitleManager.clearSubtitleTrackInfo();
   }
 
+  /// 重新触发自动检测并加载字幕（清除字幕缓存后调用）
+  Future<void> redetectAndLoadSubtitle(String videoPath) =>
+      _subtitleManager.autoDetectAndLoadSubtitle(videoPath);
+
   // 自动检测并加载同名字幕文件
   Future<void> _autoDetectAndLoadSubtitle(String videoPath) async {
     // 此方法不再需要，我们使用subtitleManager的方法代替
@@ -226,7 +445,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
   // 加载顶部弹幕屏蔽设置
   Future<void> _loadBlockTopDanmaku() async {
     final prefs = await SharedPreferences.getInstance();
-    _blockTopDanmaku = prefs.getBool(_blockTopDanmakuKey) ?? false;
+    _blockTopDanmaku = prefs.getBool(SettingsKeys.blockTopDanmaku) ?? false;
     _notifyListeners();
   }
 
@@ -235,7 +454,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
     if (_blockTopDanmaku != block) {
       _blockTopDanmaku = block;
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_blockTopDanmakuKey, block);
+      await prefs.setBool(SettingsKeys.blockTopDanmaku, block);
       _updateMergedDanmakuList();
     }
   }
@@ -243,7 +462,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
   // 加载底部弹幕屏蔽设置
   Future<void> _loadBlockBottomDanmaku() async {
     final prefs = await SharedPreferences.getInstance();
-    _blockBottomDanmaku = prefs.getBool(_blockBottomDanmakuKey) ?? false;
+    _blockBottomDanmaku = prefs.getBool(SettingsKeys.blockBottomDanmaku) ?? false;
     _notifyListeners();
   }
 
@@ -252,7 +471,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
     if (_blockBottomDanmaku != block) {
       _blockBottomDanmaku = block;
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_blockBottomDanmakuKey, block);
+      await prefs.setBool(SettingsKeys.blockBottomDanmaku, block);
       _updateMergedDanmakuList();
     }
   }
@@ -260,7 +479,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
   // 加载滚动弹幕屏蔽设置
   Future<void> _loadBlockScrollDanmaku() async {
     final prefs = await SharedPreferences.getInstance();
-    _blockScrollDanmaku = prefs.getBool(_blockScrollDanmakuKey) ?? false;
+    _blockScrollDanmaku = prefs.getBool(SettingsKeys.blockScrollDanmaku) ?? false;
     _notifyListeners();
   }
 
@@ -269,7 +488,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
     if (_blockScrollDanmaku != block) {
       _blockScrollDanmaku = block;
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_blockScrollDanmakuKey, block);
+      await prefs.setBool(SettingsKeys.blockScrollDanmaku, block);
       _updateMergedDanmakuList();
     }
   }
@@ -277,7 +496,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
   // 加载弹幕屏蔽词列表
   Future<void> _loadDanmakuBlockWords() async {
     final prefs = await SharedPreferences.getInstance();
-    final blockWordsJson = prefs.getString(_danmakuBlockWordsKey);
+    final blockWordsJson = prefs.getString(SettingsKeys.danmakuBlockWords);
     if (blockWordsJson != null && blockWordsJson.isNotEmpty) {
       try {
         final List<dynamic> decodedList = json.decode(blockWordsJson);
@@ -301,7 +520,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
   Future<void> _loadSpoilerPreventionEnabled() async {
     final prefs = await SharedPreferences.getInstance();
     _spoilerPreventionEnabled =
-        prefs.getBool(_spoilerPreventionEnabledKey) ?? false;
+        prefs.getBool(SettingsKeys.spoilerPreventionEnabled) ?? false;
     _notifyListeners();
   }
 
@@ -316,7 +535,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
     _spoilerPreventionEnabled = enabled;
 
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_spoilerPreventionEnabledKey, enabled);
+    await prefs.setBool(SettingsKeys.spoilerPreventionEnabled, enabled);
 
     _isSpoilerDanmakuAnalyzing = false;
     _spoilerDanmakuAnalysisHash = null;
@@ -366,25 +585,25 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
 
   Future<void> _loadSpoilerAiSettings() async {
     final prefs = await SharedPreferences.getInstance();
-    final storedUseCustomKey = prefs.getBool(_spoilerAiUseCustomKeyKey);
+    final storedUseCustomKey = prefs.getBool(SettingsKeys.spoilerAiUseCustomKey);
     if (storedUseCustomKey != true) {
       _spoilerAiUseCustomKey = true;
-      await prefs.setBool(_spoilerAiUseCustomKeyKey, true);
+      await prefs.setBool(SettingsKeys.spoilerAiUseCustomKey, true);
     } else {
       _spoilerAiUseCustomKey = true;
     }
     _spoilerAiApiFormat =
-        _parseSpoilerAiApiFormat(prefs.getString(_spoilerAiApiFormatKey));
-    _spoilerAiApiUrl = prefs.getString(_spoilerAiApiUrlKey) ?? '';
-    _spoilerAiApiKey = prefs.getString(_spoilerAiApiKeyKey) ?? '';
-    _spoilerAiModel = prefs.getString(_spoilerAiModelKey) ?? 'gpt-5';
-    final temp = prefs.getDouble(_spoilerAiTemperatureKey) ?? 0.5;
+        _parseSpoilerAiApiFormat(prefs.getString(SettingsKeys.spoilerAiApiFormat));
+    _spoilerAiApiUrl = prefs.getString(SettingsKeys.spoilerAiApiUrl) ?? '';
+    _spoilerAiApiKey = prefs.getString(SettingsKeys.spoilerAiApiKey) ?? '';
+    _spoilerAiModel = prefs.getString(SettingsKeys.spoilerAiModel) ?? 'gpt-5';
+    final temp = prefs.getDouble(SettingsKeys.spoilerAiTemperature) ?? 0.5;
     _spoilerAiTemperature = temp.clamp(0.0, 2.0).toDouble();
     _spoilerAiDebugPrintResponse =
-        prefs.getBool(_spoilerAiDebugPrintResponseKey) ?? false;
+        prefs.getBool(SettingsKeys.spoilerAiDebugPrintResponse) ?? false;
     if (_spoilerPreventionEnabled && !spoilerAiConfigReady) {
       _spoilerPreventionEnabled = false;
-      await prefs.setBool(_spoilerPreventionEnabledKey, false);
+      await prefs.setBool(SettingsKeys.spoilerPreventionEnabled, false);
     }
     _notifyListeners();
   }
@@ -404,7 +623,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
 
     if (useCustomKey != null && _spoilerAiUseCustomKey != true) {
       _spoilerAiUseCustomKey = true;
-      await prefs.setBool(_spoilerAiUseCustomKeyKey, true);
+      await prefs.setBool(SettingsKeys.spoilerAiUseCustomKey, true);
       changed = true;
       shouldRestartAnalysis = true;
     }
@@ -412,7 +631,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
     if (apiFormat != null && _spoilerAiApiFormat != apiFormat) {
       _spoilerAiApiFormat = apiFormat;
       await prefs.setString(
-        _spoilerAiApiFormatKey,
+        SettingsKeys.spoilerAiApiFormat,
         _spoilerAiApiFormatToPrefs(apiFormat),
       );
       changed = true;
@@ -421,21 +640,21 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
 
     if (apiUrl != null && _spoilerAiApiUrl != apiUrl) {
       _spoilerAiApiUrl = apiUrl;
-      await prefs.setString(_spoilerAiApiUrlKey, apiUrl);
+      await prefs.setString(SettingsKeys.spoilerAiApiUrl, apiUrl);
       changed = true;
       shouldRestartAnalysis = true;
     }
 
     if (apiKey != null && _spoilerAiApiKey != apiKey) {
       _spoilerAiApiKey = apiKey;
-      await prefs.setString(_spoilerAiApiKeyKey, apiKey);
+      await prefs.setString(SettingsKeys.spoilerAiApiKey, apiKey);
       changed = true;
       shouldRestartAnalysis = true;
     }
 
     if (model != null && _spoilerAiModel != model) {
       _spoilerAiModel = model;
-      await prefs.setString(_spoilerAiModelKey, model);
+      await prefs.setString(SettingsKeys.spoilerAiModel, model);
       changed = true;
       shouldRestartAnalysis = true;
     }
@@ -444,7 +663,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
       final resolved = temperature.clamp(0.0, 2.0).toDouble();
       if ((_spoilerAiTemperature - resolved).abs() > 0.0001) {
         _spoilerAiTemperature = resolved;
-        await prefs.setDouble(_spoilerAiTemperatureKey, resolved);
+        await prefs.setDouble(SettingsKeys.spoilerAiTemperature, resolved);
         changed = true;
         shouldRestartAnalysis = true;
       }
@@ -453,7 +672,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
     if (debugPrintResponse != null &&
         _spoilerAiDebugPrintResponse != debugPrintResponse) {
       _spoilerAiDebugPrintResponse = debugPrintResponse;
-      await prefs.setBool(_spoilerAiDebugPrintResponseKey, debugPrintResponse);
+      await prefs.setBool(SettingsKeys.spoilerAiDebugPrintResponse, debugPrintResponse);
       changed = true;
     }
 
@@ -522,7 +741,7 @@ extension VideoPlayerStateSubtitles on VideoPlayerState {
   Future<void> _saveDanmakuBlockWords() async {
     final prefs = await SharedPreferences.getInstance();
     final blockWordsJson = json.encode(_danmakuBlockWords);
-    await prefs.setString(_danmakuBlockWordsKey, blockWordsJson);
+    await prefs.setString(SettingsKeys.danmakuBlockWords, blockWordsJson);
   }
 
   // 检查是否是正则表达式规则格式: 规则名称/表达式/

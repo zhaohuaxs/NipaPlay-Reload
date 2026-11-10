@@ -2,7 +2,37 @@
 struct FramePayload {
     items: Vec<FrameItemPayload>,
     #[serde(default)]
+    motion_mode: MotionMode,
+    #[serde(default)]
+    motion_clock: Option<MotionClockPayload>,
+    #[serde(default)]
     emoji_glyphs: Option<Vec<FrameEmojiGlyphPayload>>,
+    /// Chars to prefetch-rasterize asynchronously (lookahead pre-warming).
+    /// Each char is dispatched via `atlas.request_rasterize` at the current
+    /// font_size; results land in the atlas via `drain_prefetch`. Dart sends
+    /// only the delta (chars not yet prefetched) to keep payload small.
+    #[serde(default)]
+    prefetch_chars: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MotionMode {
+    #[default]
+    LegacyInterpolation,
+    VsyncSnapshot,
+    ContinuousAnchor,
+}
+
+#[derive(Deserialize)]
+struct MotionClockPayload {
+    epoch: u64,
+    media_s: f64,
+    age_s: f64,
+    rate: f64,
+    playing: bool,
+    refresh_hz: f64,
+    valid_until_s: f64,
 }
 
 #[derive(Deserialize)]
@@ -17,6 +47,23 @@ struct FrameItemPayload {
     font_size_multiplier: f64,
     #[serde(default)]
     tokens: Option<Vec<FrameTokenPayload>>,
+    /// Signed scroll velocity in texture px/s (RL<0, LR>0, static=0).
+    /// Lets the renderer interpolate `x_render = x + scroll_speed * dt`
+    /// between Dart submissions. Default 0 = no interpolation (legacy
+    /// behavior; also the path taken by Next2 which doesn't send it).
+    #[serde(default)]
+    scroll_speed: f64,
+    #[serde(default)]
+    start_media_s: Option<f64>,
+    #[serde(default)]
+    end_media_s: Option<f64>,
+    /// Marks a locally-sent danmaku. Rendered with a rectangular highlight.
+    #[serde(default)]
+    is_me: bool,
+    /// Layout/collision width in texture pixels. A non-positive value falls
+    /// back to the advances accumulated while building vertices.
+    #[serde(default)]
+    width: f64,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +100,12 @@ struct FrameItem {
     outline_width: f32,
     shadow_style: u8,
     opacity: f32,
+    /// Signed scroll velocity (texture px/s). 0 = static, no interpolation.
+    scroll_speed: f32,
+    start_media_s: Option<f64>,
+    end_media_s: Option<f64>,
+    is_me: bool,
+    width: f32,
 }
 
 #[derive(Clone)]
@@ -129,3 +182,20 @@ fn decode_emoji_rasters(payloads: &[FrameEmojiGlyphPayload]) -> Vec<EmojiRasterD
     out
 }
 
+#[cfg(test)]
+mod frame_payload_tests {
+    use super::*;
+
+    #[test]
+    fn old_payloads_keep_legacy_interpolation() {
+        let payload: FramePayload = serde_json::from_str(r#"{"items":[]}"#).unwrap();
+        assert!(payload.motion_mode == MotionMode::LegacyInterpolation);
+    }
+
+    #[test]
+    fn dfm_payload_selects_vsync_snapshot_motion() {
+        let payload: FramePayload =
+            serde_json::from_str(r#"{"items":[],"motion_mode":"vsync_snapshot"}"#).unwrap();
+        assert!(payload.motion_mode == MotionMode::VsyncSnapshot);
+    }
+}

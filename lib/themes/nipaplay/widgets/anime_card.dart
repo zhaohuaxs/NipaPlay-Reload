@@ -2,9 +2,12 @@ import 'dart:io'; // Required for File
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:kmbal_ionicons/kmbal_ionicons.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/cached_network_image_widget.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/hover_tooltip_bubble.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_focusable_action.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_mode_scope.dart';
 import 'package:nipaplay/providers/appearance_settings_provider.dart';
 import 'package:provider/provider.dart';
 import 'package:nipaplay/services/web_remote_access_service.dart';
@@ -23,6 +26,16 @@ class AnimeCard extends StatefulWidget {
   final bool enableShadow; // 新增：是否启用阴影
   final double backgroundBlurSigma; // 新增：背景模糊强度（sigma）
   final bool enableBackdropImage; // 新增：是否启用背景图层
+  final bool showNewBadge; // 新番剧 / 有新集数时显示红色 NEW 标识
+
+  /// 网络封面图的解码宽度（物理像素）。
+  ///
+  /// 传 null 时由 [CachedNetworkImageWidget] 按布局尺寸自动推导。显式指定可以让
+  /// 列表在低端设备上避免按原始分辨率解码整张海报（一次可达数 MB 的位图）。
+  final int? imageDecodeWidth;
+
+  /// 网络封面图的解码高度（物理像素），语义同 [imageDecodeWidth]。
+  final int? imageDecodeHeight;
 
   const AnimeCard({
     super.key,
@@ -39,6 +52,9 @@ class AnimeCard extends StatefulWidget {
     this.enableShadow = true,
     this.backgroundBlurSigma = 20.0,
     this.enableBackdropImage = true,
+    this.showNewBadge = false,
+    this.imageDecodeWidth,
+    this.imageDecodeHeight,
   });
 
   // 根据filePath获取来源信息
@@ -75,8 +91,9 @@ class _AnimeCardState extends State<AnimeCard> {
 
   void _updateDisplayImageUrl() {
     if (kIsWeb && widget.imageUrl.startsWith('http')) {
-      _displayImageUrl = WebRemoteAccessService.imageProxyUrl(widget.imageUrl) ??
-          widget.imageUrl;
+      _displayImageUrl =
+          WebRemoteAccessService.imageProxyUrl(widget.imageUrl) ??
+              widget.imageUrl;
     } else {
       _displayImageUrl = widget.imageUrl;
     }
@@ -85,14 +102,15 @@ class _AnimeCardState extends State<AnimeCard> {
   // 格式化评分信息用于显示
   String _formatRatingInfo() {
     List<String> ratingInfo = [];
-    
+
     // 添加来源信息
     if (widget.source != null) {
       ratingInfo.add('来源：${widget.source}');
     }
-    
+
     // 添加Bangumi评分（优先显示）
-    if (widget.ratingDetails != null && widget.ratingDetails!.containsKey('Bangumi评分')) {
+    if (widget.ratingDetails != null &&
+        widget.ratingDetails!.containsKey('Bangumi评分')) {
       final bangumiRating = widget.ratingDetails!['Bangumi评分'];
       if (bangumiRating is num && bangumiRating > 0) {
         ratingInfo.add('Bangumi评分：${bangumiRating.toStringAsFixed(1)}');
@@ -102,22 +120,25 @@ class _AnimeCardState extends State<AnimeCard> {
     else if (widget.rating != null && widget.rating! > 0) {
       ratingInfo.add('评分：${widget.rating!.toStringAsFixed(1)}');
     }
-    
+
     // 添加其他平台评分（排除Bangumi评分）
     if (widget.ratingDetails != null) {
       final otherRatings = widget.ratingDetails!.entries
-          .where((entry) => entry.key != 'Bangumi评分' && entry.value is num && (entry.value as num) > 0)
+          .where((entry) =>
+              entry.key != 'Bangumi评分' &&
+              entry.value is num &&
+              (entry.value as num) > 0)
           .take(2) // 最多显示2个其他平台评分
           .map((entry) {
-            String siteName = entry.key;
-            if (siteName.endsWith('评分')) {
-              siteName = siteName.substring(0, siteName.length - 2);
-            }
-            return '$siteName：${(entry.value as num).toStringAsFixed(1)}';
-          });
+        String siteName = entry.key;
+        if (siteName.endsWith('评分')) {
+          siteName = siteName.substring(0, siteName.length - 2);
+        }
+        return '$siteName：${(entry.value as num).toStringAsFixed(1)}';
+      });
       ratingInfo.addAll(otherRatings);
     }
-    
+
     return ratingInfo.isNotEmpty ? ratingInfo.join('\n') : '';
   }
 
@@ -134,7 +155,7 @@ class _AnimeCardState extends State<AnimeCard> {
       ),
     );
   }
-  
+
   // 创建图片组件（网络图片或本地文件）
   Widget _buildImage(BuildContext context, bool isBackground) {
     if (widget.imageUrl.isEmpty) {
@@ -151,7 +172,15 @@ class _AnimeCardState extends State<AnimeCard> {
         // 网格场景禁用淡入动画，减少saveLayer
         fadeDuration: Duration.zero,
         delayLoad: widget.delayLoad, // 使用延迟加载参数
-        loadMode: CachedImageLoadMode.legacy, // 番剧卡片统一使用legacy模式，避免海报突然切换
+        // 默认走 hybrid（基础图 + 高清图），它同样遵守下面的解码尺寸；
+        // 只有调用方显式要求时才回退到 legacy。
+        loadMode: widget.useLegacyImageLoadMode
+            ? CachedImageLoadMode.legacy
+            : CachedImageLoadMode.hybrid,
+        // 关键：把解码尺寸限制在格子实际需要的范围内。缺省时由
+        // CachedNetworkImageWidget 按布局尺寸推导，不会退回整图解码。
+        memCacheWidth: widget.imageDecodeWidth,
+        memCacheHeight: widget.imageDecodeHeight,
         errorBuilder: (context, error) {
           return _buildPlaceholder(context);
         },
@@ -164,7 +193,9 @@ class _AnimeCardState extends State<AnimeCard> {
         fit: BoxFit.cover,
         width: double.infinity,
         height: double.infinity,
-        cacheWidth: isBackground ? 150 : 300, // 背景图可以更小以节省内存
+        cacheWidth: isBackground
+            ? 150
+            : (widget.imageDecodeWidth ?? 300), // 背景图可以更小以节省内存
         errorBuilder: (context, error, stackTrace) {
           return _buildPlaceholder(context);
         },
@@ -172,10 +203,34 @@ class _AnimeCardState extends State<AnimeCard> {
     }
   }
 
+  Widget _buildInteractiveCard(Widget child) {
+    if (!NipaplayLargeScreenModeScope.isActiveOf(context)) {
+      return GestureDetector(
+        onTap: widget.onTap,
+        behavior: HitTestBehavior.opaque,
+        child: child,
+      );
+    }
+
+    return NipaplayLargeScreenFocusableAction(
+      onActivate: widget.onTap,
+      borderRadius: BorderRadius.circular(12),
+      focusScale: 1,
+      style: const NipaplayLargeScreenFocusableStyle(
+        idleBackgroundDark: Colors.transparent,
+        idleBackgroundLight: Colors.transparent,
+        focusStrokeWidth: 2,
+      ),
+      child: child,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     final settings = context.watch<AppearanceSettingsProvider>();
     final bool enableBlur = settings.enableWidgetBlurEffect;
+    final titleColor = theme.colorScheme.onSurface.withValues(alpha: 0.9);
 
     final Widget imageCard = Container(
       decoration: BoxDecoration(
@@ -232,7 +287,9 @@ class _AnimeCardState extends State<AnimeCard> {
           _buildImage(context, false),
 
           // 状态图标 (移至右上角)
-          if (widget.isOnAir)
+          if (widget.showNewBadge)
+            const MediaLibraryNewBadge()
+          else if (widget.isOnAir)
             Positioned(
               top: 6,
               right: 6,
@@ -257,10 +314,8 @@ class _AnimeCardState extends State<AnimeCard> {
       ),
     );
 
-    final Widget card = GestureDetector(
-      onTap: widget.onTap,
-      behavior: HitTestBehavior.opaque,
-      child: Column(
+    final Widget card = _buildInteractiveCard(
+      Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -268,20 +323,20 @@ class _AnimeCardState extends State<AnimeCard> {
           Expanded(
             child: imageCard,
           ),
-          
+
           const SizedBox(height: 8),
-          
+
           // 标题部分
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 2.0),
             child: Text(
               widget.name,
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    fontSize: 13,
-                    height: 1.3,
-                    color: Colors.white.withValues(alpha: 0.9),
-                    fontWeight: FontWeight.w500,
-                  ),
+              style: theme.textTheme.bodyMedium?.copyWith(
+                fontSize: 13,
+                height: 1.3,
+                color: titleColor,
+                fontWeight: FontWeight.w500,
+              ),
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
               textAlign: TextAlign.left,
@@ -304,4 +359,4 @@ class _AnimeCardState extends State<AnimeCard> {
       return card;
     }
   }
-} 
+}

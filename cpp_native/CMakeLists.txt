@@ -15,11 +15,16 @@ set(NATIVE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/danmaku_layout.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/similarity_engine.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pinyin_dict.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/danmaku_parser.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/subtitle_parser.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pugixml/pugixml.cpp
 )
 
 set(NATIVE_INCLUDES
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pugixml
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rapidjson/include
 )
 
 # ──── 库类型 ────
@@ -44,6 +49,14 @@ target_include_directories(nipaplay_native PUBLIC ${NATIVE_INCLUDES})
 # ──── 公共编译宏（target 作用域）────
 target_compile_definitions(nipaplay_native PRIVATE NIPAPLAY_NATIVE_BUILDING)
 
+# ──── 抑制第三方库（rapidjson）的 MSVC 弃用警告 ────
+if(MSVC)
+    target_compile_definitions(nipaplay_native PRIVATE
+        _SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING
+        _SILENCE_ALL_CXX20_DEPRECATION_WARNINGS
+    )
+endif()
+
 # ──── MSVC CRT 链接：必须使用动态 CRT (/MD) 以匹配 Flutter 宿主 ────
 # Flutter Windows 使用 /MD（动态链接 vcruntime），如果 cpp_native 使用 /MT（静态），
 # 会导致跨 FFI 边界的 CRT 不匹配：两套独立的堆、FILE*、errno 等，
@@ -63,6 +76,9 @@ if(MSVC)
         /W4
         /Zc:__cplusplus
         /GR-
+        # /Ob3：覆盖 CMake 默认 /O2 内含的 /Ob2，更激进内联（弹幕布局热点）
+        # /fp:fast：放松 IEEE 精度换取速度（/O2 默认 /fp:precise，此处覆盖）
+        # 注：/O2 已内含 /Oi 内建函数 / /Gy 函数级链接 / /GF 字符串池化，不重复列举
         $<$<CONFIG:Release>:/Ob3>
         $<$<CONFIG:Release>:/fp:fast>
     )
@@ -75,8 +91,17 @@ if(MSVC)
             $<$<CONFIG:Release>:/arch:AVX2>
         )
     endif()
+    # MSVC 链接器死代码消除（Release only）：
+    # /OPT:REF 消除未引用段（配合 /O2 内含的 /Gy 函数级链接）
+    # /OPT:ICF COMDAT 折叠（消除重复函数/数据，配合 /Gy）
+    # MSVC Release 链接器默认含此两项，显式声明确保不被覆盖（与 windows/runner 对齐）
+    # 兼容性：visibility=hidden + export.h visibility=default 导出符号不受影响（动态符号表算被引用）
+    target_link_options(nipaplay_native PRIVATE
+        $<$<CONFIG:Release>:/OPT:REF>
+        $<$<CONFIG:Release>:/OPT:ICF>
+    )
 else()
-    # Common flags for Apple & Linux
+    # Common flags for Apple & Linux & Android (GCC/Clang)
     target_compile_options(nipaplay_native PRIVATE
         -fno-rtti
         -fexceptions
@@ -84,9 +109,30 @@ else()
         -Wextra
         -Wpedantic
         $<$<CONFIG:Debug>:-Og>
+        # -O3：最高优化（已内含自动向量化/部分循环优化/inline-functions 等，不重复加 -funroll-loops
+        #   避免强制循环展开的代码膨胀 + 指令缓存压力对分支密集型弹幕布局的负优化风险）
+        # -ffast-math：放松 IEEE 精度换取速度（-O3 不含，独立）
+        # -ffunction-sections -fdata-sections：每个函数/变量独立段，配合链接器
+        #   --gc-sections(Linux/Android) / -dead_strip(macOS) 消除未引用代码/数据
+        # 兼容性：visibility=hidden + export.h visibility=default 的导出符号不受影响
+        #   （动态符号表算被引用，gc-sections/dead_strip 只删 hidden 且未引用的）
         $<$<CONFIG:Release>:-O3>
         $<$<CONFIG:Release>:-ffast-math>
+        $<$<CONFIG:Release>:-ffunction-sections>
+        $<$<CONFIG:Release>:-fdata-sections>
     )
+    # 链接器死代码消除（Release only）
+    # Linux/Android: -Wl,--gc-sections；macOS: -Wl,-dead_strip
+    # iOS staticlib 不在此处理（静态库不链接，由 app 链接时 Xcode DEAD_CODE_STRIPPING 处理）
+    if(APPLE)
+        target_link_options(nipaplay_native PRIVATE
+            $<$<CONFIG:Release>:-Wl,-dead_strip>
+        )
+    elseif(UNIX OR ANDROID)
+        target_link_options(nipaplay_native PRIVATE
+            $<$<CONFIG:Release>:-Wl,--gc-sections>
+        )
+    endif()
 endif()
 
 # ──── 架构优化选项（Release only）────
@@ -142,14 +188,13 @@ if(NOT MSVC AND NOT ANDROID)
             $<$<CONFIG:Release>:-mtune=generic>
         )
         set(_NP_CPP_ISA_INFO "x86-64-v3 (AVX2+FMA+BMI2+POPCNT)")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+           CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         # Linux aarch64 (Docker arm64 构建、Asahi Linux 等)
-        if(NOT APPLE AND NOT ANDROID)
-            target_compile_options(nipaplay_native PRIVATE
-                $<$<CONFIG:Release>:-march=armv8.2-a>
-            )
-            set(_NP_CPP_ISA_INFO "armv8.2-a (+LSE+FP16)")
-        endif()
+        target_compile_options(nipaplay_native PRIVATE
+            $<$<CONFIG:Release>:-march=armv8.2-a>
+        )
+        set(_NP_CPP_ISA_INFO "armv8.2-a (+LSE+FP16)")
     endif()
 
     # ──── 编译诊断输出（需 flutter build -v 才可见）────
@@ -161,7 +206,8 @@ if(NOT MSVC AND NOT ANDROID)
     # Rust 侧的 target-cpu 由 .cargo/config.toml 控制，此处显示期望值
     if(_NP_TARGET_X86_64)
         message(STATUS "  Rust (cargo):    x86-64-v3 (via .cargo/config.toml)")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64" AND NOT APPLE AND NOT ANDROID)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+           CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         message(STATUS "  Rust (cargo):    neoverse-n1 (via .cargo/config.toml)")
     elseif(APPLE)
         message(STATUS "  Rust (cargo):    Apple default (-arch arm64 / x86-64-v3 for Intel)")
@@ -195,15 +241,19 @@ if(MSVC)
 endif()
 
 # ──── 安全启用 LTO/IPO ────
-# CMake 自动匹配编译器 flag: MSVC → /GL+/LTCG, GCC/Clang → -flto
-include(CheckIPOSupported)
-check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error LANGUAGES CXX)
-if(ipo_supported)
-    set_target_properties(nipaplay_native PROPERTIES
-        INTERPROCEDURAL_OPTIMIZATION_RELEASE ON
-    )
-else()
-    message(WARNING "IPO/LTO not supported: ${ipo_error}")
+# CMake 自动匹配编译器 flag: MSVC → /GL+/LTCG, GCC/Clang → -flto。
+# HarmonyOS 的 HMS toolchain wrapper 无法把 SDK 根路径传入 try_compile
+# 子工程，因此跳过 CheckIPOSupported；这不影响常规编译与链接。
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "OHOS")
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error LANGUAGES CXX)
+    if(ipo_supported)
+        set_target_properties(nipaplay_native PROPERTIES
+            INTERPROCEDURAL_OPTIMIZATION_RELEASE ON
+        )
+    else()
+        message(WARNING "IPO/LTO not supported: ${ipo_error}")
+    endif()
 endif()
 
 # Android: 使用 c++_shared STL（与 Flutter 引擎一致）
@@ -211,5 +261,27 @@ if(ANDROID)
     find_library(CXX_SHARED c++_shared)
     if(CXX_SHARED)
         target_link_libraries(nipaplay_native PUBLIC ${CXX_SHARED})
+    endif()
+endif()
+
+# ──── POSIX iconv（字幕编码转换）────
+# Windows 使用 MultiByteToWideChar/WideCharToMultiByte，无需 iconv
+# Linux/macOS 使用系统 iconv；macOS libiconv 需显式链接
+if(NOT MSVC AND NOT ANDROID)
+    # macOS: /usr/lib/libiconv.tbd (系统自带)
+    # Linux glibc: iconv 内置于 libc，无需额外链接
+    # Linux musl: 可能需要 -liconv
+    if(APPLE)
+        find_library(ICONV_LIB iconv)
+        if(ICONV_LIB)
+            target_link_libraries(nipaplay_native PRIVATE ${ICONV_LIB})
+        endif()
+    elseif(UNIX)
+        # Linux: 检测是否需要 libiconv
+        include(CheckLibraryExists)
+        check_library_exists(iconv iconv_open "" HAS_LIBICONV)
+        if(HAS_LIBICONV)
+            target_link_libraries(nipaplay_native PRIVATE iconv)
+        endif()
     endif()
 endif()

@@ -51,26 +51,29 @@ class NipaplayMainTabBar extends StatelessWidget
     );
   }
 
-  TabBar _buildTabBar(BuildContext context) {
+  Widget _buildTabBar(BuildContext context) {
     final isDarkMode = Theme.of(context).brightness == Brightness.dark;
-    return TabBar(
-      controller: controller,
-      isScrollable: true,
-      tabs: tabs,
-      labelColor: AppAccentColors.current,
-      unselectedLabelColor: isDarkMode ? Colors.white60 : Colors.black54,
-      labelPadding: labelPadding,
-      tabAlignment: TabAlignment.start,
-      splashFactory: NoSplash.splashFactory,
-      overlayColor: WidgetStateProperty.all(Colors.transparent),
-      dividerColor: showDivider ? dividerColor : Colors.transparent,
-      dividerHeight: 3.0,
-      indicator: NipaplayMainTabIndicator(
-        indicatorHeight: 3.0,
-        indicatorColor: AppAccentColors.current,
-        radius: 30.0,
+    return Material(
+      type: MaterialType.transparency,
+      child: TabBar(
+        controller: controller,
+        isScrollable: true,
+        tabs: tabs,
+        labelColor: AppAccentColors.current,
+        unselectedLabelColor: isDarkMode ? Colors.white60 : Colors.black54,
+        labelPadding: labelPadding,
+        tabAlignment: TabAlignment.start,
+        splashFactory: NoSplash.splashFactory,
+        overlayColor: WidgetStateProperty.all(Colors.transparent),
+        dividerColor: showDivider ? dividerColor : Colors.transparent,
+        dividerHeight: 3.0,
+        indicator: NipaplayMainTabIndicator(
+          indicatorHeight: 3.0,
+          indicatorColor: AppAccentColors.current,
+          radius: 30.0,
+        ),
+        indicatorSize: TabBarIndicatorSize.label,
       ),
-      indicatorSize: TabBarIndicatorSize.label,
     );
   }
 }
@@ -114,6 +117,43 @@ class _NipaplayMainTabPainter extends BoxPainter {
     canvas.drawRRect(
       RRect.fromRectAndRadius(rect, Radius.circular(decoration.radius)),
       paint,
+    );
+  }
+}
+
+/// 给自定义 Tab 使用的标签等宽指示线，与主 [TabBar] 的
+/// [TabBarIndicatorSize.label] 保持一致。
+class NipaplayLabelTabIndicator extends StatelessWidget {
+  const NipaplayLabelTabIndicator({
+    super.key,
+    required this.label,
+    required this.labelStyle,
+    required this.selected,
+    this.duration = const Duration(milliseconds: 160),
+  });
+
+  final String label;
+  final TextStyle labelStyle;
+  final bool selected;
+  final Duration duration;
+
+  @override
+  Widget build(BuildContext context) {
+    final painter = TextPainter(
+      text: TextSpan(text: label, style: labelStyle),
+      maxLines: 1,
+      textDirection: Directionality.of(context),
+      textScaler: MediaQuery.textScalerOf(context),
+    )..layout();
+
+    return AnimatedContainer(
+      duration: duration,
+      width: selected ? painter.width : 0,
+      height: 3,
+      decoration: BoxDecoration(
+        color: AppAccentColors.current,
+        borderRadius: BorderRadius.circular(30),
+      ),
     );
   }
 }

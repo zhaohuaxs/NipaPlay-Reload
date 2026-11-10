@@ -1,8 +1,12 @@
 // ignore: file_names
 import 'package:flutter/material.dart';
-import 'package:nipaplay/utils/app_accent_color.dart';
+import 'keyboard_activatable.dart';
 
 class WindowControlButtons extends StatelessWidget {
+  static const double buttonWidth = 46;
+  static const double buttonHeight = 40;
+  static const double totalWidth = buttonWidth * 3;
+
   final bool isMaximized;
   final VoidCallback onMinimize;
   final VoidCallback onMaximizeRestore;
@@ -18,33 +22,39 @@ class WindowControlButtons extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        _WindowControlIconButton(
-          icon: Icons.remove_rounded,
-          size: 22,
-          tooltip: '最小化',
-          onPressed: onMinimize,
+    return SizedBox(
+      width: totalWidth,
+      height: buttonHeight,
+      // 窗口按钮是指针操作入口，不能抢占播放器方向键/空格的焦点。
+      child: ExcludeFocus(
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _WindowControlIconButton(
+              icon: Icons.remove_rounded,
+              size: 22,
+              tooltip: '最小化',
+              onPressed: onMinimize,
+            ),
+            _WindowControlIconButton(
+              icon: isMaximized
+                  ? Icons.filter_none_rounded
+                  : Icons.crop_square_rounded,
+              size: isMaximized ? 18 : 22,
+              isFlipped: isMaximized,
+              tooltip: isMaximized ? '还原' : '最大化',
+              onPressed: onMaximizeRestore,
+            ),
+            _WindowControlIconButton(
+              icon: Icons.close_rounded,
+              size: 22,
+              tooltip: '关闭',
+              isCloseButton: true,
+              onPressed: onClose,
+            ),
+          ],
         ),
-        SizedBox(width: 8),
-        _WindowControlIconButton(
-          icon: isMaximized
-              ? Icons.filter_none_rounded
-              : Icons.crop_square_rounded,
-          size: isMaximized ? 18 : 22,
-          isFlipped: isMaximized,
-          tooltip: isMaximized ? '还原' : '最大化',
-          onPressed: onMaximizeRestore,
-        ),
-        SizedBox(width: 8),
-        _WindowControlIconButton(
-          icon: Icons.close_rounded,
-          size: 22,
-          tooltip: '关闭',
-          onPressed: onClose,
-        ),
-      ],
+      ),
     );
   }
 }
@@ -53,6 +63,7 @@ class _WindowControlIconButton extends StatefulWidget {
   final IconData icon;
   final double size;
   final bool isFlipped;
+  final bool isCloseButton;
   final String tooltip;
   final VoidCallback onPressed;
 
@@ -60,6 +71,7 @@ class _WindowControlIconButton extends StatefulWidget {
     required this.icon,
     this.size = 22,
     this.isFlipped = false,
+    this.isCloseButton = false,
     required this.tooltip,
     required this.onPressed,
   });
@@ -72,6 +84,7 @@ class _WindowControlIconButton extends StatefulWidget {
 class _WindowControlIconButtonState extends State<_WindowControlIconButton> {
   bool _isHovered = false;
   bool _isPressed = false;
+  bool _isFocused = false;
 
   void _setHovered(bool value) {
     if (_isHovered == value) {
@@ -82,12 +95,34 @@ class _WindowControlIconButtonState extends State<_WindowControlIconButton> {
     });
   }
 
+  void _setFocused(bool value) {
+    if (_isFocused == value) {
+      return;
+    }
+    setState(() {
+      _isFocused = value;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final isDarkMode = Theme.of(context).brightness == Brightness.dark;
-    final double scale = _isPressed ? 0.92 : (_isHovered ? 1.1 : 1.0);
-    final Color iconColor = _isHovered
-        ? AppAccentColors.current
+    final Color hoverBackground = isDarkMode
+        ? Colors.white.withOpacity(0.12)
+        : Colors.black.withOpacity(0.08);
+    final Color pressedBackground = isDarkMode
+        ? Colors.white.withOpacity(0.18)
+        : Colors.black.withOpacity(0.14);
+    final bool showActiveState = _isHovered || _isFocused || _isPressed;
+    final Color backgroundColor = widget.isCloseButton && showActiveState
+        ? (_isPressed ? const Color(0xFFC50F1F) : const Color(0xFFE81123))
+        : (_isPressed
+            ? pressedBackground
+            : ((_isHovered || _isFocused)
+                ? hoverBackground
+                : Colors.transparent));
+    final Color iconColor = widget.isCloseButton && showActiveState
+        ? Colors.white
         : (isDarkMode ? Colors.white : Colors.black87);
 
     Widget iconWidget = Icon(
@@ -109,15 +144,24 @@ class _WindowControlIconButtonState extends State<_WindowControlIconButton> {
       child: MouseRegion(
         onEnter: (_) => _setHovered(true),
         onExit: (_) => _setHovered(false),
-        child: GestureDetector(
-          onTapDown: (_) => setState(() => _isPressed = true),
-          onTapUp: (_) => setState(() => _isPressed = false),
-          onTapCancel: () => setState(() => _isPressed = false),
-          onTap: widget.onPressed,
-          child: AnimatedScale(
-            scale: scale,
-            duration: const Duration(milliseconds: 120),
-            child: iconWidget,
+        child: KeyboardActivatable(
+          onActivate: widget.onPressed,
+          onFocusChange: _setFocused,
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapDown: (_) => setState(() => _isPressed = true),
+            onTapUp: (_) => setState(() => _isPressed = false),
+            onTapCancel: () => setState(() => _isPressed = false),
+            onTap: widget.onPressed,
+            child: AnimatedContainer(
+              width: WindowControlButtons.buttonWidth,
+              height: WindowControlButtons.buttonHeight,
+              duration: const Duration(milliseconds: 90),
+              curve: Curves.easeOutCubic,
+              color: backgroundColor,
+              alignment: Alignment.center,
+              child: iconWidget,
+            ),
           ),
         ),
       ),

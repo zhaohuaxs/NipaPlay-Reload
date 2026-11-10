@@ -8,6 +8,11 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
       debugPrint('[VideoPlayerState] 提前加载双倍分辨率设置失败: $e');
     }
     try {
+      await _loadErikaUpscalerMode();
+    } catch (e) {
+      debugPrint('[VideoPlayerState] 提前加载 Erika 超分设置失败: $e');
+    }
+    try {
       await _loadAnime4KProfile();
     } catch (e) {
       debugPrint('[VideoPlayerState] 提前加载 Anime4K 设置失败: $e');
@@ -20,6 +25,7 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
   }
 
   Future<void> _initialize() async {
+    await _loadDanmakuVisible(); // 在耗时的平台初始化前恢复弹幕开关
     if (globals.isMobilePlatform) {
       // 使用新的屏幕方向管理器设置初始方向
       await ScreenOrientationManager.instance.setInitialOrientation();
@@ -40,7 +46,6 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
     await applyPrecacheBufferSettings(); // 应用预缓存设置
     await _loadTimelinePreviewSetting(); // 加载时间轴缩略图开关
     await _loadDanmakuOpacity(); // 加载保存的弹幕不透明度
-    await _loadDanmakuVisible(); // 加载弹幕可见性
     await _loadMergeDanmaku(); // 加载弹幕合并设置
     await _loadDanmakuStacking(); // 加载弹幕堆叠设置
     await _loadDanmakuRandomColorEnabled(); // 加载弹幕随机染色设置
@@ -61,6 +66,7 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
     // 加载弹幕字体大小和显示区域
     await _loadDanmakuFontSize();
     await _loadDanmakuDisplayEffectSettings();
+    await _loadTitanDanmakuSettings();
     await _loadSubtitleSettings();
     await _loadDanmakuDisplayArea();
     await _loadDanmakuSpeedMultiplier();
@@ -69,6 +75,7 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
 
     // 加载播放速度设置
     await _loadPlaybackRate();
+    _initialDanmakuSettingsReady.complete();
 
     // 加载快进快退时间设置
     await _loadSeekStepSeconds();
@@ -82,6 +89,10 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
     await _loadPauseOnBackgroundSetting();
     await _loadDesktopHoverSettingsMenuEnabled();
     await _loadInstantHidePlayerUiEnabled();
+    await _loadPlayerTopButtonVisibilitySettings();
+    await _loadPlayerMenuQuickControlsVisibility();
+    await _loadChapterMarkersEnabled(); // 加载 MKV 章节标记开关
+    await loadIntroSkipEnabled(); // 加载跳过片头开关
     await _loadScreenshotSaveTarget();
     await _loadScreenshotSaveDirectory();
 
@@ -90,7 +101,7 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
 
     // Ensure wakelock is disabled on initialization
     try {
-      WakelockPlus.disable();
+      _setWakelockSafely(false);
       //debugPrint("Wakelock disabled on VideoPlayerState initialization.");
     } catch (e) {
       //debugPrint("Error disabling wakelock on init: $e");
@@ -102,7 +113,7 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
     // 订阅播放器内核切换事件
     _playerKernelChangeSubscription = PlayerFactory.onKernelChanged.listen((_) {
       debugPrint('[VideoPlayerState] 收到播放器内核切换事件，执行热切换');
-      PlayerKernelManager.performPlayerKernelHotSwap(this);
+      _requestPlayerKernelHotSwap();
     });
 
     // 订阅弹幕内核切换事件
@@ -111,6 +122,48 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
       debugPrint('[VideoPlayerState] 收到弹幕内核切换事件: $newKernel');
       PlayerKernelManager.performDanmakuKernelHotSwap(this, newKernel);
     });
+  }
+
+  void _requestPlayerKernelHotSwap() {
+    if (_isDisposed) {
+      return;
+    }
+    _playerKernelSwapRequested++;
+    _startPlayerKernelHotSwapDrain();
+  }
+
+  void _startPlayerKernelHotSwapDrain() {
+    if (_isDisposed || _playerKernelSwapDrain != null) {
+      return;
+    }
+    final drain = _drainPlayerKernelHotSwaps();
+    _playerKernelSwapDrain = drain;
+    unawaited(drain);
+  }
+
+  Future<void> _drainPlayerKernelHotSwaps() async {
+    try {
+      while (!_isDisposed &&
+          _playerKernelSwapApplied < _playerKernelSwapRequested) {
+        final targetGeneration = _playerKernelSwapRequested;
+        try {
+          await PlayerKernelManager.performPlayerKernelHotSwap(this);
+        } catch (error, stackTrace) {
+          debugPrint(
+            '[VideoPlayerState] Player hot swap failed '
+            'generation=$targetGeneration: $error\n$stackTrace',
+          );
+        } finally {
+          _playerKernelSwapApplied = targetGeneration;
+        }
+      }
+    } finally {
+      _playerKernelSwapDrain = null;
+      if (!_isDisposed &&
+          _playerKernelSwapApplied < _playerKernelSwapRequested) {
+        _startPlayerKernelHotSwapDrain();
+      }
+    }
   }
 
   Future<void> _loadInitialBrightness() async {
@@ -133,29 +186,26 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
     try {
       final prefs = await SharedPreferences.getInstance();
       final savedVolume = prefs.getDouble(_playerVolumeKey);
+      _volumeBoost =
+          (prefs.getDouble('player_volume_boost') ?? 1.0).clamp(1.0, 2.0);
 
       if (_useSystemVolume) {
         _ensurePlayerVolumeMatchesPlatformPolicy();
         _systemVolumeController ??= VolumeController.instance;
         _systemVolumeController!.showSystemUI = false;
         final currentSystemVolume = await _systemVolumeController!.getVolume();
-        final initialVolume =
-            (savedVolume ?? currentSystemVolume).clamp(0.0, 1.0);
+        // 系统音量由用户和系统管理，启动时只读取，不能恢复应用内的旧值。
+        final initialVolume = currentSystemVolume.clamp(0.0, 1.0);
         _currentVolume = initialVolume;
         _initialDragVolume = initialVolume;
-        if (savedVolume != null) {
-          await _setSystemVolume(initialVolume);
-        }
       } else {
         // Web 等不支持系统音量时：使用播放器内部音量
         final initialVolume = (savedVolume ?? player.volume).clamp(0.0, 1.0);
         _currentVolume = initialVolume;
         _initialDragVolume = initialVolume;
-        player.volume = initialVolume;
+        applyPlayerVolume();
       }
-      //debugPrint("Initial volume loaded: $_currentVolume (saved: ${savedVolume != null})");
     } catch (e) {
-      //debugPrint("Failed to get initial system volume from player: $e");
       _currentVolume = 0.5; // Fallback
       _initialDragVolume = _currentVolume;
     }
@@ -164,6 +214,7 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
 
   void startBrightnessDrag() {
     if (!globals.isMobilePlatform) return;
+    if (_subtitleDragActive) return; // 字幕拖动中不响应亮度手势
     // Refresh _initialDragBrightness with the most up-to-date _currentBrightness
     // This handles cases where brightness might have been changed by other means
     // or if a previous drag was interrupted.
@@ -210,20 +261,12 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
   void _showBrightnessIndicator() {
     if (!globals.isMobilePlatform || _context == null) return;
 
-    final uiThemeProvider =
-        Provider.of<UIThemeProvider>(_context!, listen: false);
-    final bool useCupertinoStyle =
-        uiThemeProvider.isCupertinoTheme && globals.isPhone;
-
     _isBrightnessIndicatorVisible = true;
 
     if (_brightnessOverlayEntry == null) {
       _brightnessOverlayEntry = OverlayEntry(
         builder: (context) {
-          final indicatorWidget = useCupertinoStyle
-              ? const CupertinoBrightnessIndicator()
-              : const BrightnessIndicator();
-          Widget overlayChild = ChangeNotifierProvider<VideoPlayerState>.value(
+          return ChangeNotifierProvider<VideoPlayerState>.value(
             value: this,
             child: Consumer<VideoPlayerState>(
               builder: (context, videoState, _) {
@@ -239,20 +282,13 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
                         0.0,
                         0.0,
                       ),
-                      child: indicatorWidget,
+                      child: const BrightnessIndicator(),
                     ),
                   ),
                 );
               },
             ),
           );
-          if (useCupertinoStyle) {
-            overlayChild = ChangeNotifierProvider<UIThemeProvider>.value(
-              value: uiThemeProvider,
-              child: overlayChild,
-            );
-          }
-          return overlayChild;
         },
       );
       Overlay.of(_context!).insert(_brightnessOverlayEntry!);
@@ -293,20 +329,12 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
   void _showVolumeIndicator() {
     if (_context == null) return;
 
-    final uiThemeProvider =
-        Provider.of<UIThemeProvider>(_context!, listen: false);
-    final bool useCupertinoStyle =
-        uiThemeProvider.isCupertinoTheme && globals.isPhone;
-
     _isVolumeIndicatorVisible = true;
 
     if (_volumeOverlayEntry == null) {
       _volumeOverlayEntry = OverlayEntry(
         builder: (context) {
-          final indicatorWidget = useCupertinoStyle
-              ? const CupertinoVolumeIndicator()
-              : const VolumeIndicator();
-          Widget overlayChild = ChangeNotifierProvider<VideoPlayerState>.value(
+          return ChangeNotifierProvider<VideoPlayerState>.value(
             value: this,
             child: Consumer<VideoPlayerState>(
               builder: (context, videoState, _) {
@@ -322,20 +350,13 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
                         0.0,
                         0.0,
                       ),
-                      child: indicatorWidget,
+                      child: const VolumeIndicator(),
                     ),
                   ),
                 );
               },
             ),
           );
-          if (useCupertinoStyle) {
-            overlayChild = ChangeNotifierProvider<UIThemeProvider>.value(
-              value: uiThemeProvider,
-              child: overlayChild,
-            );
-          }
-          return overlayChild;
         },
       );
       Overlay.of(_context!).insert(_volumeOverlayEntry!);
@@ -383,16 +404,27 @@ extension VideoPlayerStateInitialization on VideoPlayerState {
 
   // 保存视频播放位置
   Future<void> _saveVideoPosition(String path, int position) async {
-    final prefs = await SharedPreferences.getInstance();
-    final positions = prefs.getString(_videoPositionsKey) ?? '{}';
-    final Map<String, dynamic> positionMap =
-        Map<String, dynamic>.from(json.decode(positions));
-    positionMap[path] = position;
-    await prefs.setString(_videoPositionsKey, json.encode(positionMap));
+    try {
+      await PlaybackPositionStore.instance.save(path, position);
+    } catch (error, stackTrace) {
+      debugPrint('保存播放进度失败: $error\n$stackTrace');
+    }
+  }
+
+  /// 立即持久化当前播放位置到 PlaybackPositionStore。
+  /// 供内核热切换前调用，确保新 player 的 initializePlayer
+  /// 内部的 _getVideoPosition 能读到最新位置。
+  Future<void> persistCurrentPositionForHotSwap({
+    required String path,
+    required int positionMs,
+  }) async {
+    if (path.isEmpty) return;
+    await _saveVideoPosition(path, positionMs);
   }
 
   // 获取视频播放位置（支持iOS容器路径修复和进度回退）
   Future<int> _getVideoPosition(String path) async {
+    await PlaybackPositionStore.instance.flush();
     final prefs = await SharedPreferences.getInstance();
     final positions = prefs.getString(_videoPositionsKey) ?? '{}';
     final Map<String, dynamic> positionMap =

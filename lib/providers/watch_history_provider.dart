@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:nipaplay/models/watch_history_model.dart';
 import 'package:nipaplay/models/watch_history_database.dart';
@@ -6,12 +7,18 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:nipaplay/services/file_picker_service.dart';
 import 'package:nipaplay/services/scan_service.dart';
 import 'package:nipaplay/utils/ios_container_path_fixer.dart';
+import 'package:nipaplay/utils/media_source_utils.dart';
 import 'package:nipaplay/services/web_remote_access_service.dart';
+import 'package:nipaplay/services/auto_sync_service.dart';
+import 'package:nipaplay/utils/globals.dart' as globals;
 
 class WatchHistoryProvider extends ChangeNotifier {
   List<WatchHistoryItem> _history = [];
   bool _isLoading = false;
   bool _isLoaded = false;
+  bool _disposed = false;
+  // 加载进行中又收到刷新请求时置位，当前加载结束后补加载一次
+  bool _reloadQueued = false;
   final FilePickerService _filePickerService = FilePickerService();
   final WatchHistoryDatabase _database = WatchHistoryDatabase.instance;
   static const double _completionProgressThreshold = 0.90;
@@ -29,7 +36,7 @@ class WatchHistoryProvider extends ChangeNotifier {
     return _deduplicateContinueWatching(filtered);
   }
 
-  bool get isLoading => _isLoading;
+  bool get isLoading => _isLoading && _history.isEmpty;
   bool get isLoaded => _isLoaded;
 
   // 设置ScanService监听器
@@ -56,18 +63,26 @@ class WatchHistoryProvider extends ChangeNotifier {
 
     if (_scanService!.scanJustCompleted) {
       //debugPrint('WatchHistoryProvider: 检测到扫描完成，自动刷新历史记录');
+      unawaited(_handleScanCompleted());
+    }
+  }
 
-      // 延迟刷新，确保扫描结果已保存到数据库
-      Future.delayed(const Duration(milliseconds: 100), () {
-        refresh();
-        // 确认扫描完成事件已处理
-        _scanService!.acknowledgeScanCompleted();
-      });
+  // 扫描完成后刷新历史记录：必须等刷新真正结束后再确认事件，
+  // 否则刷新与其他加载撞车时事件会被静默丢弃（媒体库要重启才更新）。
+  Future<void> _handleScanCompleted() async {
+    // 延迟刷新，确保扫描结果已保存到数据库
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    try {
+      await refreshAfterScan();
+    } finally {
+      // 确认扫描完成事件已处理
+      _scanService?.acknowledgeScanCompleted();
     }
   }
 
   @override
   void dispose() {
+    _disposed = true;
     // 移除监听器
     if (_scanService != null) {
       _scanService!.removeListener(_onScanServiceStateChanged);
@@ -76,7 +91,12 @@ class WatchHistoryProvider extends ChangeNotifier {
   }
 
   Future<void> loadHistory() async {
-    if (_isLoading) return;
+    if (_isLoading) {
+      // 已有一次加载在进行（例如扫描完成刷新与其他刷新同时发生）：
+      // 排队再补加载一次，避免刷新请求被静默丢弃导致媒体库不更新。
+      _reloadQueued = true;
+      return;
+    }
     _isLoading = true;
     notifyListeners();
 
@@ -127,13 +147,22 @@ class WatchHistoryProvider extends ChangeNotifier {
       // 迁移JSON数据到SQLite (如果需要)
       await _database.migrateFromJson();
 
-      // 调试：打印数据库全部内容
-      await _database.debugPrintAllData();
-
+      // Give the home page a bounded first snapshot before loading the full library.
+      if (!_isLoaded && _history.isEmpty) {
+        final recent = await _database.getRecentWatchHistory(limit: 40);
+        if (_disposed) return;
+        _history = recent;
+        notifyListeners();
+        await Future<void>.delayed(Duration.zero);
+      }
       // 从数据库获取历史记录
       final rawHistory = await _database.getAllWatchHistory();
 
-      // 过滤掉不存在的文件，并修复iOS路径问题
+      if (_disposed) return;
+      // Publish a usable snapshot before background path checks complete.
+      _history = rawHistory;
+      _isLoaded = true;
+      notifyListeners();
       _history = await _validateFilePaths(rawHistory);
       _isLoaded = true;
     } catch (e) {
@@ -143,19 +172,58 @@ class WatchHistoryProvider extends ChangeNotifier {
     }
 
     _isLoading = false;
+    if (_disposed) return;
     notifyListeners();
+
+    // 加载期间又有刷新请求到达：补加载一次，保证媒体库拿到最新数据
+    if (_reloadQueued) {
+      _reloadQueued = false;
+      unawaited(loadHistory());
+    }
   }
 
   // 验证文件路径并修复iOS路径问题
   Future<List<WatchHistoryItem>> _validateFilePaths(
       List<WatchHistoryItem> items) async {
+    if (kIsWeb) return items;
+    final result = <WatchHistoryItem>[];
+    const batchSize = 4;
+    for (var offset = 0; offset < items.length; offset += batchSize) {
+      if (_disposed) return result;
+      final batch =
+          items.sublist(offset, (offset + batchSize).clamp(0, items.length));
+      final validated = await Future.wait(
+          batch.map((item) => _validateFilePathBatch([item])));
+      for (final entries in validated) {
+        result.addAll(entries);
+      }
+      await Future<void>.delayed(Duration.zero);
+    }
+    return result;
+  }
+
+  Future<List<WatchHistoryItem>> _validateFilePathBatch(
+      List<WatchHistoryItem> items) async {
     if (kIsWeb) {
       return items;
     }
     List<WatchHistoryItem> validItems = [];
-    List<String> invalidPaths = [];
+
+    // 每处理若干条就让出一次事件循环。
+    //
+    // 这里对每条历史都做一次文件存在性检查（走异步 I/O，但仍是串行的）。
+    // 历史上千条时，即使单次很快，连续 await 也会长时间占用主 isolate，
+    // 让启动阶段的首帧与交互被推迟。定期让出可保持界面可响应。
+    const int yieldInterval = 50;
+    int processedSinceYield = 0;
 
     for (var item in items) {
+      processedSinceYield++;
+      if (processedSinceYield >= yieldInterval) {
+        processedSinceYield = 0;
+        await Future<void>.delayed(Duration.zero);
+      }
+
       bool fileExists = false;
       String originalPath = item.filePath;
 
@@ -272,15 +340,12 @@ class WatchHistoryProvider extends ChangeNotifier {
       } else {
         // 将无效路径添加到缓存集合
         _knownInvalidPaths.add(originalPath);
-        invalidPaths.add(originalPath);
         debugPrint('跳过无效文件: ${item.filePath}');
       }
     }
 
-    // 从数据库中删除无效的记录
-    for (var path in invalidPaths) {
-      await _database.deleteHistory(path);
-    }
+    // Missing files may be on an offline drive or awaiting authorization.
+    // Validation hides them in this snapshot; only explicit deletion removes DB rows.
 
     return validItems;
   }
@@ -341,6 +406,13 @@ class WatchHistoryProvider extends ChangeNotifier {
     await loadHistory();
   }
 
+  // 扫描完成后的刷新：文件可能被移出后又移回，
+  // 之前被判为“无效”而缓存的路径需要重新检查，否则回归的视频仍会被隐藏。
+  Future<void> refreshAfterScan() async {
+    clearInvalidPathCache();
+    await refresh();
+  }
+
   // 添加或更新历史记录
   Future<void> addOrUpdateHistory(WatchHistoryItem item) async {
     // 添加到数据库
@@ -359,6 +431,7 @@ class WatchHistoryProvider extends ChangeNotifier {
     _history.sort((a, b) => b.lastWatchTime.compareTo(a.lastWatchTime));
 
     notifyListeners();
+    _scheduleIncrementalSyncAfterChange();
   }
 
   // 根据文件路径获取历史记录
@@ -371,6 +444,7 @@ class WatchHistoryProvider extends ChangeNotifier {
     await _database.deleteHistory(filePath);
     _history.removeWhere((item) => item.filePath == filePath);
     notifyListeners();
+    _scheduleIncrementalSyncAfterChange();
   }
 
   // 删除指定前缀的历史记录
@@ -379,6 +453,7 @@ class WatchHistoryProvider extends ChangeNotifier {
     if (count > 0) {
       _history.removeWhere((item) => item.filePath.startsWith(pathPrefix));
       notifyListeners();
+      _scheduleIncrementalSyncAfterChange();
     }
   }
 
@@ -387,6 +462,12 @@ class WatchHistoryProvider extends ChangeNotifier {
     await _database.clearAllHistory();
     _history.clear();
     notifyListeners();
+    _scheduleIncrementalSyncAfterChange();
+  }
+
+  void _scheduleIncrementalSyncAfterChange() {
+    if (!globals.isDesktop) return;
+    unawaited(AutoSyncService.instance.scheduleSyncAfterLocalChange());
   }
 
   bool _shouldDisplayInContinueWatching(WatchHistoryItem item) {

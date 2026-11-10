@@ -30,6 +30,9 @@ class AdaptiveAlertDialogInput {
 
   /// Maximum length of the text input
   final int? maxLength;
+
+  bool get isPassword =>
+      obscureText || keyboardType == TextInputType.visiblePassword;
 }
 
 /// An adaptive alert dialog that renders platform-specific styles
@@ -85,7 +88,7 @@ class AdaptiveAlertDialog {
     }
 
     // iOS 18 and below - Use CupertinoAlertDialog
-    if (PlatformInfo.isIOS) {
+    if (PlatformInfo.prefersCupertinoControls) {
       return showCupertinoDialog<void>(
         context: context,
         builder: (context) {
@@ -225,7 +228,7 @@ class AdaptiveAlertDialog {
     }
 
     // iOS 18 and below - Use CupertinoAlertDialog with text field
-    if (PlatformInfo.isIOS) {
+    if (PlatformInfo.prefersCupertinoControls) {
       final textController = TextEditingController(text: input.initialValue);
 
       return showCupertinoDialog<String?>(
@@ -260,7 +263,17 @@ class AdaptiveAlertDialog {
                   CupertinoTextField(
                     controller: textController,
                     placeholder: input.placeholder,
-                    keyboardType: input.keyboardType,
+                    keyboardType: input.isPassword
+                        ? TextInputType.visiblePassword
+                        : input.keyboardType,
+                    autocorrect: !input.isPassword,
+                    enableSuggestions: !input.isPassword,
+                    smartDashesType: input.isPassword
+                        ? SmartDashesType.disabled
+                        : null,
+                    smartQuotesType: input.isPassword
+                        ? SmartQuotesType.disabled
+                        : null,
                     obscureText: input.obscureText,
                     maxLength: input.maxLength,
                     autofocus: true,
@@ -380,7 +393,17 @@ class AdaptiveAlertDialog {
                     hintText: input.placeholder,
                     border: const OutlineInputBorder(),
                   ),
-                  keyboardType: input.keyboardType,
+                  keyboardType: input.isPassword
+                      ? TextInputType.visiblePassword
+                      : input.keyboardType,
+                  autocorrect: !input.isPassword,
+                  enableSuggestions: !input.isPassword,
+                  smartDashesType: input.isPassword
+                      ? SmartDashesType.disabled
+                      : null,
+                  smartQuotesType: input.isPassword
+                      ? SmartQuotesType.disabled
+                      : null,
                   obscureText: input.obscureText,
                   maxLength: input.maxLength,
                   autofocus: true,

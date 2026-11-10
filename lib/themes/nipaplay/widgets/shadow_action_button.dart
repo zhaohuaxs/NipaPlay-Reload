@@ -1,19 +1,24 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'tooltip_bubble.dart';
 import 'control_shadow.dart';
 
 class ShadowActionButton extends StatefulWidget {
-  final String tooltip;
+  final String? tooltip;
   final IconData icon;
   final VoidCallback onPressed;
+  final VoidCallback? onLongPress;
   final double iconSize;
+  final EdgeInsetsGeometry padding;
 
   const ShadowActionButton({
     super.key,
-    required this.tooltip,
+    this.tooltip,
     required this.icon,
     required this.onPressed,
-    this.iconSize = 26,
+    this.onLongPress,
+    this.iconSize = 28,
+    this.padding = const EdgeInsets.all(8.0),
   });
 
   @override
@@ -22,40 +27,66 @@ class ShadowActionButton extends StatefulWidget {
 
 class _ShadowActionButtonState extends State<ShadowActionButton> {
   bool _isHovered = false;
+  bool _isFocused = false;
   bool _isPressed = false;
 
   @override
   Widget build(BuildContext context) {
-    return MouseRegion(
-      onEnter: (_) => setState(() => _isHovered = true),
-      onExit: (_) => setState(() => _isHovered = false),
-      child: TooltipBubble(
-        text: widget.tooltip,
-        showOnRight: false,
-        verticalOffset: 8,
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTapDown: (_) => setState(() => _isPressed = true),
-          onTapCancel: () => setState(() => _isPressed = false),
-          onTapUp: (_) {
-            setState(() => _isPressed = false);
-            widget.onPressed();
-          },
-          child: Padding(
-            padding: const EdgeInsets.all(8.0), // 增加一些点击区域
-            child: AnimatedScale(
-              duration: const Duration(milliseconds: 100),
-              scale: _isPressed ? 0.9 : (_isHovered ? 1.1 : 1.0),
-              child: ControlIconShadow(
-                child: Icon(
-                  widget.icon,
-                  color: Colors.white,
-                  size: widget.iconSize,
-                ),
-              ),
+    final isActive = _isHovered || _isFocused;
+    final button = GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTapDown: (_) => setState(() => _isPressed = true),
+      onTapCancel: () => setState(() => _isPressed = false),
+      onTapUp: (_) => setState(() => _isPressed = false),
+      onTap: widget.onPressed,
+      onLongPress: widget.onLongPress,
+      child: Padding(
+        padding: widget.padding,
+        child: AnimatedScale(
+          duration: const Duration(milliseconds: 100),
+          scale: _isPressed ? 0.9 : (isActive ? 1.1 : 1.0),
+          child: ControlIconShadow(
+            child: Icon(
+              widget.icon,
+              color: Colors.white,
+              size: widget.iconSize,
             ),
           ),
         ),
+      ),
+    );
+    return FocusableActionDetector(
+      onShowFocusHighlight: (value) {
+        if (_isFocused == value) return;
+        setState(() {
+          _isFocused = value;
+        });
+      },
+      shortcuts: const <ShortcutActivator, Intent>{
+        SingleActivator(LogicalKeyboardKey.enter): ActivateIntent(),
+        SingleActivator(LogicalKeyboardKey.numpadEnter): ActivateIntent(),
+        SingleActivator(LogicalKeyboardKey.select): ActivateIntent(),
+        SingleActivator(LogicalKeyboardKey.gameButtonA): ActivateIntent(),
+      },
+      actions: <Type, Action<Intent>>{
+        ActivateIntent: CallbackAction<ActivateIntent>(
+          onInvoke: (_) {
+            widget.onPressed();
+            return null;
+          },
+        ),
+      },
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _isHovered = true),
+        onExit: (_) => setState(() => _isHovered = false),
+        child: widget.tooltip == null
+            ? button
+            : TooltipBubble(
+                text: widget.tooltip!,
+                showOnRight: false,
+                verticalOffset: 8,
+                child: button,
+              ),
       ),
     );
   }

@@ -9,18 +9,22 @@ import 'package:shelf_router/shelf_router.dart';
 import 'package:nipaplay/constants/media_extensions.dart';
 import 'package:nipaplay/models/watch_history_model.dart';
 import 'package:nipaplay/providers/service_provider.dart';
-import 'package:nipaplay/services/dandanplay_service.dart';
+import 'package:nipaplay/services/danmaku_matching_service.dart';
 import 'package:nipaplay/services/scan_service.dart';
 import 'package:nipaplay/services/smb_proxy_service.dart';
 import 'package:nipaplay/services/webdav_service.dart';
 import 'package:nipaplay/services/smb_service.dart';
+import 'package:nipaplay/utils/media_source_utils.dart';
+import 'package:nipaplay/utils/subtitle_file_utils.dart';
 
 class _RemoteScrapeCandidate {
   final String filePath;
+  final String probePath;
   final String fileName;
 
   const _RemoteScrapeCandidate({
     required this.filePath,
+    required this.probePath,
     required this.fileName,
   });
 }
@@ -96,6 +100,7 @@ class LocalMediaManagementApi {
     '.srt': 2,
     '.sub': 3,
     '.sup': 4,
+    '.idx': 4,
   };
 
   Future<Response> _handleListFolders(Request request) async {
@@ -152,6 +157,8 @@ class LocalMediaManagementApi {
   Future<Response> _handleListWebDAV(Request request) async {
     final name = request.url.queryParameters['name']?.trim();
     final path = request.url.queryParameters['path']?.trim() ?? '/';
+    final forceRefresh =
+        request.url.queryParameters['refresh']?.toLowerCase() == 'true';
     if (name == null || name.isEmpty) {
       return _jsonError(HttpStatus.badRequest, 'Missing name');
     }
@@ -162,7 +169,11 @@ class LocalMediaManagementApi {
     }
 
     try {
-      final files = await _webdavService.listDirectory(connection, path);
+      final files = await _webdavService.listDirectory(
+        connection,
+        path,
+        forceRefresh: forceRefresh,
+      );
       final entries = files
           .map((file) => {
                 'name': file.name,
@@ -259,7 +270,11 @@ class LocalMediaManagementApi {
 
       final candidates = files
           .map((file) => _RemoteScrapeCandidate(
-                filePath: _webdavService.getFileUrl(connection, file.path),
+                filePath: MediaSourceUtils.buildWebDavPath(
+                  connection.id,
+                  file.path,
+                ),
+                probePath: _webdavService.getFileUrl(connection, file.path),
                 fileName: file.name,
               ))
           .toList();
@@ -325,6 +340,8 @@ class LocalMediaManagementApi {
   Future<Response> _handleListSMB(Request request) async {
     final name = request.url.queryParameters['name']?.trim();
     final path = request.url.queryParameters['path']?.trim() ?? '/';
+    final forceRefresh =
+        request.url.queryParameters['refresh']?.toLowerCase() == 'true';
     if (name == null || name.isEmpty) {
       return _jsonError(HttpStatus.badRequest, 'Missing name');
     }
@@ -335,7 +352,11 @@ class LocalMediaManagementApi {
     }
 
     try {
-      final files = await _smbService.listDirectory(connection, path);
+      final files = await _smbService.listDirectory(
+        connection,
+        path,
+        forceRefresh: forceRefresh,
+      );
       final entries = files
           .map((file) => {
                 'name': file.name,
@@ -416,7 +437,11 @@ class LocalMediaManagementApi {
 
       final candidates = files
           .map((file) => _RemoteScrapeCandidate(
-                filePath: SMBProxyService.instance.buildStreamUrl(
+                filePath: MediaSourceUtils.buildSmbPath(
+                  connection.id,
+                  file.path,
+                ),
+                probePath: SMBProxyService.instance.buildStreamUrl(
                   connection,
                   file.path,
                 ),
@@ -500,8 +525,9 @@ class LocalMediaManagementApi {
 
     for (final candidate in candidates) {
       try {
-        final videoInfo = await DandanplayService.getVideoInfo(
+        final videoInfo = await DanmakuMatchingService.instance.getVideoInfo(
           candidate.filePath,
+          probePath: candidate.probePath,
         );
         final matches = videoInfo['matches'];
         if (videoInfo['isMatched'] != true ||
@@ -829,9 +855,17 @@ class LocalMediaManagementApi {
           p.basenameWithoutExtension(videoFile.path).toLowerCase();
       final items = <Map<String, dynamic>>[];
 
+      final dirFiles = <File>[];
       await for (final entry in videoDir.list(followLinks: false)) {
         if (entry is! File) continue;
+        dirFiles.add(entry);
+      }
 
+      final dirNames = dirFiles
+          .map((file) => p.basename(file.path).toLowerCase())
+          .toSet();
+
+      for (final entry in dirFiles) {
         final filePath = entry.path;
         if (p.normalize(filePath) == p.normalize(videoFile.path)) {
           continue;
@@ -839,6 +873,10 @@ class LocalMediaManagementApi {
 
         final ext = p.extension(filePath).toLowerCase();
         if (!subtitleExtensions.contains(ext)) {
+          continue;
+        }
+        // .idx 无独立播放语义：目录中无同名 .sub 的孤立 IDX 不作为候选
+        if (!isVobSubPairCompleteInNames(p.basename(filePath), dirNames)) {
           continue;
         }
 
@@ -854,9 +892,7 @@ class LocalMediaManagementApi {
 
         final subtitleBaseName =
             p.basenameWithoutExtension(filePath).toLowerCase();
-        final isLikelyMatch = subtitleBaseName == videoBaseName ||
-            subtitleBaseName.contains(videoBaseName) ||
-            videoBaseName.contains(subtitleBaseName);
+        final isLikelyMatch = subtitleMatchesVideo(videoBaseName, subtitleBaseName);
 
         items.add({
           'name': p.basename(filePath),
@@ -1172,6 +1208,12 @@ class LocalMediaManagementApi {
     if (!await subtitleFile.exists()) {
       return null;
     }
+
+    // .idx 请求需要同名 .sub 配对才有效
+    if (!isVobSubPairComplete(subtitlePath)) {
+      return null;
+    }
+
     return subtitleFile;
   }
 

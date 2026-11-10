@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
 import 'package:nipaplay/models/jellyfin_model.dart';
 import 'package:nipaplay/models/emby_model.dart';
 import 'package:nipaplay/models/server_profile_model.dart';
@@ -7,10 +10,11 @@ import 'package:nipaplay/services/jellyfin_service.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_login_dialog.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/fluent_settings_switch.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/keyboard_activatable.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/multi_address_manager_widget.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/nipaplay_window.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
 import 'package:provider/provider.dart';
-import 'package:flutter_svg/flutter_svg.dart';
 import 'package:nipaplay/providers/jellyfin_provider.dart';
 import 'package:nipaplay/providers/emby_provider.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
@@ -139,7 +143,10 @@ class NetworkMediaServerDialog extends StatefulWidget {
   const NetworkMediaServerDialog({
     super.key,
     required this.serverType,
+    this.embedded = false,
   });
+
+  final bool embedded;
 
   @override
   State<NetworkMediaServerDialog> createState() =>
@@ -149,6 +156,20 @@ class NetworkMediaServerDialog extends StatefulWidget {
     final provider = _getProvider(context, serverType);
 
     if (provider.isConnected) {
+      final serverName =
+          serverType == MediaServerType.jellyfin ? 'Jellyfin' : 'Emby';
+      if (AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone) {
+        return CupertinoBottomSheet.show<bool>(
+          context: context,
+          title: '$serverName 服务器设置',
+          floatingTitle: true,
+          child: NetworkMediaServerDialog(
+            serverType: serverType,
+            embedded: true,
+          ),
+        );
+      }
+
       // 如果已连接，显示设置对话框
       final enableAnimation = Provider.of<AppearanceSettingsProvider>(
         context,
@@ -266,6 +287,7 @@ class _LibrarySelectionTile extends StatefulWidget {
 class _LibrarySelectionTileState extends State<_LibrarySelectionTile> {
   bool _isHovered = false;
   bool _isPressed = false;
+  bool _isFocused = false;
 
   void _setHovered(bool value) {
     if (_isHovered == value) return;
@@ -281,9 +303,17 @@ class _LibrarySelectionTileState extends State<_LibrarySelectionTile> {
     });
   }
 
+  void _setFocused(bool value) {
+    if (_isFocused == value) return;
+    setState(() {
+      _isFocused = value;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
-    final bool isActive = widget.isSelected || _isHovered || _isPressed;
+    final bool isActive =
+        widget.isSelected || _isHovered || _isFocused || _isPressed;
     final Color titleColor = isActive ? widget.accentColor : widget.textColor;
     final Color subtitleColor =
         isActive ? widget.accentColor.withOpacity(0.7) : widget.subTextColor;
@@ -292,48 +322,52 @@ class _LibrarySelectionTileState extends State<_LibrarySelectionTile> {
     return MouseRegion(
       onEnter: (_) => _setHovered(true),
       onExit: (_) => _setHovered(false),
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTapDown: (_) => _setPressed(true),
-        onTapUp: (_) => _setPressed(false),
-        onTapCancel: () => _setPressed(false),
-        onTap: widget.onTap,
-        child: AnimatedScale(
-          scale: isActive ? 1.03 : 1.0,
-          alignment: Alignment.centerLeft,
-          duration: const Duration(milliseconds: 150),
-          curve: Curves.easeOut,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            child: Row(
-              children: [
-                Icon(widget.icon, color: iconColor, size: 20),
-                SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        widget.title,
-                        style: TextStyle(
-                          color: titleColor,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
+      child: KeyboardActivatable(
+        onActivate: widget.onTap,
+        onFocusChange: _setFocused,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (_) => _setPressed(true),
+          onTapUp: (_) => _setPressed(false),
+          onTapCancel: () => _setPressed(false),
+          onTap: widget.onTap,
+          child: AnimatedScale(
+            scale: isActive ? 1.03 : 1.0,
+            alignment: Alignment.centerLeft,
+            duration: const Duration(milliseconds: 150),
+            curve: Curves.easeOut,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              child: Row(
+                children: [
+                  Icon(widget.icon, color: iconColor, size: 20),
+                  SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          widget.title,
+                          style: TextStyle(
+                            color: titleColor,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
-                      ),
-                      SizedBox(height: 2),
-                      Text(
-                        widget.subtitle,
-                        locale: const Locale("zh-Hans", "zh"),
-                        style: TextStyle(
-                          color: subtitleColor,
-                          fontSize: 12,
+                        SizedBox(height: 2),
+                        Text(
+                          widget.subtitle,
+                          locale: const Locale("zh-Hans", "zh"),
+                          style: TextStyle(
+                            color: subtitleColor,
+                            fontSize: 12,
+                          ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -367,26 +401,6 @@ class _NetworkMediaServerDialogState extends State<NetworkMediaServerDialog> {
       _isDarkMode ? const Color(0xFF262626) : const Color(0xFFE8E8E8);
   Color get _panelAltColor =>
       _isDarkMode ? const Color(0xFF2B2B2B) : const Color(0xFFF7F7F7);
-
-  ButtonStyle _plainButtonStyle({Color? baseColor}) {
-    final resolvedBase = baseColor ?? _textColor;
-    return ButtonStyle(
-      foregroundColor: MaterialStateProperty.resolveWith((states) {
-        if (states.contains(MaterialState.disabled)) {
-          return _mutedTextColor;
-        }
-        if (states.contains(MaterialState.hovered)) {
-          return _accentColor;
-        }
-        return resolvedBase;
-      }),
-      overlayColor: MaterialStateProperty.all(Colors.transparent),
-      splashFactory: NoSplash.splashFactory,
-      padding: MaterialStateProperty.all(
-        const EdgeInsets.symmetric(vertical: 12, horizontal: 12),
-      ),
-    );
-  }
 
   @override
   void didChangeDependencies() {
@@ -627,15 +641,6 @@ class _NetworkMediaServerDialogState extends State<NetworkMediaServerDialog> {
     }
   }
 
-  String get _serverIconAsset {
-    switch (widget.serverType) {
-      case MediaServerType.jellyfin:
-        return 'assets/jellyfin.svg';
-      case MediaServerType.emby:
-        return 'assets/emby.svg';
-    }
-  }
-
   bool get _supportsTranscode =>
       widget.serverType == MediaServerType.jellyfin ||
       widget.serverType == MediaServerType.emby;
@@ -653,6 +658,7 @@ class _NetworkMediaServerDialogState extends State<NetworkMediaServerDialog> {
         : resolvedDialogWidth;
 
     return NipaplayWindowScaffold(
+      embedded: widget.embedded,
       maxWidth: dialogWidth,
       maxHeightFactor: 0.9,
       onClose: () => Navigator.of(context).maybePop(),
@@ -684,8 +690,10 @@ class _NetworkMediaServerDialogState extends State<NetworkMediaServerDialog> {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _buildHeader(),
-        SizedBox(height: 20),
+        if (!widget.embedded) ...[
+          _buildHeader(),
+          SizedBox(height: 20),
+        ],
         Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -734,8 +742,10 @@ class _NetworkMediaServerDialogState extends State<NetworkMediaServerDialog> {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _buildHeader(),
-        SizedBox(height: 20),
+        if (!widget.embedded) ...[
+          _buildHeader(),
+          SizedBox(height: 20),
+        ],
         _buildServerInfo(),
         SizedBox(height: 20),
         if (_serverAddresses.isNotEmpty) ...[
@@ -763,27 +773,6 @@ class _NetworkMediaServerDialogState extends State<NetworkMediaServerDialog> {
   Widget _buildHeader() {
     return Row(
       children: [
-        Container(
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: _accentColor.withOpacity(0.2),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(
-              color: _accentColor.withOpacity(0.3),
-              width: 1,
-            ),
-          ),
-          child: SvgPicture.asset(
-            _serverIconAsset,
-            width: 28,
-            height: 28,
-            colorFilter: ColorFilter.mode(
-              _accentColor,
-              BlendMode.srcIn,
-            ),
-          ),
-        ),
-        SizedBox(width: 16),
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -824,15 +813,6 @@ class _NetworkMediaServerDialogState extends State<NetworkMediaServerDialog> {
         children: [
           Row(
             children: [
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: _accentColor.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Icon(Icons.dns, color: _accentColor, size: 20),
-              ),
-              SizedBox(width: 12),
               Text(
                 '服务器:',
                 locale: Locale("zh-Hans", "zh"),
@@ -851,15 +831,6 @@ class _NetworkMediaServerDialogState extends State<NetworkMediaServerDialog> {
           SizedBox(height: 12),
           Row(
             children: [
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: _accentColor.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Icon(Icons.person, color: _accentColor, size: 20),
-              ),
-              SizedBox(width: 12),
               Text(
                 '用户:',
                 locale: Locale("zh-Hans", "zh"),
@@ -883,15 +854,6 @@ class _NetworkMediaServerDialogState extends State<NetworkMediaServerDialog> {
       children: [
         Row(
           children: [
-            Container(
-              padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(
-                color: _accentColor.withOpacity(0.2),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Icon(Icons.library_books, color: _accentColor, size: 20),
-            ),
-            SizedBox(width: 12),
             Text(
               '媒体库选择',
               locale: Locale("zh-Hans", "zh"),
@@ -1017,86 +979,82 @@ class _NetworkMediaServerDialogState extends State<NetworkMediaServerDialog> {
     return _subTextColor;
   }
 
+  void _toggleTranscodeSettings() {
+    setState(() {
+      _transcodeSettingsExpanded = !_transcodeSettingsExpanded;
+    });
+  }
+
   Widget _buildTranscodeSection() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        InkWell(
-          onTap: () {
-            setState(() {
-              _transcodeSettingsExpanded = !_transcodeSettingsExpanded;
-            });
-          },
-          borderRadius: BorderRadius.circular(12),
-          splashFactory: NoSplash.splashFactory,
-          splashColor: Colors.transparent,
-          highlightColor: Colors.transparent,
-          hoverColor: Colors.transparent,
-          focusColor: Colors.transparent,
-          child: Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: _panelColor,
-              borderRadius: _transcodeSettingsExpanded
-                  ? const BorderRadius.only(
-                      topLeft: Radius.circular(12),
-                      topRight: Radius.circular(12),
-                    )
-                  : BorderRadius.circular(12),
-              border: _transcodeSettingsExpanded
-                  ? Border(
-                      top: BorderSide(color: _borderColor),
-                      left: BorderSide(color: _borderColor),
-                      right: BorderSide(color: _borderColor),
-                    )
-                  : Border.all(color: _borderColor),
-            ),
-            child: Row(
-              children: [
-                Container(
-                  padding: const EdgeInsets.all(8),
-                  decoration: BoxDecoration(
-                    color: _accentColor.withOpacity(0.2),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child:
-                      Icon(Icons.high_quality, color: _accentColor, size: 20),
+        Semantics(
+          button: true,
+          expanded: _transcodeSettingsExpanded,
+          onTap: _toggleTranscodeSettings,
+          child: KeyboardActivatable(
+            onActivate: _toggleTranscodeSettings,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              excludeFromSemantics: true,
+              onTap: _toggleTranscodeSettings,
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: _panelColor,
+                  borderRadius: _transcodeSettingsExpanded
+                      ? const BorderRadius.only(
+                          topLeft: Radius.circular(12),
+                          topRight: Radius.circular(12),
+                        )
+                      : BorderRadius.circular(12),
+                  border: _transcodeSettingsExpanded
+                      ? Border(
+                          top: BorderSide(color: _borderColor),
+                          left: BorderSide(color: _borderColor),
+                          right: BorderSide(color: _borderColor),
+                        )
+                      : Border.all(color: _borderColor),
                 ),
-                SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        '转码设置',
-                        locale: Locale("zh-Hans", "zh"),
-                        style: TextStyle(
-                          color: _textColor,
-                          fontSize: 16,
-                          fontWeight: FontWeight.w500,
-                        ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '转码设置',
+                            locale: Locale("zh-Hans", "zh"),
+                            style: TextStyle(
+                              color: _textColor,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                          SizedBox(height: 4),
+                          Text(
+                            '当前默认质量: ${_selectedQuality.displayName}',
+                            locale: Locale("zh-Hans", "zh"),
+                            style: TextStyle(
+                              color: _subTextColor,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
                       ),
-                      SizedBox(height: 4),
-                      Text(
-                        '当前默认质量: ${_selectedQuality.displayName}',
-                        locale: Locale("zh-Hans", "zh"),
-                        style: TextStyle(
-                          color: _subTextColor,
-                          fontSize: 12,
-                        ),
+                    ),
+                    AnimatedRotation(
+                      turns: _transcodeSettingsExpanded ? 0.5 : 0,
+                      duration: const Duration(milliseconds: 200),
+                      child: Icon(
+                        Icons.expand_more,
+                        color: _subTextColor,
                       ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
-                AnimatedRotation(
-                  turns: _transcodeSettingsExpanded ? 0.5 : 0,
-                  duration: const Duration(milliseconds: 200),
-                  child: Icon(
-                    Icons.expand_more,
-                    color: _subTextColor,
-                  ),
-                ),
-              ],
+              ),
             ),
           ),
         ),
@@ -1343,20 +1301,23 @@ class _NetworkMediaServerDialogState extends State<NetworkMediaServerDialog> {
     return Row(
       children: [
         Expanded(
-          child: TextButton.icon(
+          child: AdaptiveMediaActionButton(
+            label: '断开连接',
             onPressed: _disconnectFromServer,
-            style: _plainButtonStyle(),
-            icon: Icon(Icons.link_off, size: 18),
-            label: const Text('断开连接'),
+            desktopIcon: Icons.link_off,
+            phoneIcon: Icons.link_off,
+            expand: true,
           ),
         ),
         SizedBox(width: 12),
         Expanded(
-          child: TextButton.icon(
+          child: AdaptiveMediaActionButton(
+            label: '保存设置',
             onPressed: _saveSelectedLibraries,
-            style: _plainButtonStyle(baseColor: _accentColor),
-            icon: Icon(Icons.save, size: 18),
-            label: const Text('保存设置'),
+            desktopIcon: Icons.save,
+            phoneIcon: Icons.save,
+            emphasis: AdaptiveMediaActionEmphasis.primary,
+            expand: true,
           ),
         ),
       ],

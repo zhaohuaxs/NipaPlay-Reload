@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:nipaplay/utils/video_player_state.dart';
+import 'package:nipaplay/widgets/danmaku_track_offset_button.dart';
 import 'base_settings_menu.dart';
+import 'player_menu_theme.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_button.dart';
-import 'package:nipaplay/utils/danmaku_xml_utils.dart';
-import 'dart:convert';
-import 'dart:io' as io;
+import 'package:nipaplay/utils/local_danmaku_file.dart';
 import 'package:file_selector/file_selector.dart';
 
 class DanmakuTracksMenu extends StatefulWidget {
@@ -45,24 +45,8 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
 
     try {
       // 使用文件选择器选择弹幕文件
-      final XTypeGroup jsonTypeGroup = XTypeGroup(
-        label: 'JSON弹幕文件',
-        extensions: const ['json'],
-        uniformTypeIdentifiers: io.Platform.isIOS
-            ? ['public.json', 'public.text', 'public.plain-text']
-            : null,
-      );
-
-      final XTypeGroup xmlTypeGroup = XTypeGroup(
-        label: 'XML弹幕文件',
-        extensions: const ['xml'],
-        uniformTypeIdentifiers: io.Platform.isIOS
-            ? ['public.xml', 'public.text', 'public.plain-text']
-            : null,
-      );
-
-      final XFile? file = await openFile(
-        acceptedTypeGroups: [jsonTypeGroup, xmlTypeGroup],
+      final file = await openFile(
+        acceptedTypeGroups: localDanmakuFileTypes,
         confirmButtonText: '选择弹幕文件',
       );
 
@@ -75,55 +59,8 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
         return;
       }
 
-      // 读取文件内容并根据扩展名处理
-      //final fileContent = await file.readAsString();
-      final fileBytes = await file.readAsBytes();
-      final fileContent = utf8.decode(fileBytes);
-      final fileName = file.name.toLowerCase();
-      Map<String, dynamic> jsonData;
-
-      if (fileName.endsWith('.xml')) {
-        // XML文件，先转换为JSON格式
-        jsonData = _convertXmlToJson(fileContent);
-      } else {
-        // JSON文件，直接解析
-        jsonData = json.decode(fileContent);
-      }
-
-      // 解析弹幕数据，支持多种格式
-      List<dynamic> comments = [];
-
-      if (jsonData.containsKey('comments') && jsonData['comments'] is List) {
-        // 标准格式：comments字段包含数组
-        comments = jsonData['comments'];
-      } else if (jsonData.containsKey('data')) {
-        // 兼容格式：data字段
-        final data = jsonData['data'];
-        if (data is List) {
-          // data是数组
-          comments = data;
-        } else if (data is String) {
-          // data是字符串，需要解析
-          try {
-            final parsedData = json.decode(data);
-            if (parsedData is List) {
-              comments = parsedData;
-            } else {
-              throw Exception('data字段的JSON字符串不是数组格式');
-            }
-          } catch (e) {
-            throw Exception('data字段的JSON字符串解析失败: $e');
-          }
-        } else {
-          throw Exception('data字段格式不正确，应为数组或JSON字符串');
-        }
-      } else {
-        throw Exception('JSON文件格式不正确，必须包含comments数组或data字段');
-      }
-
-      if (comments.isEmpty) {
-        throw Exception('弹幕文件中没有弹幕数据');
-      }
+      final jsonData = await readLocalDanmakuFile(file);
+      final comments = jsonData['comments'] as List;
 
       final localTrackCount = videoState.danmakuTracks.values
           .where((track) => track['source'] == 'local')
@@ -154,15 +91,11 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
     }
   }
 
-  // XML弹幕转换为JSON格式
-  Map<String, dynamic> _convertXmlToJson(String xmlContent) {
-    return convertBilibiliXmlDanmakuToJson(xmlContent);
-  }
-
   @override
   Widget build(BuildContext context) {
     return Consumer<VideoPlayerState>(
       builder: (context, videoState, child) {
+        final menuColors = PlayerMenuTheme.colorsOf(context);
         final tracks = videoState.danmakuTracks;
         final trackEnabled = videoState.danmakuTrackEnabled;
         final totalDanmakuCount = videoState.totalDanmakuCount;
@@ -182,19 +115,19 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
                   vertical: 12,
                 ),
                 decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.1),
+                  color: menuColors.controlBackground,
                   border: Border(
                     bottom: BorderSide(
-                      color: Colors.white.withOpacity(0.5),
+                      color: menuColors.divider,
                       width: 0.5,
                     ),
                   ),
                 ),
                 child: Row(
                   children: [
-                    const Icon(
+                    Icon(
                       Icons.info_outline,
-                      color: Colors.white,
+                      color: menuColors.foreground,
                       size: 20,
                     ),
                     const SizedBox(width: 12),
@@ -202,11 +135,11 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Text(
+                          Text(
                             '弹幕轨道总览',
                             locale: Locale("zh-Hans", "zh"),
                             style: TextStyle(
-                              color: Colors.white,
+                              color: menuColors.foreground,
                               fontSize: 14,
                               fontWeight: FontWeight.w500,
                             ),
@@ -216,7 +149,7 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
                             '共${tracks.length}个轨道，合计$totalDanmakuCount条弹幕',
                             locale: Locale("zh-Hans", "zh"),
                             style: TextStyle(
-                              color: Colors.white.withOpacity(0.7),
+                              color: menuColors.secondaryForeground,
                               fontSize: 12,
                             ),
                           ),
@@ -246,6 +179,8 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
                 final trackName = trackData['name'] as String;
                 final source = trackData['source'] as String;
                 final count = trackData['count'] as int;
+                final generation = videoState.playbackGeneration;
+                final offset = videoState.danmakuTrackOffset(trackId);
 
                 IconData trackIcon;
 
@@ -272,11 +207,11 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
                       ),
                       decoration: BoxDecoration(
                         color: isEnabled
-                            ? Colors.white.withOpacity(0.1)
+                            ? menuColors.selectedBackground
                             : Colors.transparent,
                         border: Border(
                           bottom: BorderSide(
-                            color: Colors.white.withOpacity(0.5),
+                            color: menuColors.divider,
                             width: 0.5,
                           ),
                         ),
@@ -287,13 +222,17 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
                             isEnabled
                                 ? Icons.check_circle
                                 : Icons.radio_button_unchecked,
-                            color: Colors.white,
+                            color: isEnabled
+                                ? menuColors.selectedForeground
+                                : menuColors.foreground,
                             size: 20,
                           ),
                           const SizedBox(width: 12),
                           Icon(
                             trackIcon,
-                            color: Colors.white,
+                            color: isEnabled
+                                ? menuColors.selectedForeground
+                                : menuColors.foreground,
                             size: 16,
                           ),
                           const SizedBox(width: 8),
@@ -306,8 +245,8 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
                                   locale: Locale("zh-Hans", "zh"),
                                   style: TextStyle(
                                     color: isEnabled
-                                        ? Colors.white
-                                        : Colors.white.withOpacity(0.7),
+                                        ? menuColors.selectedForeground
+                                        : menuColors.foreground,
                                     fontSize: 14,
                                     fontWeight: isEnabled
                                         ? FontWeight.w500
@@ -315,28 +254,41 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
                                   ),
                                 ),
                                 Text(
-                                  '$count条弹幕',
+                                  '$count条弹幕 · ${formatDanmakuTrackOffset(offset)}',
                                   locale: Locale("zh-Hans", "zh"),
                                   style: TextStyle(
-                                    color: Colors.white.withOpacity(0.6),
+                                    color: menuColors.secondaryForeground,
                                     fontSize: 12,
                                   ),
                                 ),
                               ],
                             ),
                           ),
+                          DanmakuTrackOffsetButton(
+                            trackName: trackName,
+                            offset: offset,
+                            onChanged: (value) {
+                              if (videoState.playbackGeneration == generation &&
+                                  identical(videoState.danmakuTracks[trackId], trackData)) {
+                                videoState.setDanmakuTrackOffset(trackId, value);
+                              }
+                            },
+                          ),
                           // 删除按钮（本地轨道才显示）
                           if (source == 'local')
-                            GestureDetector(
-                              onTap: () =>
+                            IconButton(
+                              tooltip: '删除弹幕轨道',
+                              onPressed: () =>
                                   videoState.removeDanmakuTrack(trackId),
-                              child: Container(
-                                padding: const EdgeInsets.all(4),
-                                child: const Icon(
-                                  Icons.delete_outline,
-                                  color: Colors.white,
-                                  size: 18,
-                                ),
+                              padding: const EdgeInsets.all(4),
+                              constraints: const BoxConstraints(
+                                minWidth: 28,
+                                minHeight: 28,
+                              ),
+                              iconSize: 18,
+                              icon: Icon(
+                                Icons.delete_outline,
+                                color: menuColors.secondaryForeground,
                               ),
                             ),
                         ],
@@ -358,8 +310,6 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
                             height: 24,
                             child: CircularProgressIndicator(
                               strokeWidth: 2,
-                              valueColor:
-                                  AlwaysStoppedAnimation<Color>(Colors.white),
                             ),
                           ),
                           const SizedBox(width: 12),
@@ -367,7 +317,7 @@ class _DanmakuTracksMenuState extends State<DanmakuTracksMenu> {
                             '正在加载弹幕文件...',
                             locale: Locale("zh-Hans", "zh"),
                             style: TextStyle(
-                              color: Colors.white.withOpacity(0.7),
+                              color: menuColors.secondaryForeground,
                               fontSize: 14,
                             ),
                           ),

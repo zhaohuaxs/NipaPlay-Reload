@@ -1,5 +1,26 @@
 part of video_player_state;
 
+const bool _enablePlaybackDiagnostics = false;
+
+@visibleForTesting
+bool shouldTreatMdkPositionAsEnded({
+  required int remainingMs,
+  required int movementMs,
+  required int stalledDurationMs,
+}) {
+  return remainingMs >= 0 &&
+      remainingMs <= 1500 &&
+      movementMs.abs() <= 20 &&
+      stalledDurationMs >= 750;
+}
+
+void _playbackDiag(String Function() messageBuilder) {
+  if (!_enablePlaybackDiagnostics) {
+    return;
+  }
+  debugPrint(messageBuilder());
+}
+
 extension VideoPlayerStateNavigation on VideoPlayerState {
   // 播放上一话
   Future<void> playPreviousEpisode() async {
@@ -13,6 +34,10 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
       _showNavigationBusyMessage('上一话');
       return;
     }
+
+    final skipDanmakuMatching = _context != null && _context!.mounted
+        ? _context!.read<SettingsProvider>().skipDanmakuMatching
+        : false;
 
     _isEpisodeNavigating = true;
 
@@ -68,6 +93,7 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
         currentFilePath: _currentVideoPath!,
         animeId: _animeId,
         episodeId: _episodeId,
+        skipDanmakuMatching: skipDanmakuMatching,
       );
 
       if (result.success) {
@@ -93,13 +119,25 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
         }
 
         if (historyItem != null &&
+            !skipDanmakuMatching &&
             WatchHistoryAutoMatchHelper.shouldAutoMatch(historyItem)) {
           historyItem = await _tryAutoMatchForNavigation(historyItem);
         }
 
         if (historyItem != null) {
           // 从数据库找到的剧集，包含完整的历史信息
-          final resolvedHistory = historyItem;
+          final requested = PlayableItem(
+            mediaLibraryScope: _playbackDetailContext?.mediaLibraryScope,
+            videoPath: historyItem.filePath,
+            historyItem: historyItem,
+            detailContext: _playbackDetailContext,
+          );
+          final selectionContext = _context ?? globals.navigatorKey.currentContext;
+          final selected = selectionContext?.mounted == true
+              ? await EpisodeFileSelectionService.select(selectionContext!, requested)
+              : requested;
+          if (selected == null) return;
+          final resolvedHistory = selected.historyItem ?? historyItem;
           // 检查是否为Jellyfin或Emby流媒体，如果是则需要获取实际的HTTP URL
           if (resolvedHistory.filePath.startsWith('jellyfin://')) {
             try {
@@ -119,6 +157,10 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 resolvedHistory.filePath,
                 historyItem: resolvedHistory,
                 playbackSession: playbackSession,
+                mediaLibraryScope: selected.mediaLibraryScope,
+                playbackDetailContext: selected.detailContext,
+                actualPlayUrl: selected.actualPlayUrl,
+                episodeFileSelectionHandled: true,
               );
             } catch (e) {
               debugPrint('[上一话] 获取Jellyfin播放会话失败: $e');
@@ -145,6 +187,10 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 resolvedHistory.filePath,
                 historyItem: resolvedHistory,
                 playbackSession: playbackSession,
+                mediaLibraryScope: selected.mediaLibraryScope,
+                playbackDetailContext: selected.detailContext,
+                actualPlayUrl: selected.actualPlayUrl,
+                episodeFileSelectionHandled: true,
               );
             } catch (e) {
               debugPrint('[上一话] 获取Emby播放会话失败: $e');
@@ -153,8 +199,14 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
             }
           } else {
             // 本地文件或其他类型
-            await initializePlayer(resolvedHistory.filePath,
-                historyItem: resolvedHistory);
+            await initializePlayer(
+              resolvedHistory.filePath,
+              historyItem: resolvedHistory,
+              mediaLibraryScope: selected.mediaLibraryScope,
+              playbackDetailContext: selected.detailContext,
+              actualPlayUrl: selected.actualPlayUrl,
+              episodeFileSelectionHandled: true,
+            );
           }
         } else {
           _showEpisodeErrorMessage('上一话', '无法加载上一话的历史记录');
@@ -172,8 +224,265 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
     }
   }
 
+  /// Returns the item immediately following the current item in the same
+  /// playlist used by the player UI.
+  Future<void> preloadPlaybackPlaylist() async {
+    final currentPath = _currentVideoPath;
+    final detailContext = _playbackDetailContext;
+    if (currentPath == null || detailContext == null) return;
+
+    final stopwatch = Stopwatch()..start();
+    try {
+      final episodes = await _playbackPlaylistCache.load(
+        sourceKey: detailContext.sourceKey,
+        loader: detailContext.episodeLoader,
+      );
+      if (_currentVideoPath != currentPath ||
+          _playbackDetailContext?.sourceKey != detailContext.sourceKey) {
+        return;
+      }
+      debugPrint(
+        '[播放列表] 后台预加载完成: ${episodes.length} 项, '
+        '${stopwatch.elapsedMilliseconds}ms',
+      );
+    } catch (e) {
+      // 不缓存失败结果，片尾检查时仍可再次加载。
+      debugPrint('[播放列表] 后台预加载失败，将在需要时重试: $e');
+    }
+  }
+
+  Future<PlaylistCursorResult> resolvePlaylistCursor({
+    bool forceRefresh = false,
+  }) async {
+    final currentPath = _currentVideoPath;
+    final detailContext = _playbackDetailContext;
+    // Re-resolve from the active path so connection-root migrations cannot
+    // leave a stale key captured before WebDAV/SMB initialization.
+    final currentMediaKey =
+        currentPath == null ? null : MediaIdentityResolver.forPath(currentPath);
+    if (currentPath == null ||
+        currentMediaKey == null ||
+        detailContext == null) {
+      return const PlaylistCurrentNotFound();
+    }
+
+    try {
+      if (forceRefresh) {
+        _playbackPlaylistCache.invalidate();
+      }
+      final episodes = await _playbackPlaylistCache.load(
+        sourceKey: detailContext.sourceKey,
+        loader: detailContext.episodeLoader,
+      );
+      if (_currentVideoPath != currentPath ||
+          _playbackDetailContext?.sourceKey != detailContext.sourceKey) {
+        return const PlaylistCurrentNotFound();
+      }
+      final result = PlaybackPlaylist.locate(
+        episodes,
+        currentMediaKey,
+        // The path is the source of truth. Cached episode media keys may have
+        // been produced before a remote connection/root migration.
+        identityOf: (episode) =>
+            MediaIdentityResolver.forPath(episode.videoPath),
+      );
+      if (result is PlaylistCurrentNotFound) {
+        debugPrint(
+          '[播放列表] 当前项身份未命中: source=${detailContext.sourceKey}, '
+          'current=$currentMediaKey, episodes=${episodes.length}',
+        );
+        for (final episode in episodes.take(5)) {
+          final episodeKey = MediaIdentityResolver.forPath(episode.videoPath);
+          debugPrint(
+            '[播放列表] 候选项身份: id=${episode.id}, key=$episodeKey',
+          );
+        }
+      }
+      return result;
+    } catch (e) {
+      debugPrint('[播放列表] 获取下一项失败: $e');
+      return PlaylistLoadFailed(e);
+    }
+  }
+
   // 播放下一话
-  Future<void> playNextEpisode() async {
+  Future<void> playNextEpisode({
+    PlaybackDetailEpisode? verifiedPlaylistEpisode,
+  }) async {
+    if (_playbackDetailContext == null) {
+      await _playNextEpisodeUsingLegacyNavigation();
+      return;
+    }
+
+    PlaybackDetailEpisode? nextEpisode = verifiedPlaylistEpisode;
+    if (nextEpisode == null) {
+      final result = await resolvePlaylistCursor();
+      switch (result) {
+        case PlaylistHasNext(:final episode):
+          nextEpisode = episode;
+        case PlaylistAtEnd():
+          debugPrint('[下一话] 当前播放列表已经是最后一项');
+          _showEpisodeNotFoundMessage('下一话');
+          return;
+        case PlaylistCurrentNotFound():
+          debugPrint('[下一话] 无法在播放列表中定位当前项');
+          _showEpisodeErrorMessage('下一话', '无法在播放列表中定位当前项');
+          return;
+        case PlaylistLoadFailed(:final error):
+          debugPrint('[下一话] 播放列表加载失败: $error');
+          _showEpisodeErrorMessage('下一话', '播放列表加载失败：$error');
+          return;
+      }
+    }
+
+    if (_isEpisodeNavigating) {
+      _showNavigationBusyMessage('下一话');
+      return;
+    }
+    _isEpisodeNavigating = true;
+    try {
+      await _playPlaylistEpisode(nextEpisode);
+    } catch (e) {
+      debugPrint('[下一话] 播放列表切换失败: $e');
+      _showEpisodeErrorMessage('下一话', e.toString());
+      rethrow;
+    } finally {
+      _isEpisodeNavigating = false;
+    }
+  }
+
+  Future<void> _playPlaylistEpisode(PlaybackDetailEpisode episode) async {
+    final skipDanmakuMatching = _context != null && _context!.mounted
+        ? _context!.read<SettingsProvider>().skipDanmakuMatching
+        : false;
+
+    // 优先查询数据库中的真实观看记录，因为 WebDAV/SMB 的 episodeLoader
+    // 创建的占位 historyItem 中 animeName/episodeTitle 都是文件名，没有
+    // animeId。数据库中有通过弹幕匹配写入的正确番剧/剧集名。
+    var historyItem =
+        await WatchHistoryManager.getHistoryItemByPath(episode.videoPath);
+    final detailContext = _playbackDetailContext;
+
+    // 播放列表中的本地文件项通常只保存路径。切集前补回媒体库中的匹配记录，
+    // 并用播放列表元数据兜底，避免 initializePlayer 将下一话当作裸文件载入。
+    // episode.historyItem（占位 history，无 animeId）放到最后兜底，
+    // 否则 historyItem 永远非 null，导致此分支不会执行。
+    if (historyItem == null &&
+        detailContext != null &&
+        detailContext.isIdentified) {
+      historyItem = WatchHistoryItem(
+        filePath: episode.videoPath,
+        animeName: detailContext.title,
+        episodeTitle: episode.title,
+        animeId: episode.animeId ?? detailContext.animeId,
+        episodeId: episode.episodeId,
+        watchProgress: episode.progress ?? 0,
+        lastPosition: 0,
+        duration: 0,
+        lastWatchTime: DateTime.now(),
+        thumbnailPath: detailContext.imageUrl,
+        mediaKey: MediaIdentityResolver.forPath(episode.videoPath),
+      );
+    }
+    historyItem ??= episode.historyItem;
+    if (historyItem != null &&
+        !skipDanmakuMatching &&
+        WatchHistoryAutoMatchHelper.shouldAutoMatch(historyItem)) {
+      // WebDAV/SMB 等远程路径优先使用 episode.actualPlayUrl（服务器返回的
+      // 原始编码路径构建的 HTTP URL），避免 _resolveMatchablePath 从解码后
+      // 的路径重新编码时与服务器预期编码不一致，导致 hash 下载 404。
+      final matchableUrl = (episode.actualPlayUrl?.isNotEmpty == true)
+          ? episode.actualPlayUrl
+          : await _resolveMatchablePath(historyItem.filePath);
+      if (matchableUrl != null && matchableUrl.isNotEmpty) {
+        historyItem = await WatchHistoryAutoMatchHelper.tryAutoMatch(
+          _context!,
+          historyItem,
+          matchablePath: matchableUrl,
+          onMatched: (msg) => BlurSnackBar.show(_context!, msg),
+        );
+      }
+    }
+
+    final selected = await EpisodeFileSelectionService.select(
+      _context!,
+      PlayableItem(
+        mediaLibraryScope: _playbackDetailContext?.mediaLibraryScope,
+        videoPath: episode.videoPath,
+        historyItem: historyItem,
+        animeId:
+            historyItem?.animeId ?? episode.animeId ?? detailContext?.animeId,
+        episodeId: historyItem?.episodeId ?? episode.episodeId,
+        actualPlayUrl: episode.actualPlayUrl,
+        playbackSession: episode.playbackSession,
+      ),
+    );
+    if (selected == null) return;
+    if (!MediaIdentityResolver.samePath(selected.videoPath, episode.videoPath)) {
+      await PlaybackService().play(selected, episodeFileSelectionHandled: true);
+      return;
+    }
+    historyItem = selected.historyItem ?? historyItem;
+
+    PlaybackSession? playbackSession = episode.playbackSession;
+    if (episode.videoPath.startsWith('jellyfin://')) {
+      playbackSession ??= await JellyfinService.instance.createPlaybackSession(
+        itemId: episode.videoPath.replaceFirst('jellyfin://', ''),
+      );
+    } else if (episode.videoPath.startsWith('emby://')) {
+      final rawPath = episode.videoPath.replaceFirst('emby://', '');
+      playbackSession ??= await EmbyService.instance.createPlaybackSession(
+        itemId: rawPath.split('/').last,
+      );
+    }
+
+    String? actualPlayUrl;
+    if (MediaSourceUtils.isNewWebDavPath(episode.videoPath)) {
+      actualPlayUrl = episode.actualPlayUrl ??
+          await MediaSourceUtils.resolveWebDavPathToUrlInitialized(
+            episode.videoPath,
+          );
+    } else if (MediaSourceUtils.isNewSmbPath(episode.videoPath)) {
+      actualPlayUrl = episode.actualPlayUrl ??
+          MediaSourceUtils.resolveSmbPathToUrl(episode.videoPath);
+    }
+
+    // 当 historyItem 未匹配到番剧（animeId 为空）但当前播放上下文已识别时，
+    // 将上下文的番剧名写回 historyItem。否则 initializePlayer 会优先读取
+    // historyItem.animeName（WebDAV/SMB 的 _loadXxxEpisodes 创建的占位记录中
+    // animeName 是文件名），导致 resolvedDetailContext.title 的正确番剧名被忽略。
+    final bool historyWasUnidentified =
+        historyItem != null && historyItem.animeId == null;
+    if (historyWasUnidentified &&
+        detailContext != null &&
+        detailContext.isIdentified) {
+      historyItem = historyItem.copyWith(
+        animeName: detailContext.title,
+      );
+    }
+
+    final playableItem = PlayableItem(
+      mediaLibraryScope: _playbackDetailContext?.mediaLibraryScope,
+      videoPath: episode.videoPath,
+      title: historyItem?.animeName ?? detailContext?.title ?? episode.subtitle,
+      subtitle: historyItem?.episodeTitle ?? episode.title,
+      animeId:
+          historyItem?.animeId ?? episode.animeId ?? detailContext?.animeId,
+      episodeId: historyItem?.episodeId ?? episode.episodeId,
+      historyItem: historyItem,
+      actualPlayUrl: actualPlayUrl,
+      playbackSession: playbackSession,
+      mediaKey: MediaIdentityResolver.forPath(episode.videoPath),
+      // 不传入旧的 detailContext，否则 PlaybackSourceService.resolve() 会
+      // 直接复用上一集的上下文（subtitle 是上一集的剧集名），导致新一集显示旧标题。
+    );
+
+    // 与番剧详情页点击剧集使用同一个正式入口。该入口会完整传递
+    // PlayableItem 的番剧/剧集元数据并统一解析播放来源。
+    await PlaybackService().play(playableItem, episodeFileSelectionHandled: true);
+  }
+
+  Future<void> _playNextEpisodeUsingLegacyNavigation() async {
     if (!canPlayNextEpisode || _currentVideoPath == null) {
       debugPrint('[下一话] 无法播放下一话：检查条件不满足');
       return;
@@ -184,6 +493,10 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
       _showNavigationBusyMessage('下一话');
       return;
     }
+
+    final skipDanmakuMatching = _context != null && _context!.mounted
+        ? _context!.read<SettingsProvider>().skipDanmakuMatching
+        : false;
 
     _isEpisodeNavigating = true;
 
@@ -239,6 +552,7 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
         currentFilePath: _currentVideoPath!,
         animeId: _animeId,
         episodeId: _episodeId,
+        skipDanmakuMatching: skipDanmakuMatching,
       );
 
       if (result.success) {
@@ -263,13 +577,25 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
         }
 
         if (historyItem != null &&
+            !skipDanmakuMatching &&
             WatchHistoryAutoMatchHelper.shouldAutoMatch(historyItem)) {
           historyItem = await _tryAutoMatchForNavigation(historyItem);
         }
 
         if (historyItem != null) {
           // 从数据库找到的剧集，包含完整的历史信息
-          final resolvedHistory = historyItem;
+          final requested = PlayableItem(
+            mediaLibraryScope: _playbackDetailContext?.mediaLibraryScope,
+            videoPath: historyItem.filePath,
+            historyItem: historyItem,
+            detailContext: _playbackDetailContext,
+          );
+          final selectionContext = _context ?? globals.navigatorKey.currentContext;
+          final selected = selectionContext?.mounted == true
+              ? await EpisodeFileSelectionService.select(selectionContext!, requested)
+              : requested;
+          if (selected == null) return;
+          final resolvedHistory = selected.historyItem ?? historyItem;
           // 检查是否为Jellyfin或Emby流媒体，如果是则需要获取实际的HTTP URL
           if (resolvedHistory.filePath.startsWith('jellyfin://')) {
             try {
@@ -289,6 +615,10 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 resolvedHistory.filePath,
                 historyItem: resolvedHistory,
                 playbackSession: playbackSession,
+                mediaLibraryScope: selected.mediaLibraryScope,
+                playbackDetailContext: selected.detailContext,
+                actualPlayUrl: selected.actualPlayUrl,
+                episodeFileSelectionHandled: true,
               );
             } catch (e) {
               debugPrint('[下一话] 获取Jellyfin播放会话失败: $e');
@@ -315,6 +645,10 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 resolvedHistory.filePath,
                 historyItem: resolvedHistory,
                 playbackSession: playbackSession,
+                mediaLibraryScope: selected.mediaLibraryScope,
+                playbackDetailContext: selected.detailContext,
+                actualPlayUrl: selected.actualPlayUrl,
+                episodeFileSelectionHandled: true,
               );
             } catch (e) {
               debugPrint('[下一话] 获取Emby播放会话失败: $e');
@@ -323,8 +657,14 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
             }
           } else {
             // 本地文件或其他类型
-            await initializePlayer(resolvedHistory.filePath,
-                historyItem: resolvedHistory);
+            await initializePlayer(
+              resolvedHistory.filePath,
+              historyItem: resolvedHistory,
+              mediaLibraryScope: selected.mediaLibraryScope,
+              playbackDetailContext: selected.detailContext,
+              actualPlayUrl: selected.actualPlayUrl,
+              episodeFileSelectionHandled: true,
+            );
           }
         } else {
           _showEpisodeErrorMessage('下一话', '无法加载下一话的历史记录');
@@ -384,6 +724,21 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
         forceDirectPlay: true,
       );
     }
+    // WebDAV/SMB 新格式路径需解析为 HTTP URL，否则自动匹配系统会因
+    // "路径不可用"（非本地文件也非 HTTP URL）而跳过，导致续播无弹幕。
+    if (MediaSourceUtils.isNewWebDavPath(filePath)) {
+      try {
+        final url =
+            await MediaSourceUtils.resolveWebDavPathToUrlInitialized(filePath);
+        if (url != null && url.isNotEmpty) return url;
+      } catch (_) {}
+    }
+    if (MediaSourceUtils.isNewSmbPath(filePath)) {
+      try {
+        final url = MediaSourceUtils.resolveSmbPathToUrl(filePath);
+        if (url != null && url.isNotEmpty) return url;
+      } catch (_) {}
+    }
     return filePath;
   }
 
@@ -430,18 +785,20 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
   }
 
   Widget _buildEpisodeNavigationDialogContent() {
-    final isCupertinoTheme = _context != null && _context!.mounted
-        ? Provider.of<UIThemeProvider>(_context!, listen: false)
-            .isCupertinoTheme
+    final isPhoneLayout = _context != null && _context!.mounted
+        ? Provider.of<UIThemeProvider>(_context!, listen: false).isPhoneLayout
+        : false;
+    final skipDanmakuMatching = _context != null && _context!.mounted
+        ? _context!.read<SettingsProvider>().skipDanmakuMatching
         : false;
 
-    final Widget indicator = isCupertinoTheme
+    final Widget indicator = isPhoneLayout
         ? const CupertinoActivityIndicator(radius: 12)
         : const CircularProgressIndicator(
             valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
           );
 
-    final TextStyle textStyle = isCupertinoTheme
+    final TextStyle textStyle = isPhoneLayout
         ? const TextStyle(
             color: CupertinoColors.secondaryLabel,
             fontSize: 14,
@@ -459,7 +816,7 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
         indicator,
         const SizedBox(height: 16),
         Text(
-          '正在定位剧集并匹配弹幕，请稍候…',
+          skipDanmakuMatching ? '正在定位剧集，请稍候…' : '正在定位剧集并匹配弹幕，请稍候…',
           style: textStyle,
           textAlign: TextAlign.center,
         ),
@@ -494,7 +851,7 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
   // 启动UI更新定时器（根据弹幕内核类型设置不同的更新频率，同时处理数据保存）
   void _startUiUpdateTimer() {
     if (!kReleaseMode) {
-      debugPrint('[LOOP-RESTART-DIAG] _startUiUpdateTimer() CALLED: '
+      _playbackDiag(() => '[LOOP-RESTART-DIAG] _startUiUpdateTimer() CALLED: '
           '_status=$_status _seekTargetMs=$_seekTargetMs '
           '_lastRawPlayerMs=$_lastRawPlayerMs '
           'tickerExisted=${_uiUpdateTicker != null}');
@@ -517,19 +874,19 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
     // 假设：此时 playbackTimeMs=0（由 _resetVideoState 设置），
     // Ticker 首帧锚定到 player.position（可能也是0），导致弹幕从头播放
     if (!kReleaseMode) {
-      debugPrint('[VIDEO-OPEN-PTM-DIAG] _startUiUpdateTimer: '
+      _playbackDiag(() => '[VIDEO-OPEN-PTM-DIAG] _startUiUpdateTimer: '
           'playbackTimeMs=${_playbackTimeMs.value.toStringAsFixed(1)} '
           '_position=${_position.inMilliseconds} '
           '_smoothAnchorMs=${_smoothAnchorMs.toStringAsFixed(1)} '
           '_seekTargetMs=$_seekTargetMs '
-          '_status=$_status ← Ticker will anchor to player.position on first frame');
+          '_status=$_status  Ticker will anchor to player.position on first frame');
     }
     // [NEXT-DIAG] 重置帧间隔基线，避免跨 Ticker 实例的假阳性
     _lastElapsedUs = 0;
     _diagBaselineFrameUs = 0;
     _diagFrameSampleCount = 0;
 
-    // 🔥 关键优化：使用Ticker代替Timer.periodic
+    //  关键优化：使用Ticker代替Timer.periodic
     // Ticker会与显示刷新率同步，更精确地控制帧率
     // 如未创建过，则创建Ticker；注意此Ticker不受TickerMode影响（非Widget上下文），需手动启停
     _uiUpdateTicker ??= Ticker((elapsed) async {
@@ -556,13 +913,29 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
       }
 
       if (!_isSeeking && hasVideo) {
+        // Whole-block mode: reduced-frequency poll while paused so style
+        // slider drags keep the text fresh on a paused frame.
+        if (embeddedSubtitleOverlayMode && _status != PlayerStatus.playing) {
+          pollEmbeddedSubtitleOverlayTextPaused();
+        }
         if (_status == PlayerStatus.playing) {
-          final playerPosition = player.position;
+          if (isBuffering) {
+            // Buffering is not a user pause. Keep the ticker available for
+            // recovery, but freeze its media anchor and skip drift correction.
+            _lastElapsedUs = elapsed.inMicroseconds;
+            _smoothAnchorElapsedUs = _lastElapsedUs;
+            return;
+          }
+          var playerPosition = player.position;
           final playerDuration = player.mediaInfo.duration;
 
           if (playerPosition >= 0 && playerDuration > 0) {
             // 更新UI显示
             _position = Duration(milliseconds: playerPosition);
+            // 内嵌字幕整块移动模式：节流轮询 sub-text（文本变化才通知）
+            pollEmbeddedSubtitleOverlayText();
+            // 同步当前章节索引（MKV 自带章节，参考 mpv playloop.c:607 get_current_chapter）
+            _updateCurrentChapterFromPosition(playerPosition);
             final previousDurationMs = _duration.inMilliseconds;
             final previousSubtitleDelay = subtitleDelaySeconds;
             _duration = Duration(milliseconds: playerDuration);
@@ -571,7 +944,12 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                     0.0001) {
               unawaited(applySubtitleStylePreference());
             }
-            _progress = _position.inMilliseconds / _duration.inMilliseconds;
+            // duration 为 0 时（iOS 流媒体 duration 延迟就绪/解析失败）避免除零
+            // 产生 Infinity/NaN，否则会落库到 watchProgress 导致全量备份
+            // JSON 编码失败（"Converting object to an encoding object failed: Infinity"）
+            _progress = _duration.inMilliseconds > 0
+                ? _position.inMilliseconds / _duration.inMilliseconds
+                : 0.0;
             final bufferedMs = player.bufferedPosition;
             _bufferedPositionMs = bufferedMs <= 0
                 ? 0
@@ -593,7 +971,8 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 // 采样阶段：收集最小帧间隔作为基线
                 _diagFrameSampleCount++;
                 if (frameDeltaUs > 0 &&
-                    (_diagBaselineFrameUs == 0 || frameDeltaUs < _diagBaselineFrameUs)) {
+                    (_diagBaselineFrameUs == 0 ||
+                        frameDeltaUs < _diagBaselineFrameUs)) {
                   _diagBaselineFrameUs = frameDeltaUs;
                 }
               } else if (_diagBaselineFrameUs > 0 &&
@@ -601,14 +980,45 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 final now = DateTime.now().millisecondsSinceEpoch;
                 if (now - _lastDiagFrameSkipTimeMs >= 2000) {
                   _lastDiagFrameSkipTimeMs = now;
-                  debugPrint('[NEXT-DIAG] FRAME SKIP: $frameDeltaUs μs '
-                      '(baseline=${_diagBaselineFrameUs}μs) '
-                      'at playback=${playerPosition}ms');
+                  _playbackDiag(
+                      () => '[NEXT-DIAG] FRAME SKIP: $frameDeltaUs μs '
+                          '(baseline=${_diagBaselineFrameUs}μs) '
+                          'at playback=${playerPosition}ms');
                 }
               }
             }
             _lastElapsedUs = currentElapsedUs;
-            final playerMs = playerPosition.toDouble();
+            var playerMs = playerPosition.toDouble();
+
+            // [MDK-SPIKE-GUARD] 缓冲抖动时 MDK 的 position 可能瞬时前跳
+            // 数秒又回落（日志实证 raw 183828→191764→184618）。平滑时钟
+            // 追单样本尖刺会让字幕/弹幕前跳数秒再回弹（用户感知"字幕早
+            // 1-2 秒"）。策略：非 seek 状态下 position 相对平滑时钟前跳
+            // 超过 1.5s 视为可疑尖刺，连续 3 个采样（约 50ms/帧）仍保持
+            // 才接受为真实跳变；否则用平滑时钟外推值替代本次采样。
+            final spikeGuardExpected = _playbackTimeMs.value + 2500.0;
+            if (_seekTargetMs == null && playerMs > spikeGuardExpected) {
+              _rawSpikeStreak += 1;
+              if (_rawSpikeStreak < 4) {
+                // 只改写平滑时钟锚定用的 playerMs；
+                // playerPosition（结束检测/章节/进度条）保持真实值。
+                final extrapolated = (_smoothAnchorMs +
+                        (currentElapsedUs - _smoothAnchorElapsedUs) /
+                            1000.0 *
+                            effectivePlaybackRate)
+                    .clamp(0.0, _duration.inMilliseconds.toDouble());
+                playerMs = extrapolated;
+                if (!kReleaseMode || nowTime - _lastDiagDriftSnapMs >= 2000) {
+                  debugPrint('[MDK-SPIKE-GUARD] 前跳尖刺被忽略: '
+                      'raw=${playerPosition}ms using=${playerMs.toStringAsFixed(0)}ms '
+                      'streak=$_rawSpikeStreak');
+                }
+              } else {
+                _rawSpikeStreak = 0;
+              }
+            } else {
+              _rawSpikeStreak = 0;
+            }
 
             // seek 保护：player.position 更新有延迟，在它追上 seekTarget 之前
             // 保持锚定在 seek 目标位置，避免弹幕闪回旧位置
@@ -617,7 +1027,7 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 // player.position 已追上 seek 目标，恢复正常插值
                 // [LOOP-RESTART-DIAG] 诊断：seek 保护结束
                 if (!kReleaseMode) {
-                  debugPrint('[LOOP-RESTART-DIAG] SEEK CAUGHT UP: '
+                  _playbackDiag(() => '[LOOP-RESTART-DIAG] SEEK CAUGHT UP: '
                       'playerMs=${playerMs.toStringAsFixed(1)} '
                       'seekTargetMs=${_seekTargetMs!.toStringAsFixed(1)} '
                       'ptm=${_playbackTimeMs.value.toStringAsFixed(1)}');
@@ -629,101 +1039,118 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 _anchorSetBySeek = false; // seek 完成，锚点已对齐到实际位置
               } else {
                 // 还在等待 player.position 追上，从 seekTarget 插值推进
-                final elapsedDeltaUs = currentElapsedUs - _smoothAnchorElapsedUs;
-                _playbackTimeMs.value = (_smoothAnchorMs + elapsedDeltaUs / 1000.0 * effectivePlaybackRate)
+                final elapsedDeltaUs =
+                    currentElapsedUs - _smoothAnchorElapsedUs;
+                _playbackTimeMs.value = (_smoothAnchorMs +
+                        elapsedDeltaUs / 1000.0 * effectivePlaybackRate)
                     .clamp(0.0, _duration.inMilliseconds.toDouble());
               }
             } else if (_lastRawPlayerMs < 0) {
               // 首帧或重置后：锚定
-              // ✅ P3 修复：暂停恢复场景下，play() 已设置 _smoothAnchorMs = 暂停时的值，
+              //  P3 修复：暂停恢复场景下，play() 已设置 _smoothAnchorMs = 暂停时的值，
               // _smoothAnchorElapsedUs = 0。此时不应让 player.position 覆盖锚点，
               // 而是直接用已设置的锚点插值推进，让漂移修正自然校准。
-              final isResumeFromPause = _smoothAnchorElapsedUs == 0 && _playbackTimeMs.value > 100.0;
+              final isResumeFromPause =
+                  _smoothAnchorElapsedUs == 0 && _playbackTimeMs.value > 100.0;
 
               if (isResumeFromPause) {
                 // 暂停恢复：锚点已在 play() 中设置，直接插值推进
-                final elapsedDeltaUs = currentElapsedUs - _smoothAnchorElapsedUs;
-                final newPtm = (_smoothAnchorMs + elapsedDeltaUs / 1000.0 * effectivePlaybackRate)
+                final elapsedDeltaUs =
+                    currentElapsedUs - _smoothAnchorElapsedUs;
+                final newPtm = (_smoothAnchorMs +
+                        elapsedDeltaUs / 1000.0 * effectivePlaybackRate)
                     .clamp(0.0, _duration.inMilliseconds.toDouble());
                 _playbackTimeMs.value = newPtm;
                 // 标记 _lastRawPlayerMs 让下一帧走漂移修正路径
                 // 但不立即锚定到 playerMs，让漂移修正渐进收敛
                 _lastRawPlayerMs = playerPosition;
                 if (!kReleaseMode) {
-                  debugPrint('[RESUME-PAUSE-DIAG] Resume from pause: '
+                  _playbackDiag(() => '[RESUME-PAUSE-DIAG] Resume from pause: '
                       'anchorMs=${_smoothAnchorMs.toStringAsFixed(1)} '
                       'playerMs=${playerMs.toStringAsFixed(1)} '
                       'ptm=${newPtm.toStringAsFixed(1)} '
                       'delta=${(newPtm - playerMs).toStringAsFixed(1)}ms');
                 }
               } else {
-              // ✅ 防御性修复(V3)：检测过期 playerMs
-              // 核心判断：如果 playbackTimeMs ≈ 0（刚被重置）且 playerMs >> 0，
-              // 则 playerMs 一定是过期数据（旧视频/旧位置），无论 _anchorSetBySeek 是什么值。
-              // 没有合法场景会同时出现 playbackTimeMs=0 和 playerMs=1420007。
-              // 合法首帧加载：playbackTimeMs=恢复位置, playerMs=恢复位置 → 信任
-              // 合法从头播放：playbackTimeMs=0, playerMs≈0 → 信任
-              // 过期数据：playbackTimeMs=0(刚重置), playerMs=旧末尾 → 不信任
-              final anchorDelta = (playerMs - _smoothAnchorMs).abs();
-              final prevPtm = _playbackTimeMs.value;
-              final ptmDelta = (playerMs - prevPtm).abs();
-              // 过期检测：playbackTimeMs 接近 0 且 playerMs 远离 0 → playerMs 是旧值
-              final isStalePlayerMs = prevPtm < 100.0 && playerMs > 1000.0;
-              if (!kReleaseMode) {
-                debugPrint('[LOOP-RESTART-DIAG] TICKER LAST_RAW<0: '
-                    'playerMs=${playerMs.toStringAsFixed(1)} '
-                    'prevPtm=${prevPtm.toStringAsFixed(1)} '
-                    'ptmDelta=${ptmDelta.toStringAsFixed(1)} '
-                    'smoothAnchorMs=${_smoothAnchorMs.toStringAsFixed(1)} '
-                    'anchorDelta=${anchorDelta.toStringAsFixed(1)} '
-                    'seekTargetMs=$_seekTargetMs '
-                    'anchorSetBySeek=$_anchorSetBySeek '
-                    'isStale=$isStalePlayerMs');
-              }
-              if (isStalePlayerMs) {
-                // playerMs 是过期数据（旧视频位置），不信任它
-                // 保持 playbackTimeMs 不变，启用 seek 保护等待 player.position 追上
-                _smoothAnchorElapsedUs = currentElapsedUs;
-                _seekTargetMs = prevPtm > 0.0 ? prevPtm : _smoothAnchorMs;
-                _lastRawPlayerMs = -1; // 保持负值，让 seek 保护分支接管下一帧
-                // playbackTimeMs 保持当前值（不跳到过期 playerMs）
-                final elapsedDeltaUs = currentElapsedUs - _smoothAnchorElapsedUs;
-                _playbackTimeMs.value = (_seekTargetMs! + elapsedDeltaUs / 1000.0 * effectivePlaybackRate)
-                    .clamp(0.0, _duration.inMilliseconds.toDouble());
+                //  防御性修复(V3)：检测过期 playerMs
+                // 核心判断：如果 playbackTimeMs ≈ 0（刚被重置）且 playerMs >> 0，
+                // 则 playerMs 一定是过期数据（旧视频/旧位置），无论 _anchorSetBySeek 是什么值。
+                // 没有合法场景会同时出现 playbackTimeMs=0 和 playerMs=1420007。
+                // 合法首帧加载：playbackTimeMs=恢复位置, playerMs=恢复位置  信任
+                // 合法从头播放：playbackTimeMs=0, playerMs≈0  信任
+                // 过期数据：playbackTimeMs=0(刚重置), playerMs=旧末尾  不信任
+                final anchorDelta = (playerMs - _smoothAnchorMs).abs();
+                final prevPtm = _playbackTimeMs.value;
+                final ptmDelta = (playerMs - prevPtm).abs();
+                // 过期检测：playbackTimeMs 接近 0 且 playerMs 远离 0  playerMs 是旧值
+                // 扩展（2026-06-21）：覆盖切集反向场景
+                // 原判定 prevPtm<100 && playerMs>1000 只覆盖"playbackTimeMs 归零 + playerMs 旧末尾"
+                // 切集反向场景：prevPtm=旧集末尾(大) + playerMs=新集开头(小)  原判定不触发
+                //  走 FIRST-ANCHOR 把新集 playerMs 当有效值  playbackTimeMs 突跌  回弹
+                // 扩展：prevPtm>1000 且 playerMs<prevPtm-1000 也视为污染，启用 seek 保护
+                final isStalePlayerMs =
+                    (prevPtm < 100.0 && playerMs > 1000.0) ||
+                        (prevPtm > 1000.0 && playerMs < prevPtm - 1000.0);
                 if (!kReleaseMode) {
-                  debugPrint('[LOOP-RESTART-DIAG] STALE PLAYER: '
-                      'rejecting stale playerMs=${playerMs.toStringAsFixed(1)} '
-                      'anchoring to seekTargetMs=${_seekTargetMs?.toStringAsFixed(1)} '
-                      'prevPtm=${prevPtm.toStringAsFixed(1)}');
+                  _playbackDiag(() => '[LOOP-RESTART-DIAG] TICKER LAST_RAW<0: '
+                      'playerMs=${playerMs.toStringAsFixed(1)} '
+                      'prevPtm=${prevPtm.toStringAsFixed(1)} '
+                      'ptmDelta=${ptmDelta.toStringAsFixed(1)} '
+                      'smoothAnchorMs=${_smoothAnchorMs.toStringAsFixed(1)} '
+                      'anchorDelta=${anchorDelta.toStringAsFixed(1)} '
+                      'seekTargetMs=$_seekTargetMs '
+                      'anchorSetBySeek=$_anchorSetBySeek '
+                      'isStale=$isStalePlayerMs');
                 }
-              } else {
-                // playerMs 合法：首帧加载/恢复位置/从头播放 → 正常锚定
-                // ✅ P7修复：首帧锚定路径添加P1单调递增保护
-                // 根因：暂停恢复后 player.position 可能回退（比暂停前小），
-                // 直接赋值 _playbackTimeMs.value = playerMs 会导致 playbackTimeMs 回退 → 弹幕回弹。
-                // 修复：与锚点过期重锚路径（line 712-729）保持一致的单调递增保护逻辑。
-                final newPtmCandidate = playerMs.clamp(0.0, _duration.inMilliseconds.toDouble());
-                if (newPtmCandidate < _playbackTimeMs.value - 0.5 && _playbackTimeMs.value > 100.0) {
-                  // playerMs 回退 → 保持 prevPtm，锚定到 prevPtm 使后续帧正常推进
-                  _smoothAnchorMs = _playbackTimeMs.value;
+                if (isStalePlayerMs) {
+                  // playerMs 是过期数据（旧视频位置），不信任它
+                  // 保持 playbackTimeMs 不变，启用 seek 保护等待 player.position 追上
                   _smoothAnchorElapsedUs = currentElapsedUs;
-                  _lastRawPlayerMs = playerPosition;
-                  _anchorSetBySeek = false;
-                  // playbackTimeMs 保持不变（hold）
+                  _seekTargetMs = prevPtm > 0.0 ? prevPtm : _smoothAnchorMs;
+                  _lastRawPlayerMs = -1; // 保持负值，让 seek 保护分支接管下一帧
+                  // playbackTimeMs 保持当前值（不跳到过期 playerMs）
+                  final elapsedDeltaUs =
+                      currentElapsedUs - _smoothAnchorElapsedUs;
+                  _playbackTimeMs.value = (_seekTargetMs! +
+                          elapsedDeltaUs / 1000.0 * effectivePlaybackRate)
+                      .clamp(0.0, _duration.inMilliseconds.toDouble());
                   if (!kReleaseMode) {
-                    debugPrint('[FIRST-ANCHOR-DIAG] BACKWARD PREVENTED: '
-                        'prevPtm=${_playbackTimeMs.value.toStringAsFixed(1)} → playerMs=${playerMs.toStringAsFixed(1)} '
-                        'delta=${(newPtmCandidate - _playbackTimeMs.value).toStringAsFixed(1)}ms '
-                        'rate=$effectivePlaybackRate ← held at prevPtm, anchor=prevPtm');
+                    _playbackDiag(() => '[LOOP-RESTART-DIAG] STALE PLAYER: '
+                        'rejecting stale playerMs=${playerMs.toStringAsFixed(1)} '
+                        'anchoring to seekTargetMs=${_seekTargetMs?.toStringAsFixed(1)} '
+                        'prevPtm=${prevPtm.toStringAsFixed(1)}');
                   }
                 } else {
-                  _smoothAnchorMs = playerMs;
-                  _smoothAnchorElapsedUs = currentElapsedUs;
-                  _lastRawPlayerMs = playerPosition;
-                  _anchorSetBySeek = false;
-                  _playbackTimeMs.value = newPtmCandidate;
+                  // playerMs 合法：首帧加载/恢复位置/从头播放  正常锚定
+                  //  P7修复：首帧锚定路径添加P1单调递增保护
+                  // 根因：暂停恢复后 player.position 可能回退（比暂停前小），
+                  // 直接赋值 _playbackTimeMs.value = playerMs 会导致 playbackTimeMs 回退  弹幕回弹。
+                  // 修复：与锚点过期重锚路径（line 712-729）保持一致的单调递增保护逻辑。
+                  final newPtmCandidate =
+                      playerMs.clamp(0.0, _duration.inMilliseconds.toDouble());
+                  if (newPtmCandidate < _playbackTimeMs.value - 0.5 &&
+                      _playbackTimeMs.value > 100.0) {
+                    // playerMs 回退  保持 prevPtm，锚定到 prevPtm 使后续帧正常推进
+                    _smoothAnchorMs = _playbackTimeMs.value;
+                    _smoothAnchorElapsedUs = currentElapsedUs;
+                    _lastRawPlayerMs = playerPosition;
+                    _anchorSetBySeek = false;
+                    // playbackTimeMs 保持不变（hold）
+                    if (!kReleaseMode) {
+                      _playbackDiag(() =>
+                          '[FIRST-ANCHOR-DIAG] BACKWARD PREVENTED: '
+                          'prevPtm=${_playbackTimeMs.value.toStringAsFixed(1)}  playerMs=${playerMs.toStringAsFixed(1)} '
+                          'delta=${(newPtmCandidate - _playbackTimeMs.value).toStringAsFixed(1)}ms '
+                          'rate=$effectivePlaybackRate  held at prevPtm, anchor=prevPtm');
+                    }
+                  } else {
+                    _smoothAnchorMs = playerMs;
+                    _smoothAnchorElapsedUs = currentElapsedUs;
+                    _lastRawPlayerMs = playerPosition;
+                    _anchorSetBySeek = false;
+                    _playbackTimeMs.value = newPtmCandidate;
+                  }
                 }
-              }
               }
             } else {
               // 正常播放：检测锚点是否过期（seek/暂停恢复后第一帧）
@@ -732,7 +1159,7 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 // 锚点距今超过 50ms，说明经历了 seek/暂停等中断，
                 // 重新锚定到当前 player.position，避免插值跳变
                 // [PTM-ANCHOR-EXPIRE-DIAG] 根因1辅助诊断：追踪锚点过期重锚定
-                // 假设：暂停后恢复，锚点过期 → 直接对齐到 playerMs →
+                // 假设：暂停后恢复，锚点过期  直接对齐到 playerMs 
                 // 如果 playerMs < playbackTimeMs（player.position 回退），playbackTimeMs 回跳
                 if (!kReleaseMode) {
                   final prevPtm = _playbackTimeMs.value;
@@ -741,9 +1168,10 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                     final now = DateTime.now().millisecondsSinceEpoch;
                     if (now - _lastDiagPtmBackwardMs >= 500) {
                       _lastDiagPtmBackwardMs = now;
-                      debugPrint('[PTM-ANCHOR-EXPIRE-DIAG] ANCHOR EXPIRE causes ptm BACKWARD: '
-                          'anchorAge=${anchorAgeMs.toStringAsFixed(1)}ms > 50ms → snap to playerMs '
-                          'prevPtm=${prevPtm.toStringAsFixed(1)} → playerMs=${playerMs.toStringAsFixed(1)} '
+                      _playbackDiag(() =>
+                          '[PTM-ANCHOR-EXPIRE-DIAG] ANCHOR EXPIRE causes ptm BACKWARD: '
+                          'anchorAge=${anchorAgeMs.toStringAsFixed(1)}ms > 50ms  snap to playerMs '
+                          'prevPtm=${prevPtm.toStringAsFixed(1)}  playerMs=${playerMs.toStringAsFixed(1)} '
                           'delta=${(playerMs - prevPtm).toStringAsFixed(1)}ms '
                           'rate=$effectivePlaybackRate');
                     }
@@ -752,19 +1180,22 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 _smoothAnchorMs = playerMs;
                 _smoothAnchorElapsedUs = currentElapsedUs;
                 _lastRawPlayerMs = playerPosition;
-                // ✅ P1 单调递增保护：锚点过期重锚定时，确保 playbackTimeMs 不回退
-                final _anchorExpireNewPtm = playerMs.clamp(0.0, _duration.inMilliseconds.toDouble());
-                if (_anchorExpireNewPtm < _playbackTimeMs.value && _playbackTimeMs.value > 100.0) {
-                  // playerMs 回退 → 保持 prevPtm，锚定到 prevPtm 使后续帧正常推进
+                //  P1 单调递增保护：锚点过期重锚定时，确保 playbackTimeMs 不回退
+                final _anchorExpireNewPtm =
+                    playerMs.clamp(0.0, _duration.inMilliseconds.toDouble());
+                if (_anchorExpireNewPtm < _playbackTimeMs.value &&
+                    _playbackTimeMs.value > 100.0) {
+                  // playerMs 回退  保持 prevPtm，锚定到 prevPtm 使后续帧正常推进
                   _smoothAnchorMs = _playbackTimeMs.value;
                   _playbackTimeMs.value = _playbackTimeMs.value; // hold
                   if (!kReleaseMode) {
                     final now = DateTime.now().millisecondsSinceEpoch;
                     if (now - _lastDiagPtmBackwardMs >= 500) {
                       _lastDiagPtmBackwardMs = now;
-                      debugPrint('[PTM-MONOTONICITY-DIAG] ANCHOR-EXPIRE backward prevented: '
+                      _playbackDiag(() =>
+                          '[PTM-MONOTONICITY-DIAG] ANCHOR-EXPIRE backward prevented: '
                           'prevPtm=${_playbackTimeMs.value.toStringAsFixed(1)} '
-                          'playerMs=${playerMs.toStringAsFixed(1)} → held at prevPtm');
+                          'playerMs=${playerMs.toStringAsFixed(1)}  held at prevPtm');
                     }
                   }
                 } else {
@@ -772,58 +1203,78 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 }
               } else if (playerPosition != _lastRawPlayerMs) {
                 // player.position 更新了：检查平滑时钟与实际位置的漂移
-                final smoothMs = _smoothAnchorMs + elapsedDeltaUs / 1000.0 * effectivePlaybackRate;
+                final smoothMs = _smoothAnchorMs +
+                    elapsedDeltaUs / 1000.0 * effectivePlaybackRate;
                 final drift = smoothMs - playerMs;
+                // [CHAIN-A] 记录 drift 修正前的 playbackTimeMs，供末尾聚合输出使用
+                final chainAPrevPtm = _playbackTimeMs.value;
                 if (drift.abs() > 30.0) {
                   // 大跳变（seek/暂停恢复后）
-                  // ✅ 修复：如果 playerMs < 当前 playbackTimeMs（回退场景），
+                  //  修复：如果 playerMs < 当前 playbackTimeMs（回退场景），
                   // 不立即对齐到 playerMs，而是渐进修正，避免 playbackTimeMs 回跳。
                   // 回跳场景：暂停恢复时 player.position 返回比暂停前小的值；
                   // 正常播放时平滑时钟超前但 playerMs 落后。
-                  // 前进场景：seek 后 playerMs 大幅领先 → 立即对齐正确。
+                  // 前进场景：seek 后 playerMs 大幅领先  立即对齐正确。
                   final prevPtm = _playbackTimeMs.value;
-                  final isBackward = playerMs < prevPtm - 5.0; // playerMs 比 playbackTimeMs 小 >5ms
+                  final isBackward = playerMs <
+                      prevPtm - 5.0; // playerMs 比 playbackTimeMs 小 >5ms
                   if (isBackward) {
-                    // ✅ 回退保护：渐进修正而非立即对齐
+                    //  回退保护：渐进修正而非立即对齐
                     // P3 优化：提高修正速率到 35%，让暂停恢复后的时间偏差更快收敛。
                     // 旧值 20% 在暂停恢复后需要 ~15 帧才能收敛 30ms 偏差，
                     // 期间弹幕时间与视频不同步。35% 可在 ~8 帧内收敛。
                     final correctionMs = drift * 0.35;
                     _smoothAnchorMs = smoothMs - correctionMs;
-                    final correctionUsExact = correctionMs * 1000.0 / effectivePlaybackRate;
+                    final correctionUsExact =
+                        correctionMs * 1000.0 / effectivePlaybackRate;
                     _smoothAnchorElapsedUs =
                         currentElapsedUs - correctionUsExact.round();
                     // [PTM-MONOTONICITY-DIAG] 检测渐进修正是否导致 playbackTimeMs 回退
                     if (!kReleaseMode) {
-                      final newDeltaUs = currentElapsedUs - _smoothAnchorElapsedUs;
-                      final newPtm = (_smoothAnchorMs + newDeltaUs / 1000.0 * effectivePlaybackRate)
+                      final newDeltaUs =
+                          currentElapsedUs - _smoothAnchorElapsedUs;
+                      final newPtm = (_smoothAnchorMs +
+                              newDeltaUs / 1000.0 * effectivePlaybackRate)
                           .clamp(0.0, _duration.inMilliseconds.toDouble());
                       if (newPtm < prevPtm - 0.5 && prevPtm > 100.0) {
                         final now = DateTime.now().millisecondsSinceEpoch;
                         if (now - _lastDiagPtmBackwardMs >= 200) {
                           _lastDiagPtmBackwardMs = now;
-                          debugPrint('[PTM-MONOTONICITY-DIAG] PROGRESSIVE CORRECTION causes ptm BACKWARD: '
-                              'prevPtm=${prevPtm.toStringAsFixed(1)} → newPtm=${newPtm.toStringAsFixed(1)} '
+                          _playbackDiag(() =>
+                              '[PTM-MONOTONICITY-DIAG] PROGRESSIVE CORRECTION causes ptm BACKWARD: '
+                              'prevPtm=${prevPtm.toStringAsFixed(1)}  newPtm=${newPtm.toStringAsFixed(1)} '
                               'delta=${(newPtm - prevPtm).toStringAsFixed(3)}ms '
                               'drift=${drift.toStringAsFixed(1)}ms correction=${correctionMs.toStringAsFixed(1)}ms '
                               'smoothMs=${smoothMs.toStringAsFixed(1)} playerMs=${playerMs.toStringAsFixed(1)} '
-                              'rate=$effectivePlaybackRate ← ROOT CAUSE: drift correction violates monotonicity');
+                              'rate=$effectivePlaybackRate  ROOT CAUSE: drift correction violates monotonicity');
                         }
                       }
                       // 保留原有 DRIFT-SNAP-DIAG
                       final now2 = DateTime.now().millisecondsSinceEpoch;
                       if (now2 - _lastDiagDriftSnapMs >= 500) {
                         _lastDiagDriftSnapMs = now2;
-                        debugPrint('[DRIFT-SNAP-DIAG] BACKWARD PROTECTED: '
+                        _playbackDiag(() =>
+                            '[DRIFT-SNAP-DIAG] BACKWARD PROTECTED: '
                             'drift=${drift.toStringAsFixed(1)}ms > 30ms BUT playerMs(${playerMs.toStringAsFixed(1)}) < ptm(${prevPtm.toStringAsFixed(1)}) '
-                            '→ progressive correction 20% instead of snap '
+                            ' progressive correction 20% instead of snap '
                             'smoothMs=${smoothMs.toStringAsFixed(1)} rate=$effectivePlaybackRate '
-                            'ptmWillBackward=${newPtm < prevPtm ? "YES←BUG" : "no"}');
+                            'ptmWillBackward=${newPtm < prevPtm ? "YESBUG" : "no"}');
                       }
                     }
                   } else {
-                    // 前进场景：playerMs >= playbackTimeMs，立即对齐正确
-                    _smoothAnchorMs = playerMs;
+                    // [FIX-L2] 前进场景：playerMs >= playbackTimeMs，改渐进追赶替代立即 snap。
+                    // 根因：原实现立即 _smoothAnchorMs=playerMs  playbackTimeMs 阶跃到 playerMs
+                    //  engine item.x 阶跃  painter displayX 漂移  drift 修正  回弹。
+                    // 修复：用 0.35 渐进追赶。注意 big-fwd 时 drift<0（smoothMs 落后 playerMs），
+                    // correctionMs=drift*0.35<0，需让当前帧 newPtm = smoothMs + |correctionMs| 立即追赶，
+                    // 而非像 backward 那样保持当前帧连续（backward 靠下一帧 anchor 减小来收敛）。
+                    // big-fwd 是持续追赶场景，当前帧就应前进 |correctionMs|，否则在 drift 稳态时
+                    // 永不收敛（回归实证：drift=-278ms 持续，0.35 修正被 anchorElapsedUs 抵消）。
+                    // 实现：_smoothAnchorMs = smoothMs - correctionMs（= smoothMs + |correctionMs|），
+                    //       _smoothAnchorElapsedUs = currentElapsedUs（不调整，newDeltaUs=0），
+                    //  newPtm = anchorMs + 0 = smoothMs + |correctionMs|，当前帧立即追赶。
+                    final correctionMs = drift * 0.35;
+                    _smoothAnchorMs = smoothMs - correctionMs;
                     _smoothAnchorElapsedUs = currentElapsedUs;
                     if (!kReleaseMode) {
                       final snapDeltaMs = playerMs - prevPtm;
@@ -831,9 +1282,10 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                         final now = DateTime.now().millisecondsSinceEpoch;
                         if (now - _lastDiagDriftSnapMs >= 500) {
                           _lastDiagDriftSnapMs = now;
-                          debugPrint('[DRIFT-SNAP-DIAG] FORWARD SNAP: '
-                              'drift=${drift.toStringAsFixed(1)}ms → snap to playerMs: '
-                              'prevPtm=${prevPtm.toStringAsFixed(1)} → playerMs=${playerMs.toStringAsFixed(1)} '
+                          _playbackDiag(() =>
+                              '[DRIFT-SNAP-DIAG] FORWARD PROGRESSIVE: '
+                              'drift=${drift.toStringAsFixed(1)}ms  0.35 progressive (was snap): '
+                              'prevPtm=${prevPtm.toStringAsFixed(1)}  playerMs=${playerMs.toStringAsFixed(1)} '
                               'delta=${snapDeltaMs.toStringAsFixed(1)}ms '
                               'smoothMs=${smoothMs.toStringAsFixed(1)} rate=$effectivePlaybackRate');
                         }
@@ -842,26 +1294,33 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                   }
                 } else {
                   // 小漂移：渐进修正锚点
-                  // P3 优化：提高修正速率到 15%，让正常播放中的微小偏差更快收敛。
-                  // 旧值 5% 收敛太慢，导致弹幕时间持续领先/落后视频几十毫秒。
-                  // 15% 可在 ~15 帧内收敛 30ms 偏差，同时保持帧间连续性。
-                  final correctionMs = drift * 0.15;
+                  // [FIX-L2] 收敛速率 0.15  0.25，减少正常播放的系统性落后。
+                  // 根因：flutter.log 实证 small 分支持续 drift -15~-29ms，0.15 收敛太慢，
+                  // 平滑时钟系统性落后 player.position，item.x 微左移 vs displayX 墙钟走，
+                  // 14px 边缘周期性漂移  不丝滑。0.25 可在 ~9 帧内收敛 30ms 偏差，
+                  // 同时保持帧间连续性（单帧修正占比 <25% 正常移动）。
+                  final correctionMs = drift * 0.25;
                   _smoothAnchorMs = smoothMs - correctionMs;
                   // 锚点时间调整：锚点位置被修正了 correctionMs，
                   // 锚点时间需设置为 currentElapsedUs - correctionMs*1000/rate，
                   // 使得当前帧输出 = smoothMs（保持连续性），
                   // 下一帧的插值从修正后的锚点自然推进。
-                  final correctionUsExact = correctionMs * 1000.0 / effectivePlaybackRate;
+                  final correctionUsExact =
+                      correctionMs * 1000.0 / effectivePlaybackRate;
                   final correctionUsRounded = correctionUsExact.round();
                   _smoothAnchorElapsedUs =
                       currentElapsedUs - correctionUsRounded;
                   // [DRIFT-ROUND-DIAG] 根因A诊断：追踪 .round() 舍入误差
                   // 假设：.round() 将微小的 correctionUs（倍速时<100μs）截断为整数，
-                  // 误差被后续帧 * _playbackRate 放大 → 周期性振荡 → playbackTimeMs 微回退
+                  // 误差被后续帧 * _playbackRate 放大  周期性振荡  playbackTimeMs 微回退
                   if (!kReleaseMode) {
-                    final roundErrorUs = (correctionUsExact - correctionUsRounded).abs();
+                    final roundErrorUs =
+                        (correctionUsExact - correctionUsRounded).abs();
                     final prevPtmValue = _playbackTimeMs.value;
-                    final newPtmValue = (_smoothAnchorMs + (currentElapsedUs - _smoothAnchorElapsedUs) / 1000.0 * effectivePlaybackRate)
+                    final newPtmValue = (_smoothAnchorMs +
+                            (currentElapsedUs - _smoothAnchorElapsedUs) /
+                                1000.0 *
+                                effectivePlaybackRate)
                         .clamp(0.0, _duration.inMilliseconds.toDouble());
                     final ptmDelta = newPtmValue - prevPtmValue;
                     // 仅在舍入误差>0.5μs 或 playbackTimeMs 回退时输出
@@ -869,7 +1328,8 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                       final now = DateTime.now().millisecondsSinceEpoch;
                       if (now - _lastDiagRoundTimeMs >= 500) {
                         _lastDiagRoundTimeMs = now;
-                        debugPrint('[DRIFT-ROUND-DIAG] correctionMs=${correctionMs.toStringAsFixed(4)} '
+                        _playbackDiag(() =>
+                            '[DRIFT-ROUND-DIAG] correctionMs=${correctionMs.toStringAsFixed(4)} '
                             'correctionUsExact=${correctionUsExact.toStringAsFixed(2)} '
                             'correctionUsRounded=$correctionUsRounded '
                             'roundError=${roundErrorUs.toStringAsFixed(2)}μs '
@@ -883,7 +1343,8 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 }
                 _lastRawPlayerMs = playerPosition;
                 final newDeltaUs = currentElapsedUs - _smoothAnchorElapsedUs;
-                final newPtm = (_smoothAnchorMs + newDeltaUs / 1000.0 * effectivePlaybackRate)
+                final newPtm = (_smoothAnchorMs +
+                        newDeltaUs / 1000.0 * effectivePlaybackRate)
                     .clamp(0.0, _duration.inMilliseconds.toDouble());
                 // [DRIFT-ROUND-DIAG] 追踪 playbackTimeMs 回退（无论走哪个分支）
                 if (!kReleaseMode) {
@@ -893,8 +1354,9 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                     final now = DateTime.now().millisecondsSinceEpoch;
                     if (now - _lastDiagPtmBackwardMs >= 500) {
                       _lastDiagPtmBackwardMs = now;
-                      debugPrint('[PTM-BACKWARD-DIAG] playbackTimeMs 回退: '
-                          '${prevPtm.toStringAsFixed(1)} → ${newPtm.toStringAsFixed(1)} '
+                      _playbackDiag(() =>
+                          '[PTM-BACKWARD-DIAG] playbackTimeMs 回退: '
+                          '${prevPtm.toStringAsFixed(1)}  ${newPtm.toStringAsFixed(1)} '
                           'delta=${(newPtm - prevPtm).toStringAsFixed(3)}ms '
                           'rate=$effectivePlaybackRate '
                           'anchorMs=${_smoothAnchorMs.toStringAsFixed(1)} '
@@ -902,8 +1364,9 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                     }
                   }
                 }
-                // ✅ P1 单调递增保护：漂移修正后确保 playbackTimeMs 不回退
-                if (newPtm < _playbackTimeMs.value && _playbackTimeMs.value > 100.0) {
+                //  P1 单调递增保护：漂移修正后确保 playbackTimeMs 不回退
+                if (newPtm < _playbackTimeMs.value &&
+                    _playbackTimeMs.value > 100.0) {
                   _smoothAnchorMs = _playbackTimeMs.value;
                   _smoothAnchorElapsedUs = currentElapsedUs;
                   // playbackTimeMs 保持不变（hold），锚点重设到 prevPtm 使后续帧正常推进
@@ -911,21 +1374,53 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                     final now = DateTime.now().millisecondsSinceEpoch;
                     if (now - _lastDiagPtmBackwardMs >= 200) {
                       _lastDiagPtmBackwardMs = now;
-                      debugPrint('[PTM-MONOTONICITY-DIAG] DRIFT-CORRECTION backward prevented: '
+                      _playbackDiag(() =>
+                          '[PTM-MONOTONICITY-DIAG] DRIFT-CORRECTION backward prevented: '
                           'prevPtm=${_playbackTimeMs.value.toStringAsFixed(1)} '
-                          'newPtm=${newPtm.toStringAsFixed(1)} → held at prevPtm, anchor reset');
+                          'newPtm=${newPtm.toStringAsFixed(1)}  held at prevPtm, anchor reset');
                     }
                   }
                 } else {
                   _playbackTimeMs.value = newPtm;
                 }
+                // [CHAIN-A] 全链路回弹诊断 — 平滑时钟层单帧聚合
+                // 捕获正常播放时 player.position 更新导致的 drift 修正最终结果。
+                // 与 painter 侧 [CHAIN-B] 共享墙钟时间戳，按时间排序可看到完整因果链：
+                //   position更新  平滑时钟修正/hold  下一帧 painter drift修正  回弹
+                // branch: small=|drift|<=30ms渐进0.15; big-back=drift>30且playerMs回退0.35渐进;
+                //         big-fwd=drift>30且前进snap; hold=P1单调保护卡住一帧
+                if (!kReleaseMode) {
+                  final finalPtm = _playbackTimeMs.value;
+                  final held =
+                      (newPtm < chainAPrevPtm && chainAPrevPtm > 100.0);
+                  final branch = drift.abs() > 30.0
+                      ? (playerMs < chainAPrevPtm - 5.0
+                          ? 'big-back'
+                          : 'big-fwd')
+                      : 'small';
+                  // 仅在发生 hold/回退/大drift时输出，避免正常帧刷屏
+                  if (held ||
+                      drift.abs() > 15.0 ||
+                      newPtm < chainAPrevPtm - 0.5) {
+                    final now = DateTime.now().millisecondsSinceEpoch;
+                    _playbackDiag(() => '[CHAIN-A] t=$now '
+                        'ptm ${chainAPrevPtm.toStringAsFixed(1)}${finalPtm.toStringAsFixed(1)} '
+                        'drift=${drift.toStringAsFixed(1)}ms '
+                        'playerMs=${playerMs.toStringAsFixed(1)} '
+                        'branch=$branch held=${held ? "YES" : "no"} '
+                        'rate=$effectivePlaybackRate '
+                        'newPtmRaw=${newPtm.toStringAsFixed(1)}');
+                  }
+                }
               } else {
                 // player.position 未变，正常插值推进
-                // ✅ P1 单调递增保护：正常插值也确保不回退
-                final _interpPtm = (_smoothAnchorMs + elapsedDeltaUs / 1000.0 * effectivePlaybackRate)
+                //  P1 单调递增保护：正常插值也确保不回退
+                final _interpPtm = (_smoothAnchorMs +
+                        elapsedDeltaUs / 1000.0 * effectivePlaybackRate)
                     .clamp(0.0, _duration.inMilliseconds.toDouble());
-                if (_interpPtm < _playbackTimeMs.value && _playbackTimeMs.value > 100.0) {
-                  // 插值回退 → 重锚到 prevPtm
+                if (_interpPtm < _playbackTimeMs.value &&
+                    _playbackTimeMs.value > 100.0) {
+                  // 插值回退  重锚到 prevPtm
                   _smoothAnchorMs = _playbackTimeMs.value;
                   _smoothAnchorElapsedUs = currentElapsedUs;
                 } else {
@@ -956,8 +1451,50 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
               _updateWatchHistory();
             }
 
-            // 检测播放结束
-            if (_position.inMilliseconds >= _duration.inMilliseconds - 100) {
+            // 检测播放结束。MDK 在部分文件的 EOF 不会切换为 paused/stopped，
+            // position 也可能停在容器 duration 前数百毫秒，因此额外识别
+            // “已接近末尾且位置持续停滞”，避免单纯扩大阈值而截断片尾。
+            final remainingMs = playerDuration - playerPosition;
+            // [MDK-EOF-GUARD] duration 无效（流媒体未就绪/为 0）时 remaining 恒为负，
+            // 不能判定结束；且需连续 2 个采样（约 100ms）确认，防 position 尖刺误杀。
+            var reachedExactEnd = playerDuration > 0 &&
+                remainingMs >= 0 &&
+                remainingMs <= 100;
+            if (reachedExactEnd) {
+              _exactEndStreak++;
+              if (_exactEndStreak < 2) reachedExactEnd = false;
+            } else {
+              _exactEndStreak = 0;
+            }
+            var reachedMdkStalledEnd = false;
+            if (player.getPlayerKernelName() == 'MDK' &&
+                remainingMs >= 0 &&
+                remainingMs <= 1500) {
+              final positionIsStalled = _mdkNearEndLastPositionMs >= 0 &&
+                  (playerPosition - _mdkNearEndLastPositionMs).abs() <= 20;
+              if (positionIsStalled) {
+                _mdkNearEndStalledSinceMs = _mdkNearEndStalledSinceMs == 0
+                    ? nowTime
+                    : _mdkNearEndStalledSinceMs;
+                reachedMdkStalledEnd = shouldTreatMdkPositionAsEnded(
+                  remainingMs: remainingMs,
+                  movementMs: playerPosition - _mdkNearEndLastPositionMs,
+                  stalledDurationMs: nowTime - _mdkNearEndStalledSinceMs,
+                );
+              } else {
+                _mdkNearEndStalledSinceMs = 0;
+              }
+              _mdkNearEndLastPositionMs = playerPosition;
+            } else {
+              _mdkNearEndLastPositionMs = -1;
+              _mdkNearEndStalledSinceMs = 0;
+            }
+
+            if (reachedExactEnd || reachedMdkStalledEnd) {
+              debugPrint('[Player] EOF 检测触发: kernel=${player.getPlayerKernelName()} '
+                  'remaining=${remainingMs}ms exact=$reachedExactEnd '
+                  'mdkStalled=$reachedMdkStalledEnd pos=$playerPosition '
+                  'duration=$playerDuration');
               player.state = PlaybackState.paused;
               _setStatus(PlayerStatus.paused, message: '播放结束');
               if (_currentVideoPath != null) {
@@ -965,6 +1502,13 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 debugPrint(
                     'VideoPlayerState: Video ended, explicitly saved position 0 for $_currentVideoPath');
                 await _updateWatchHistory(forceRemoteSync: true);
+                unawaited(
+                  AutoSyncService.instance
+                      .syncOnPlaybackEnd()
+                      .catchError((error) {
+                    debugPrint('播放结束时增量同步失败: $error');
+                  }),
+                );
 
                 // Jellyfin同步：如果是Jellyfin流媒体，报告播放结束
                 if (_currentVideoPath!.startsWith('jellyfin://')) {
@@ -976,16 +1520,23 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                   _handleEmbyPlaybackEnd(_currentVideoPath!);
                 }
 
-                // 播放结束时触发自动云同步
-                try {
-                  await AutoSyncService.instance.syncOnPlaybackEnd();
-                } catch (e) {
-                  debugPrint('播放结束时云同步失败: $e');
-                }
-
                 // 根据用户设置处理播放结束行为
                 await _handlePlaybackEndAction();
               }
+            }
+
+            // 播放停滞诊断：状态为 playing 但真实位置 3s 无推进
+            final posForStallDiag = _position.inMilliseconds;
+            if (posForStallDiag == _lastStallDiagPositionMs) {
+              if (nowTime - _lastStallDiagAtMs >= 3000 &&
+                  nowTime - _lastStallDiagLoggedAtMs >= 5000) {
+                _lastStallDiagLoggedAtMs = nowTime;
+                debugPrint('[Player] 位置停滞诊断: status=playing 但位置 3s 未推进 '
+                    'pos=${posForStallDiag}ms kernel=${player.getPlayerKernelName()}');
+              }
+            } else {
+              _lastStallDiagPositionMs = posForStallDiag;
+              _lastStallDiagAtMs = nowTime;
             }
 
             if (shouldUiNotify) {
@@ -999,9 +1550,19 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
 
             // 如果之前已经有有效的时长信息，而现在临时返回0，可能是正常的操作过程
             final bool hasValidDurationBefore = _duration.inMilliseconds > 0;
-            final bool isTemporaryInvalid = hasValidDurationBefore &&
-                playerPosition == 0 &&
-                playerDuration == 0;
+            final bool isTemporaryInvalid =
+                hasValidDurationBefore && playerDuration == 0;
+            final bool isMediaLoadPending = player.supportsMediaLoadReadiness &&
+                !player.isMediaReady &&
+                !player.hasMediaLoadFailed;
+            final bool isReadyUnknownDurationMedia =
+                player.supportsMediaLoadReadiness &&
+                    player.isMediaReady &&
+                    playerDuration == 0;
+            final bool isWaitingForFirstRealPosition =
+                player.supportsMediaLoadReadiness &&
+                    !player.hasReceivedRealPosition &&
+                    playerDuration == 0;
 
             final bool isStreamingPath =
                 (_currentVideoPath?.startsWith('jellyfin://') ?? false) ||
@@ -1031,6 +1592,10 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
                 _currentVideoPath == null && _status == PlayerStatus.idle;
 
             if (isTemporaryInvalid ||
+                isMediaLoadPending ||
+                isReadyUnknownDurationMedia ||
+                isWaitingForFirstRealPosition ||
+                _status == PlayerStatus.loading ||
                 isStreamingStartupGrace ||
                 isJellyfinInitializing ||
                 isPlayerResetting ||
@@ -1075,15 +1640,7 @@ extension VideoPlayerStateNavigation on VideoPlayerState {
             _duration = Duration.zero;
             _bufferedPositionMs = 0;
 
-            WidgetsBinding.instance.addPostFrameCallback((_) async {
-              // 1. 执行 handleBackButton 逻辑 (处理全屏、截图等)
-              await handleBackButton();
-
-              // 2. DO NOT call resetPlayer() here. The dialog's action will call it.
-
-              // 3. 通知UI层执行pop/显示对话框等
-              onSeriousPlaybackErrorAndShouldPop?.call();
-            });
+            _notifySeriousPlaybackErrorAfterFrame();
 
             return;
           }

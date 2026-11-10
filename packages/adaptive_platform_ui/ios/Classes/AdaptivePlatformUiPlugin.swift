@@ -14,6 +14,8 @@ public class AdaptivePlatformUiPlugin: NSObject, FlutterPlugin {
             NativeOverlayManager.shared.handle(call, result: result)
         }
 
+        registerMediaDetailControls(with: registrar)
+
         // Initialize iOS 26+ Native Tab Bar Manager
         if #available(iOS 26.0, *) {
             iOS26NativeTabBarManager.shared.setup(messenger: registrar.messenger())
@@ -24,6 +26,12 @@ public class AdaptivePlatformUiPlugin: NSObject, FlutterPlugin {
         registrar.register(
             ios26ButtonFactory,
             withId: "adaptive_platform_ui/ios26_button"
+        )
+
+        let ios26ButtonGroupFactory = iOS26ButtonGroupViewFactory(messenger: registrar.messenger())
+        registrar.register(
+            ios26ButtonGroupFactory,
+            withId: "adaptive_platform_ui/ios26_button_group"
         )
 
         // Register iOS 26 Switch platform view factory

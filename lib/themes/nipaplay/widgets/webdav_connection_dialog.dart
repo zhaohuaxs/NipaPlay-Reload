@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_dialog.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/tvos_remote_text_input_scope.dart';
 import 'package:nipaplay/services/webdav_service.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
 
@@ -46,6 +47,7 @@ class _WebDAVFormState extends State<_WebDAVForm> {
   final _formKey = GlobalKey<FormState>();
   final _nameController = TextEditingController();
   final _urlController = TextEditingController();
+  final _wanUrlController = TextEditingController();
   final _usernameController = TextEditingController();
   final _passwordController = TextEditingController();
 
@@ -58,6 +60,7 @@ class _WebDAVFormState extends State<_WebDAVForm> {
     if (widget.editConnection != null) {
       _nameController.text = widget.editConnection!.name;
       _urlController.text = widget.editConnection!.url;
+      _wanUrlController.text = widget.editConnection!.wanUrl;
       _usernameController.text = widget.editConnection!.username;
       _passwordController.text = widget.editConnection!.password;
     } else {
@@ -70,6 +73,7 @@ class _WebDAVFormState extends State<_WebDAVForm> {
   void dispose() {
     _nameController.dispose();
     _urlController.dispose();
+    _wanUrlController.dispose();
     _usernameController.dispose();
     _passwordController.dispose();
     super.dispose();
@@ -101,6 +105,15 @@ class _WebDAVFormState extends State<_WebDAVForm> {
         }
         return textColor;
       }),
+      backgroundColor: WidgetStateProperty.resolveWith((states) =>
+          states.contains(WidgetState.focused)
+              ? accentColor.withValues(alpha: 0.18)
+              : Colors.transparent),
+      side: WidgetStateProperty.resolveWith((states) => BorderSide(
+          color: states.contains(WidgetState.focused)
+              ? accentColor
+              : Colors.transparent,
+          width: 2)),
       overlayColor: MaterialStateProperty.all(Colors.transparent),
       splashFactory: NoSplash.splashFactory,
       padding: MaterialStateProperty.all(
@@ -146,139 +159,209 @@ class _WebDAVFormState extends State<_WebDAVForm> {
 
     return TextSelectionTheme(
       data: selectionTheme,
-      child: Form(
-        key: _formKey,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text(
-              'WebDAV服务器只会建立连接，不会自动扫描。\n您可以在连接后手动选择要扫描的文件夹。',
-              style: TextStyle(
-                color: subTextColor,
-                fontSize: 13,
+      child: TvOSRemoteTextInputGroup(
+        title:
+            widget.editConnection == null ? '添加 WebDAV 服务器' : '编辑 WebDAV 服务器',
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'WebDAV服务器只会建立连接，不会自动扫描。\n您可以在连接后手动选择要扫描的文件夹。',
+                style: TextStyle(
+                  color: subTextColor,
+                  fontSize: 13,
+                ),
+                textAlign: TextAlign.center,
               ),
-              textAlign: TextAlign.center,
-            ),
-            SizedBox(height: 24),
+              SizedBox(height: 24),
 
-            // 连接名称
-            TextFormField(
-              controller: _nameController,
-              cursorColor: accentColor,
-              style: TextStyle(color: textColor),
-              decoration: buildDecoration(
-                label: '连接名称（可选）',
-                hint: '留空则自动生成',
-              ),
-              validator: (value) {
-                // 连接名称现在是可选的，不需要验证
-                return null;
-              },
-            ),
-
-            SizedBox(height: 16),
-
-            // WebDAV URL
-            TextFormField(
-              controller: _urlController,
-              cursorColor: accentColor,
-              style: TextStyle(color: textColor),
-              decoration: buildDecoration(
-                label: 'WebDAV地址',
-                hint: 'https://your-server.com/webdav',
-              ),
-              validator: (value) {
-                if (value == null || value.trim().isEmpty) {
-                  return '请输入WebDAV地址';
-                }
-                if (!value.startsWith('http://') &&
-                    !value.startsWith('https://')) {
-                  return '请输入有效的URL地址';
-                }
-                return null;
-              },
-            ),
-
-            SizedBox(height: 16),
-
-            // 用户名
-            TextFormField(
-              controller: _usernameController,
-              cursorColor: accentColor,
-              style: TextStyle(color: textColor),
-              decoration: buildDecoration(
-                label: '用户名',
-                hint: '可选，如果服务器需要认证',
-              ),
-            ),
-
-            SizedBox(height: 16),
-
-            // 密码
-            TextFormField(
-              controller: _passwordController,
-              obscureText: !_passwordVisible,
-              cursorColor: accentColor,
-              style: TextStyle(color: textColor),
-              decoration: buildDecoration(
-                label: '密码',
-                hint: '可选，如果服务器需要认证',
-                suffixIcon: IconButton(
-                  icon: Icon(
-                    _passwordVisible ? Icons.visibility : Icons.visibility_off,
-                    color: accentColor,
+              // 连接名称
+              TvOSRemoteTextInputControl(
+                title: '连接名称（可选）',
+                fieldId: 'name',
+                child: TextFormField(
+                  controller: _nameController,
+                  cursorColor: accentColor,
+                  style: TextStyle(color: textColor),
+                  decoration: buildDecoration(
+                    label: '连接名称（可选）',
+                    hint: '留空则自动生成',
                   ),
-                  onPressed: () {
-                    setState(() {
-                      _passwordVisible = !_passwordVisible;
-                    });
+                  validator: (value) {
+                    // 连接名称现在是可选的，不需要验证
+                    return null;
                   },
-                  style: IconButton.styleFrom(
-                    overlayColor: Colors.transparent,
+                ),
+              ),
+
+              SizedBox(height: 16),
+
+              // 内网地址
+              TvOSRemoteTextInputControl(
+                title: '内网地址',
+                fieldId: 'url',
+                child: TextFormField(
+                  controller: _urlController,
+                  keyboardType: TextInputType.url,
+                  cursorColor: accentColor,
+                  style: TextStyle(color: textColor),
+                  decoration: buildDecoration(
+                    label: '内网地址',
+                    hint: 'http://192.168.1.1:5244/dav',
+                  ),
+                  validator: (value) {
+                    final trimmed = (value ?? '').trim();
+                    if (trimmed.isNotEmpty &&
+                        !trimmed.startsWith('http://') &&
+                        !trimmed.startsWith('https://')) {
+                      return '请输入有效的URL地址';
+                    }
+                    if (_urlController.text.trim().isEmpty &&
+                        _wanUrlController.text.trim().isEmpty) {
+                      return '请至少填写内网地址或公网地址其中之一';
+                    }
+                    return null;
+                  },
+                ),
+              ),
+
+              SizedBox(height: 16),
+
+              // 公网地址
+              TvOSRemoteTextInputControl(
+                title: '公网地址',
+                fieldId: 'wanUrl',
+                child: TextFormField(
+                  controller: _wanUrlController,
+                  keyboardType: TextInputType.url,
+                  cursorColor: accentColor,
+                  style: TextStyle(color: textColor),
+                  decoration: buildDecoration(
+                    label: '公网地址',
+                    hint: 'https://your-server.com/dav',
+                  ),
+                  validator: (value) {
+                    final trimmed = (value ?? '').trim();
+                    if (trimmed.isNotEmpty &&
+                        !trimmed.startsWith('http://') &&
+                        !trimmed.startsWith('https://')) {
+                      return '请输入有效的URL地址';
+                    }
+                    return null;
+                  },
+                ),
+              ),
+
+              SizedBox(height: 16),
+
+              // 用户名
+              TvOSRemoteTextInputControl(
+                title: '用户名',
+                fieldId: 'username',
+                child: TextFormField(
+                  controller: _usernameController,
+                  cursorColor: accentColor,
+                  style: TextStyle(color: textColor),
+                  decoration: buildDecoration(
+                    label: '用户名',
+                    hint: '可选，如果服务器需要认证',
                   ),
                 ),
               ),
-            ),
 
-            SizedBox(height: 24),
+              SizedBox(height: 16),
 
-            // 按钮行
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                TextButton(
-                  onPressed: _isLoading
-                      ? null
-                      : () => Navigator.of(context).pop(false),
-                  style: plainButtonStyle,
-                  child: const Text('取消'),
+              // 密码
+              TvOSRemoteTextInputControl(
+                title: '密码',
+                fieldId: 'password',
+                obscureText: true,
+                child: TextFormField(
+                  controller: _passwordController,
+                  obscureText: !_passwordVisible,
+                  keyboardType: TextInputType.visiblePassword,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  smartDashesType: SmartDashesType.disabled,
+                  smartQuotesType: SmartQuotesType.disabled,
+                  cursorColor: accentColor,
+                  style: TextStyle(color: textColor),
+                  decoration: buildDecoration(
+                    label: '密码',
+                    hint: '可选，如果服务器需要认证',
+                    suffixIcon: IconButton(
+                      icon: Icon(
+                        _passwordVisible
+                            ? Icons.visibility
+                            : Icons.visibility_off,
+                        color: accentColor,
+                      ),
+                      onPressed: () {
+                        setState(() {
+                          _passwordVisible = !_passwordVisible;
+                        });
+                      },
+                      style: IconButton.styleFrom(
+                        overlayColor: Colors.transparent,
+                      ).copyWith(
+                        backgroundColor: WidgetStateProperty.resolveWith(
+                            (states) => states.contains(WidgetState.focused)
+                                ? accentColor.withValues(alpha: 0.18)
+                                : Colors.transparent),
+                        side: WidgetStateProperty.resolveWith((states) =>
+                            BorderSide(
+                                color: states.contains(WidgetState.focused)
+                                    ? accentColor
+                                    : Colors.transparent,
+                                width: 2)),
+                      ),
+                    ),
+                  ),
                 ),
-                SizedBox(width: 12),
-                TextButton(
-                  onPressed: _isLoading ? null : _testConnection,
-                  style: accentButtonStyle,
-                  child: _isLoading
-                      ? SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            valueColor:
-                                AlwaysStoppedAnimation<Color>(accentColor),
-                          ),
-                        )
-                      : const Text('测试连接'),
-                ),
-                SizedBox(width: 12),
-                TextButton(
-                  onPressed: _isLoading ? null : _saveConnection,
-                  style: accentButtonStyle,
-                  child: Text(widget.editConnection == null ? '添加' : '保存'),
-                ),
-              ],
-            ),
-          ],
+              ),
+
+              SizedBox(height: 24),
+
+              // 按钮行
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: _isLoading
+                        ? null
+                        : () => Navigator.of(context).pop(false),
+                    style: plainButtonStyle,
+                    child: const Text('取消'),
+                  ),
+                  SizedBox(width: 12),
+                  TextButton(
+                    onPressed: _isLoading ? null : _testConnection,
+                    style: accentButtonStyle,
+                    child: _isLoading
+                        ? SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor:
+                                  AlwaysStoppedAnimation<Color>(accentColor),
+                            ),
+                          )
+                        : const Text('测试连接'),
+                  ),
+                  SizedBox(width: 12),
+                  TextButton(
+                    onPressed: _isLoading ? null : _saveConnection,
+                    style: accentButtonStyle,
+                    child: Text(widget.editConnection == null ? '添加' : '保存'),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -299,7 +382,10 @@ class _WebDAVFormState extends State<_WebDAVForm> {
       // 如果没有提供连接名称，自动生成用于测试
       if (connectionName.isEmpty) {
         try {
-          final uri = Uri.parse(_urlController.text.trim());
+          final lanUrl = _urlController.text.trim();
+          final primaryAddress =
+              lanUrl.isNotEmpty ? lanUrl : _wanUrlController.text.trim();
+          final uri = Uri.parse(primaryAddress);
           final username = _usernameController.text.trim();
 
           if (username.isNotEmpty) {
@@ -313,8 +399,10 @@ class _WebDAVFormState extends State<_WebDAVForm> {
       }
 
       final connection = WebDAVConnection(
+        id: widget.editConnection?.id,
         name: connectionName,
         url: _urlController.text.trim(),
+        wanUrl: _wanUrlController.text.trim(),
         username: _usernameController.text.trim(),
         password: _passwordController.text.trim(),
       );
@@ -363,7 +451,10 @@ class _WebDAVFormState extends State<_WebDAVForm> {
 
       // 如果没有提供连接名称，自动生成
       if (connectionName.isEmpty) {
-        final uri = Uri.parse(_urlController.text.trim());
+        final lanUrl = _urlController.text.trim();
+        final primaryAddress =
+            lanUrl.isNotEmpty ? lanUrl : _wanUrlController.text.trim();
+        final uri = Uri.parse(primaryAddress);
         final username = _usernameController.text.trim();
 
         if (username.isNotEmpty) {
@@ -374,8 +465,10 @@ class _WebDAVFormState extends State<_WebDAVForm> {
       }
 
       final connection = WebDAVConnection(
+        id: widget.editConnection?.id,
         name: connectionName,
         url: _urlController.text.trim(),
+        wanUrl: _wanUrlController.text.trim(),
         username: _usernameController.text.trim(),
         password: _passwordController.text.trim(),
       );
@@ -384,12 +477,7 @@ class _WebDAVFormState extends State<_WebDAVForm> {
       if (widget.onSave != null) {
         success = await widget.onSave!(connection);
       } else {
-        if (widget.editConnection != null) {
-          // 如果是编辑模式，先删除旧连接
-          await WebDAVService.instance
-              .removeConnection(widget.editConnection!.name);
-        }
-        success = await WebDAVService.instance.addConnection(connection);
+        success = await WebDAVService.instance.upsertConnection(connection);
       }
 
       if (mounted) {

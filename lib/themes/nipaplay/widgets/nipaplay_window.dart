@@ -4,8 +4,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:nipaplay/providers/appearance_settings_provider.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/cached_network_image_widget.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_home_page.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/large_screen_mode_scope.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/large_screen_window_page.dart';
+import 'package:nipaplay/services/large_screen_ui_sfx_service.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
 import 'package:nipaplay/utils/hotkey_service.dart';
 import 'package:provider/provider.dart';
@@ -19,22 +21,35 @@ class NipaplayWindowScaffold extends StatefulWidget {
     this.backgroundImageUrl,
     this.backgroundColor,
     this.blurBackground = false,
+    this.backdropBlurSigma = 0,
+    this.borderColor,
     this.onClose,
     this.topRightAction,
     this.maxWidth = 850,
     this.maxHeightFactor = 0.8,
+    this.respectMaxSizeInFilledScreen = false,
     this.showCloseButton = true,
+    this.embedded = false,
   });
 
   final Widget child;
   final String? backgroundImageUrl;
   final Color? backgroundColor;
   final bool blurBackground;
+
+  /// Blurs the content behind the window. Unlike [blurBackground], this does
+  /// not require the window to provide its own background image.
+  final double backdropBlurSigma;
+  final Color? borderColor;
   final VoidCallback? onClose;
   final Widget? topRightAction;
   final double maxWidth;
   final double maxHeightFactor;
+
+  /// Keeps [maxWidth] and [maxHeightFactor] active in filled-screen mode.
+  final bool respectMaxSizeInFilledScreen;
   final bool showCloseButton;
+  final bool embedded;
 
   @override
   State<NipaplayWindowScaffold> createState() => _NipaplayWindowScaffoldState();
@@ -135,8 +150,38 @@ class _NipaplayWindowScaffoldState extends State<NipaplayWindowScaffold> {
     });
   }
 
+  void _toggleWindowDisplayMode(AppearanceSettingsProvider settings) {
+    final nextMode =
+        settings.windowDisplayMode == NipaplayWindowDisplayMode.filledScreen
+            ? NipaplayWindowDisplayMode.windowed
+            : NipaplayWindowDisplayMode.filledScreen;
+    if (_offset != Offset.zero) {
+      setState(() {
+        _offset = Offset.zero;
+      });
+    }
+    settings.setWindowDisplayMode(nextMode);
+  }
+
   VoidCallback _resolveCloseHandler(BuildContext context) {
     return widget.onClose ?? () => Navigator.of(context).maybePop();
+  }
+
+  Widget _applyBackdropBlur({
+    required BorderRadius borderRadius,
+    required Widget child,
+  }) {
+    if (widget.backdropBlurSigma <= 0) return child;
+    return ClipRRect(
+      borderRadius: borderRadius,
+      child: BackdropFilter(
+        filter: ui.ImageFilter.blur(
+          sigmaX: widget.backdropBlurSigma,
+          sigmaY: widget.backdropBlurSigma,
+        ),
+        child: child,
+      ),
+    );
   }
 
   Widget _buildMacCloseButton(BuildContext context) {
@@ -202,6 +247,13 @@ class _NipaplayWindowScaffoldState extends State<NipaplayWindowScaffold> {
 
   @override
   Widget build(BuildContext context) {
+    if (widget.embedded) {
+      return Material(
+        type: MaterialType.transparency,
+        child: widget.child,
+      );
+    }
+
     final appearanceSettings = context.watch<AppearanceSettingsProvider>();
     final bool useFilledScreenLayout = appearanceSettings.windowDisplayMode ==
         NipaplayWindowDisplayMode.filledScreen;
@@ -212,6 +264,7 @@ class _NipaplayWindowScaffoldState extends State<NipaplayWindowScaffold> {
     final bool useMacStyleCloseButton = _useMacStyleCloseButton();
     final Widget? topRightAction = widget.topRightAction;
     final bool showCloseButton = widget.showCloseButton;
+    final bool usePhoneBottomSheetLayout = globals.isPhone && !globals.isTablet;
     final mediaQuery = MediaQuery.of(context);
     final EdgeInsets safePadding = mediaQuery.padding;
     final Size screenSize = mediaQuery.size;
@@ -221,12 +274,21 @@ class _NipaplayWindowScaffoldState extends State<NipaplayWindowScaffold> {
     final double bottomMargin = useFilledScreenLayout
         ? safePadding.bottom + _filledScreenMargin
         : _windowedMargin;
+    final double filledScreenMaxWidth =
+        (screenSize.width - horizontalMargin * 2).clamp(0.0, screenSize.width);
+    final double filledScreenMaxHeight =
+        (screenSize.height - topMargin - bottomMargin)
+            .clamp(0.0, screenSize.height);
     final double effectiveMaxWidth = useFilledScreenLayout
-        ? (screenSize.width - horizontalMargin * 2).clamp(0.0, screenSize.width)
+        ? (widget.respectMaxSizeInFilledScreen
+            ? widget.maxWidth.clamp(0.0, filledScreenMaxWidth)
+            : filledScreenMaxWidth)
         : widget.maxWidth;
     final double effectiveMaxHeight = useFilledScreenLayout
-        ? (screenSize.height - topMargin - bottomMargin)
-            .clamp(0.0, screenSize.height)
+        ? (widget.respectMaxSizeInFilledScreen
+            ? (screenSize.height * widget.maxHeightFactor)
+                .clamp(0.0, filledScreenMaxHeight)
+            : filledScreenMaxHeight)
         : screenSize.height * widget.maxHeightFactor;
     final double windowControlPadding =
         globals.isTablet ? _windowControlPadding + 3 : _windowControlPadding;
@@ -243,6 +305,127 @@ class _NipaplayWindowScaffoldState extends State<NipaplayWindowScaffold> {
         .style
         .merge(windowTheme.textTheme.bodyMedium)
         .copyWith(color: textColor);
+
+    if (usePhoneBottomSheetLayout) {
+      final double maxSheetHeight = (screenSize.height - safePadding.top - 12)
+          .clamp(0.0, screenSize.height);
+      const BorderRadius sheetBorderRadius = BorderRadius.vertical(
+        top: Radius.circular(24),
+      );
+      final Widget? phoneTopRightAction = topRightAction;
+
+      return Theme(
+        data: windowTheme,
+        child: Scaffold(
+          backgroundColor: Colors.transparent,
+          body: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: widget.onClose == null ? null : _handleBackgroundTap,
+            child: Stack(
+              children: [
+                Align(
+                  alignment: Alignment.bottomCenter,
+                  child: GestureDetector(
+                    onTap: () {},
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        minWidth: screenSize.width,
+                        maxWidth: screenSize.width,
+                        maxHeight: maxSheetHeight * widget.maxHeightFactor,
+                      ),
+                      child: _applyBackdropBlur(
+                        borderRadius: sheetBorderRadius,
+                        child: Material(
+                          color: bgColor,
+                          borderRadius: sheetBorderRadius,
+                          clipBehavior: Clip.antiAlias,
+                          child: Stack(
+                            children: [
+                              if (widget.backgroundImageUrl != null &&
+                                  widget.backgroundImageUrl!.isNotEmpty)
+                                Positioned.fill(
+                                  child: ImageFiltered(
+                                    imageFilter: widget.blurBackground
+                                        ? ui.ImageFilter.blur(
+                                            sigmaX: 40,
+                                            sigmaY: 40,
+                                          )
+                                        : ui.ImageFilter.blur(
+                                            sigmaX: 0,
+                                            sigmaY: 0,
+                                          ),
+                                    child: Opacity(
+                                      opacity: isDark ? 0.25 : 0.35,
+                                      child: CachedNetworkImageWidget(
+                                        imageUrl: widget.backgroundImageUrl!,
+                                        fit: BoxFit.cover,
+                                        shouldCompress: false,
+                                        loadMode: CachedImageLoadMode.hybrid,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              Positioned.fill(
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    gradient: LinearGradient(
+                                      begin: Alignment.topCenter,
+                                      end: Alignment.bottomCenter,
+                                      colors: [
+                                        bgColor.withValues(alpha: 0.1),
+                                        bgColor.withValues(alpha: 0.4),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              DefaultTextStyle(
+                                style: windowTextStyle,
+                                child: Padding(
+                                  padding: EdgeInsets.only(
+                                    top: _contentTopPadding,
+                                    bottom: safePadding.bottom,
+                                  ),
+                                  child: widget.child,
+                                ),
+                              ),
+                              if (showCloseButton &&
+                                  phoneTopRightAction == null)
+                                Positioned(
+                                  top: windowControlPadding,
+                                  right: windowControlPadding,
+                                  child: _buildFluentCloseButton(context),
+                                ),
+                              if (phoneTopRightAction != null)
+                                Positioned(
+                                  top: windowControlPadding,
+                                  right: windowControlPadding,
+                                  child: showCloseButton
+                                      ? Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            phoneTopRightAction,
+                                            const SizedBox(
+                                              width: _windowControlGap,
+                                            ),
+                                            _buildFluentCloseButton(context),
+                                          ],
+                                        )
+                                      : phoneTopRightAction,
+                                ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
 
     return Theme(
       data: windowTheme,
@@ -273,6 +456,9 @@ class _NipaplayWindowScaffoldState extends State<NipaplayWindowScaffold> {
                         child: Container(
                           decoration: BoxDecoration(
                             borderRadius: windowBorderRadius,
+                            border: widget.borderColor == null
+                                ? null
+                                : Border.all(color: widget.borderColor!),
                             boxShadow: [
                               BoxShadow(
                                 color: Colors.black.withValues(alpha: 0.2),
@@ -281,104 +467,118 @@ class _NipaplayWindowScaffoldState extends State<NipaplayWindowScaffold> {
                               ),
                             ],
                           ),
-                          child: Material(
-                            color: bgColor,
+                          child: _applyBackdropBlur(
                             borderRadius: windowBorderRadius,
-                            clipBehavior: Clip.antiAlias,
-                            child: Stack(
-                              children: [
-                                if (widget.backgroundImageUrl != null &&
-                                    widget.backgroundImageUrl!.isNotEmpty)
+                            child: Material(
+                              color: bgColor,
+                              borderRadius: windowBorderRadius,
+                              clipBehavior: Clip.antiAlias,
+                              child: Stack(
+                                children: [
+                                  if (widget.backgroundImageUrl != null &&
+                                      widget.backgroundImageUrl!.isNotEmpty)
+                                    Positioned.fill(
+                                      child: ImageFiltered(
+                                        imageFilter: widget.blurBackground
+                                            ? ui.ImageFilter.blur(
+                                                sigmaX: 40, sigmaY: 40)
+                                            : ui.ImageFilter.blur(
+                                                sigmaX: 0, sigmaY: 0),
+                                        child: Opacity(
+                                          opacity: isDark ? 0.25 : 0.35,
+                                          child: CachedNetworkImageWidget(
+                                            imageUrl:
+                                                widget.backgroundImageUrl!,
+                                            fit: BoxFit.cover,
+                                            shouldCompress: false,
+                                            loadMode:
+                                                CachedImageLoadMode.hybrid,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
                                   Positioned.fill(
-                                    child: ImageFiltered(
-                                      imageFilter: widget.blurBackground
-                                          ? ui.ImageFilter.blur(
-                                              sigmaX: 40, sigmaY: 40)
-                                          : ui.ImageFilter.blur(
-                                              sigmaX: 0, sigmaY: 0),
-                                      child: Opacity(
-                                        opacity: isDark ? 0.25 : 0.35,
-                                        child: CachedNetworkImageWidget(
-                                          imageUrl: widget.backgroundImageUrl!,
-                                          fit: BoxFit.cover,
-                                          shouldCompress: false,
-                                          loadMode: CachedImageLoadMode.hybrid,
+                                    child: Container(
+                                      decoration: BoxDecoration(
+                                        gradient: LinearGradient(
+                                          begin: Alignment.topCenter,
+                                          end: Alignment.bottomCenter,
+                                          colors: [
+                                            bgColor.withValues(alpha: 0.1),
+                                            bgColor.withValues(alpha: 0.4),
+                                          ],
                                         ),
                                       ),
                                     ),
                                   ),
-                                Positioned.fill(
-                                  child: Container(
-                                    decoration: BoxDecoration(
-                                      gradient: LinearGradient(
-                                        begin: Alignment.topCenter,
-                                        end: Alignment.bottomCenter,
-                                        colors: [
-                                          bgColor.withValues(alpha: 0.1),
-                                          bgColor.withValues(alpha: 0.4),
-                                        ],
+                                  DefaultTextStyle(
+                                    style: windowTextStyle,
+                                    child: NipaplayWindowPositionProvider(
+                                      onMove: _applyWindowOffset,
+                                      onToggleDisplayMode: () =>
+                                          _toggleWindowDisplayMode(
+                                        appearanceSettings,
+                                      ),
+                                      child: Padding(
+                                        padding: const EdgeInsets.only(
+                                          top: _contentTopPadding,
+                                        ),
+                                        child: widget.child,
                                       ),
                                     ),
                                   ),
-                                ),
-                                DefaultTextStyle(
-                                  style: windowTextStyle,
-                                  child: NipaplayWindowPositionProvider(
-                                    onMove: _applyWindowOffset,
-                                    child: Padding(
-                                      padding: const EdgeInsets.only(
-                                        top: _contentTopPadding,
-                                      ),
-                                      child: widget.child,
-                                    ),
-                                  ),
-                                ),
-                                Positioned(
-                                  top: 0,
-                                  left: 0,
-                                  right: 0,
-                                  height: _contentTopPadding,
-                                  child: GestureDetector(
-                                    behavior: HitTestBehavior.translucent,
-                                    onPanUpdate: (details) =>
-                                        _applyWindowOffset(details.delta),
-                                  ),
-                                ),
-                                if (showCloseButton && useMacStyleCloseButton)
                                   Positioned(
                                     top: 0,
                                     left: 0,
-                                    child: _buildMacCloseButton(context),
-                                  )
-                                else if (showCloseButton &&
-                                    topRightAction == null)
-                                  Positioned(
-                                    top: windowControlPadding,
-                                    right: windowControlPadding,
-                                    child: _buildFluentCloseButton(context),
+                                    right: 0,
+                                    height: _contentTopPadding,
+                                    child: GestureDetector(
+                                      behavior: HitTestBehavior.translucent,
+                                      onDoubleTap: () =>
+                                          _toggleWindowDisplayMode(
+                                        appearanceSettings,
+                                      ),
+                                      onPanUpdate: (details) =>
+                                          _applyWindowOffset(details.delta),
+                                    ),
                                   ),
-                                if (topRightAction != null)
-                                  Positioned(
-                                    top: windowControlPadding,
-                                    right: windowControlPadding,
-                                    child: showCloseButton
-                                        ? (useMacStyleCloseButton
-                                            ? topRightAction
-                                            : Row(
-                                                mainAxisSize: MainAxisSize.min,
-                                                children: [
-                                                  topRightAction,
-                                                  const SizedBox(
-                                                    width: _windowControlGap,
-                                                  ),
-                                                  _buildFluentCloseButton(
-                                                    context,
-                                                  ),
-                                                ],
-                                              ))
-                                        : topRightAction,
-                                  ),
-                              ],
+                                  if (showCloseButton && useMacStyleCloseButton)
+                                    Positioned(
+                                      top: 0,
+                                      left: 0,
+                                      child: _buildMacCloseButton(context),
+                                    )
+                                  else if (showCloseButton &&
+                                      topRightAction == null)
+                                    Positioned(
+                                      top: windowControlPadding,
+                                      right: windowControlPadding,
+                                      child: _buildFluentCloseButton(context),
+                                    ),
+                                  if (topRightAction != null)
+                                    Positioned(
+                                      top: windowControlPadding,
+                                      right: windowControlPadding,
+                                      child: showCloseButton
+                                          ? (useMacStyleCloseButton
+                                              ? topRightAction
+                                              : Row(
+                                                  mainAxisSize:
+                                                      MainAxisSize.min,
+                                                  children: [
+                                                    topRightAction,
+                                                    const SizedBox(
+                                                      width: _windowControlGap,
+                                                    ),
+                                                    _buildFluentCloseButton(
+                                                      context,
+                                                    ),
+                                                  ],
+                                                ))
+                                          : topRightAction,
+                                    ),
+                                ],
+                              ),
                             ),
                           ),
                         ),
@@ -398,9 +598,11 @@ class _NipaplayWindowScaffoldState extends State<NipaplayWindowScaffold> {
 /// 用于在窗口内容中处理拖动的手势提供者
 class NipaplayWindowPositionProvider extends InheritedWidget {
   final Function(Offset delta) onMove;
+  final VoidCallback onToggleDisplayMode;
 
   const NipaplayWindowPositionProvider({
     required this.onMove,
+    required this.onToggleDisplayMode,
     required super.child,
     super.key,
   });
@@ -432,14 +634,31 @@ class NipaplayWindow {
 
     Future<T?> result;
     if (useLargeScreenSubPage) {
+      context.read<LargeScreenUiSfxService>().playOpenSubPage();
       result = Navigator.of(context).push<T>(
         NipaplayLargeScreenWindowPageRoute<T>(
-          builder: (_) => child,
+          builder: (_) => NipaplayLargeScreenModeScope(
+            isActive: true,
+            child: Material(
+              type: MaterialType.transparency,
+              child: NipaplayLargeScreenContentPage(
+                closeOnBack: true,
+                child: child,
+              ),
+            ),
+          ),
           enableAnimation: enableAnimation,
           dismissible: barrierDismissible,
         ),
       );
+      result.then((_) {
+        if (context.mounted) {
+          context.read<LargeScreenUiSfxService>().playCloseSubPage();
+        }
+      });
     } else {
+      final bool usePhoneBottomSheetLayout =
+          globals.isPhone && !globals.isTablet;
       result = showGeneralDialog<T>(
         context: context,
         barrierDismissible: barrierDismissible,
@@ -458,8 +677,22 @@ class NipaplayWindow {
           }
           final curvedAnimation = CurvedAnimation(
             parent: animation,
-            curve: Curves.easeOutBack,
+            curve: usePhoneBottomSheetLayout
+                ? Curves.easeOutCubic
+                : Curves.easeOutBack,
           );
+          if (usePhoneBottomSheetLayout) {
+            return SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(0, 1),
+                end: Offset.zero,
+              ).animate(curvedAnimation),
+              child: FadeTransition(
+                opacity: animation,
+                child: child,
+              ),
+            );
+          }
           return ScaleTransition(
             scale: Tween<double>(begin: 0.8, end: 1.0).animate(curvedAnimation),
             child: FadeTransition(

@@ -1,367 +1,558 @@
-import 'package:nipaplay/themes/cupertino/cupertino_adaptive_platform_ui.dart';
-import 'package:nipaplay/themes/cupertino/cupertino_imports.dart';
-import 'package:nipaplay/l10n/l10n.dart';
-import 'package:nipaplay/utils/globals.dart' as globals;
-import 'package:provider/provider.dart';
+import 'package:nipaplay/widgets/lazy_page_stack.dart';
+import 'dart:async';
+import 'dart:io';
 
-import 'package:nipaplay/themes/cupertino/pages/account/cupertino_account_page.dart';
-import 'package:nipaplay/themes/cupertino/pages/cupertino_home_page.dart';
-import 'package:nipaplay/themes/cupertino/pages/cupertino_media_library_page.dart';
-import 'package:nipaplay/themes/cupertino/pages/cupertino_play_video_page.dart';
-import 'package:nipaplay/themes/cupertino/pages/cupertino_settings_page.dart';
-import 'package:nipaplay/themes/cupertino/pages/cupertino_torrent_download_page.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:nipaplay/app/app_navigation_scope.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_page_ids.dart';
+import 'package:nipaplay/app/app_size_class_scope.dart';
+import 'package:nipaplay/app/unified_app_pages.dart';
+import 'package:nipaplay/l10n/l10n.dart';
 import 'package:nipaplay/plugins/plugin_service.dart';
 import 'package:nipaplay/providers/bottom_bar_provider.dart';
+import 'package:nipaplay/providers/service_provider.dart';
 import 'package:nipaplay/providers/downloader_settings_provider.dart';
 import 'package:nipaplay/providers/webdav_quick_access_provider.dart';
-import 'package:nipaplay/utils/tab_change_notifier.dart';
+import 'package:nipaplay/services/external_player_console_service.dart';
+import 'package:nipaplay/services/file_association_service.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
+import 'package:nipaplay/themes/cupertino/cupertino_adaptive_platform_ui.dart';
+import 'package:nipaplay/themes/cupertino/cupertino_imports.dart';
+import 'package:nipaplay/themes/cupertino/utils/cupertino_bottom_navigation_style.dart';
+import 'package:nipaplay/themes/cupertino/utils/cupertino_glass_navigation_insets.dart';
+import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_app_page_actions.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_page_actions_scope.dart';
 import 'package:nipaplay/themes/cupertino/widgets/cupertino_bounce_wrapper.dart';
-import 'package:nipaplay/pages/webdav_browser_page.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_vertical_glass_tab_bar.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/background_with_blur.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
+import 'package:nipaplay/utils/globals.dart' as globals;
+import 'package:nipaplay/utils/tab_change_notifier.dart';
+import 'package:nipaplay/utils/launch_file_handler.dart';
+import 'package:nipaplay/utils/system_window_traits.dart';
+import 'package:nipaplay/utils/video_player_state.dart';
+import 'package:path/path.dart' as path;
+import 'package:provider/provider.dart';
+
+const _lightPhoneNavigationGlassSettings = LiquidGlassSettings(
+  thickness: 30,
+  blur: 6,
+  chromaticAberration: 0.2,
+  lightIntensity: 0.62,
+  refractiveIndex: 1.5,
+  saturation: 1.05,
+  ambientStrength: 0.65,
+  glassColor: Color(0x70FFFFFF),
+  backerColor: Color(0xA6FFFFFF),
+  whitenStrength: 0.25,
+  whitenGated: false,
+);
+
+const _darkPhoneNavigationGlassSettings = LiquidGlassSettings(
+  thickness: 30,
+  blur: 6,
+  chromaticAberration: 0.2,
+  lightIntensity: 0.45,
+  refractiveIndex: 1.5,
+  saturation: 0.9,
+  ambientStrength: 0.35,
+  glassColor: Color(0x52000000),
+  backerColor: Color(0x99000000),
+);
 
 class CupertinoMainPage extends StatefulWidget {
-  final String? launchFilePath;
-
   const CupertinoMainPage({super.key, this.launchFilePath});
+
+  final String? launchFilePath;
 
   @override
   State<CupertinoMainPage> createState() => _CupertinoMainPageState();
 }
 
 class _CupertinoMainPageState extends State<CupertinoMainPage> {
-  int _selectedIndex = 0;
+  String _selectedPageId = AppPageIds.home;
+  bool _showWebDAV = false;
+  bool _showDownloader = false;
+  bool _didApplyInitialPage = false;
+  final Map<String, CupertinoPageActionsController> _pageActionControllers = {};
+  CupertinoPageActionsController _actionsFor(String id) =>
+      _pageActionControllers.putIfAbsent(
+          id, CupertinoPageActionsController.new);
+
   TabChangeNotifier? _tabChangeNotifier;
-  bool _isVideoPagePresented = false;
-  bool _showWebDAVTab = false;
-  bool _showDownloaderTab = false;
+  StreamSubscription<String>? _fileAssociationSubscription;
+  StreamSubscription<String>? _fileAssociationErrorSubscription;
   WebDAVQuickAccessProvider? _webdavProvider;
   DownloaderSettingsProvider? _downloaderProvider;
   PluginService? _pluginService;
-  String? _lastAppliedDefaultTab;
-  List<GlobalKey<CupertinoBounceWrapperState>> _bounceKeys = [];
 
-  static const List<Widget> _basePages = [
-    CupertinoHomePage(),
-    CupertinoMediaLibraryPage(),
-    CupertinoAccountPage(),
-    CupertinoSettingsPage(),
-  ];
+  final Map<String, GlobalKey<CupertinoBounceWrapperState>> _bounceKeys =
+      <String, GlobalKey<CupertinoBounceWrapperState>>{};
 
-  List<Widget> get _pages {
-    final pages = <Widget>[];
-    // 0: Home
-    pages.add(_basePages[0]);
-    // 1: WebDAV (optional)
-    if (_showWebDAVTab) {
-      pages.add(const WebDAVBrowserPage());
-    }
-    // Next: Media Library
-    pages.add(_basePages[1]);
-    // Next: Account
-    pages.add(_basePages[2]);
-    // Next: Downloader (optional)
-    if (_showDownloaderTab) {
-      pages.add(const CupertinoTorrentDownloadPage());
-    }
-    // Last: Settings
-    pages.add(_basePages[3]);
-    return pages;
+  List<UnifiedAppPage> get _pages => buildUnifiedAppPages(
+        availability: AppPageAvailability(
+          showWebDAV: _showWebDAV,
+          showDownloader: _showDownloader,
+          showExternalPlayerConsole:
+              ExternalPlayerConsoleService.isSupportedPlatform,
+        ),
+      );
+
+  int get _selectedIndex {
+    final index = appPageIndexById(_pages, _selectedPageId);
+    return index < 0 ? 0 : index;
   }
 
-  List<BottomNavigationBarItem> _buildNavItems(BuildContext context) {
-    final l10n = context.l10n;
-    final items = <BottomNavigationBarItem>[];
-    items.add(BottomNavigationBarItem(
-      icon: Icon(CupertinoIcons.house),
-      activeIcon: Icon(CupertinoIcons.house_fill),
-      label: l10n.tabHome,
-    ));
-    if (_showWebDAVTab) {
-      items.add(const BottomNavigationBarItem(
-        icon: Icon(CupertinoIcons.cloud),
-        activeIcon: Icon(CupertinoIcons.cloud_fill),
-        label: 'WebDAV',
-      ));
-    }
-    items.add(BottomNavigationBarItem(
-      icon: Icon(CupertinoIcons.play_rectangle),
-      activeIcon: Icon(CupertinoIcons.play_rectangle_fill),
-      label: l10n.tabMediaLibrary,
-    ));
-    items.add(BottomNavigationBarItem(
-      icon: Icon(CupertinoIcons.person_crop_circle),
-      activeIcon: Icon(CupertinoIcons.person_crop_circle_fill),
-      label: l10n.tabAccount,
-    ));
-    if (_showDownloaderTab) {
-      items.add(BottomNavigationBarItem(
-        icon: const Icon(CupertinoIcons.arrow_down_circle),
-        activeIcon: const Icon(CupertinoIcons.arrow_down_circle_fill),
-        label: l10n.tabTorrentDownload,
-      ));
-    }
-    items.add(BottomNavigationBarItem(
-      icon: Icon(CupertinoIcons.gear_alt),
-      activeIcon: Icon(CupertinoIcons.gear_alt_fill),
-      label: l10n.tabSettings,
-    ));
-    return items;
-  }
-
-  List<AdaptiveNavigationDestination> _buildAdaptiveNavItems(
-      BuildContext context) {
-    final l10n = context.l10n;
-    final items = <AdaptiveNavigationDestination>[];
-    items.add(AdaptiveNavigationDestination(
-      icon: 'house.fill',
-      label: l10n.tabHome,
-    ));
-    if (_showWebDAVTab) {
-      items.add(const AdaptiveNavigationDestination(
-        icon: 'cloud.fill',
-        label: 'WebDAV',
-      ));
-    }
-    items.add(AdaptiveNavigationDestination(
-      icon: 'play.rectangle.fill',
-      label: l10n.tabMediaLibrary,
-    ));
-    items.add(AdaptiveNavigationDestination(
-      icon: 'person.crop.circle.fill',
-      label: l10n.tabAccount,
-    ));
-    if (_showDownloaderTab) {
-      items.add(AdaptiveNavigationDestination(
-        icon: 'arrow.down.circle.fill',
-        label: l10n.tabTorrentDownload,
-      ));
-    }
-    items.add(AdaptiveNavigationDestination(
-      icon: 'gearshape.fill',
-      label: l10n.tabSettings,
-    ));
-    return items;
-  }
-
-  void _updateBounceKeys() {
-    final neededKeys = _pages.length;
-    while (_bounceKeys.length < neededKeys) {
-      _bounceKeys.add(GlobalKey<CupertinoBounceWrapperState>());
-    }
-  }
-
-  int _getInitialTabIndex() {
-    final defaultTab = _webdavProvider?.effectiveDefaultHomeTab ??
-        WebDAVQuickAccessProvider.tabHome;
-
-    switch (defaultTab) {
-      case WebDAVQuickAccessProvider.tabHome:
-        return 0;
-      case WebDAVQuickAccessProvider.tabWebDAV:
-        return _showWebDAVTab ? 1 : 0;
-      case WebDAVQuickAccessProvider.tabMediaLibrary:
-        return _mediaLibraryIndex;
-      case WebDAVQuickAccessProvider.tabTorrent:
-        return _showDownloaderTab ? _downloaderIndex : 0;
-      case WebDAVQuickAccessProvider.tabAccount:
-        return _accountIndex;
-      case WebDAVQuickAccessProvider.tabSettings:
-        return _settingsIndex;
-      default:
-        return 0;
-    }
-  }
-
-  int get _mediaLibraryIndex => _showWebDAVTab ? 2 : 1;
-  int get _accountIndex => _mediaLibraryIndex + 1;
-  int get _downloaderIndex => _showDownloaderTab ? _accountIndex + 1 : -1;
-  int get _settingsIndex => _accountIndex + (_showDownloaderTab ? 2 : 1);
-
-  void _onWebDAVSettingsChanged() {
-    if (!mounted) return;
-    final showWebDAVTab = _webdavProvider?.showWebDAVTab ?? false;
-    final shouldUpdate = showWebDAVTab != _showWebDAVTab ||
-        _webdavProvider?.defaultHomeTab != _lastAppliedDefaultTab;
-
-    if (shouldUpdate) {
-      setState(() {
-        _showWebDAVTab = showWebDAVTab;
-        _lastAppliedDefaultTab = _webdavProvider?.defaultHomeTab;
-        _updateBounceKeys();
-        _selectedIndex = _getInitialTabIndex().clamp(0, _pages.length - 1);
-      });
-    }
-  }
-
-  void _onDownloaderSettingsChanged() {
-    if (!mounted) return;
-    final provider = _downloaderProvider;
-    if (provider == null || !provider.isLoaded) return;
-    final showDownloaderTab =
-        globals.isDownloaderSupportedPlatform && provider.enabled;
-    if (showDownloaderTab != _showDownloaderTab) {
-      setState(() {
-        _showDownloaderTab = showDownloaderTab;
-        _updateBounceKeys();
-        _selectedIndex = _selectedIndex.clamp(0, _pages.length - 1);
-      });
-    }
+  GlobalKey<CupertinoBounceWrapperState> _bounceKey(String pageId) {
+    return _bounceKeys.putIfAbsent(
+      pageId,
+      () => GlobalKey<CupertinoBounceWrapperState>(),
+    );
   }
 
   @override
   void initState() {
     super.initState();
-    _updateBounceKeys();
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      if (!mounted) return;
-      _tabChangeNotifier =
-          Provider.of<TabChangeNotifier>(context, listen: false);
-      _tabChangeNotifier?.addListener(_handleTabChange);
-      _webdavProvider =
-          Provider.of<WebDAVQuickAccessProvider>(context, listen: false);
-      _webdavProvider?.addListener(_onWebDAVSettingsChanged);
-      await _webdavProvider?.loadSettings();
+    SystemWindowTraitsObserver.instance
+      ..ensureStarted()
+      ..traits.addListener(_handleWindowTraitsChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _initialize());
+  }
 
-      _downloaderProvider =
-          Provider.of<DownloaderSettingsProvider>(context, listen: false);
-      _downloaderProvider?.addListener(_onDownloaderSettingsChanged);
+  Future<void> _initialize() async {
+    if (!mounted) return;
 
-      _pluginService = Provider.of<PluginService>(context, listen: false);
-      _pluginService?.addListener(_onDownloaderSettingsChanged);
-      PluginService.setBuildContext(context);
+    _tabChangeNotifier = context.read<TabChangeNotifier>()
+      ..addListener(_handleNavigationRequest);
+    _webdavProvider = context.read<WebDAVQuickAccessProvider>()
+      ..addListener(_handleWebDAVChanged);
+    await _webdavProvider?.loadSettings();
+    if (!mounted) return;
 
-      if (mounted) {
-        final dlProvider = _downloaderProvider;
-        setState(() {
-          _showWebDAVTab = _webdavProvider?.showWebDAVTab ?? false;
-          _showDownloaderTab = globals.isDownloaderSupportedPlatform &&
-              (dlProvider == null ||
-                  !dlProvider.isLoaded ||
-                  dlProvider.enabled);
-          _updateBounceKeys();
-          _selectedIndex = _getInitialTabIndex();
-        });
-        CupertinoBounceWrapper.playAnimation(_bounceKeys[_selectedIndex]);
-      }
+    _downloaderProvider = context.read<DownloaderSettingsProvider>()
+      ..addListener(_handleDownloaderChanged);
+    _pluginService = context.read<PluginService>()
+      ..addListener(_handleDownloaderChanged);
+    PluginService.setBuildContext(context);
+
+    final downloader = _downloaderProvider;
+    setState(() {
+      _showWebDAV = _webdavProvider?.showWebDAVTab ?? false;
+      _showDownloader = globals.isDownloaderSupportedPlatform &&
+          (downloader == null || !downloader.isLoaded || downloader.enabled);
+      _applyInitialPage();
     });
+    _playBounce(_selectedPageId);
+    _initializeFileAssociationListeners();
+    final launchPath = widget.launchFilePath;
+    final playbackReady = launchPath == null
+        ? Future<void>.value()
+        : _handleLaunchFile(launchPath);
+    unawaited(ServiceProvider.scanService.startStartupRefresh(
+      playbackReady: playbackReady,
+    ));
   }
 
-  @override
-  void dispose() {
-    _tabChangeNotifier?.removeListener(_handleTabChange);
-    _webdavProvider?.removeListener(_onWebDAVSettingsChanged);
-    _downloaderProvider?.removeListener(_onDownloaderSettingsChanged);
-    _pluginService?.removeListener(_onDownloaderSettingsChanged);
-    super.dispose();
+  void _initializeFileAssociationListeners() {
+    if (kIsWeb) return;
+    if (Platform.isAndroid || Platform.isIOS) {
+      _fileAssociationSubscription ??=
+          FileAssociationService.openFileStream.listen((filePath) {
+        unawaited(_handleLaunchFile(filePath));
+      });
+    }
+    if (Platform.isIOS) {
+      _fileAssociationErrorSubscription ??=
+          FileAssociationService.openFileErrorStream.listen((message) {
+        if (mounted) BlurSnackBar.show(context, message);
+      });
+    }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final Color activeColor = AppAccentColors.current;
-    final Color inactiveColor =
-        CupertinoDynamicColor.resolve(CupertinoColors.inactiveGray, context);
-    final double bottomInset = MediaQuery.viewPaddingOf(context).bottom;
-    final double tabBarHeight = bottomInset > 0 ? 56.0 : 50.0;
-
-    return Consumer<BottomBarProvider>(
-      builder: (context, bottomBarProvider, _) {
-        final bool showBottomBar = bottomBarProvider.isBottomBarVisible;
-        return AdaptiveScaffold(
-          minimizeBehavior: TabBarMinimizeBehavior.never,
-          enableBlur: true,
-          body: AnimatedSwitcher(
-            duration: const Duration(milliseconds: 50),
-            switchInCurve: Curves.easeOut,
-            switchOutCurve: Curves.easeIn,
-            child: KeyedSubtree(
-              key: ValueKey<int>(_selectedIndex),
-              child: CupertinoBounceWrapper(
-                key: _bounceKeys[_selectedIndex],
-                autoPlay: false,
-                child: _pages[_selectedIndex],
-              ),
-            ),
-          ),
-          bottomNavigationBar: showBottomBar
-              ? AdaptiveBottomNavigationBar(
-                  useNativeBottomBar: bottomBarProvider.useNativeBottomBar,
-                  selectedItemColor: activeColor,
-                  unselectedItemColor: inactiveColor,
-                  cupertinoTabBar: CupertinoTabBar(
-                    currentIndex: _selectedIndex,
-                    onTap: _selectTab,
-                    activeColor: activeColor,
-                    inactiveColor: inactiveColor,
-                    height: tabBarHeight,
-                    items: _buildNavItems(context),
-                  ),
-                  items: _buildAdaptiveNavItems(context),
-                  selectedIndex: _selectedIndex,
-                  onTap: _selectTab,
-                )
-              : null,
-        );
+  Future<void> _handleLaunchFile(String filePath) async {
+    if (!await FileAssociationService.validateFilePath(filePath)) {
+      if (mounted) {
+        BlurSnackBar.show(context, '无法播放启动文件: ${path.basename(filePath)}');
+      }
+      return;
+    }
+    if (!mounted) return;
+    await LaunchFileHandler.handle(
+      filePath,
+      onError: (message) {
+        if (mounted) BlurSnackBar.show(context, message);
       },
     );
   }
 
-  void _selectTab(int index) {
-    if (_selectedIndex == index) {
-      return;
-    }
-    if (index >= _pages.length) {
-      return;
-    }
+  void _applyInitialPage() {
+    if (_didApplyInitialPage) return;
+    _didApplyInitialPage = true;
+    _selectedPageId = effectiveAppPageId(
+      _pages,
+      _webdavProvider?.effectiveDefaultHomeTab,
+    );
+  }
+
+  void _handleWebDAVChanged() {
+    if (!mounted) return;
+    final show = _webdavProvider?.showWebDAVTab ?? false;
+    if (show == _showWebDAV) return;
     setState(() {
-      _selectedIndex = index;
-    });
-    Future.delayed(const Duration(milliseconds: 50), () {
-      if (mounted) {
-        CupertinoBounceWrapper.playAnimation(_bounceKeys[index]);
-      }
+      _showWebDAV = show;
+      _selectedPageId = effectiveAppPageId(_pages, _selectedPageId);
     });
   }
 
-  void _handleTabChange() {
+  void _handleDownloaderChanged() {
+    if (!mounted) return;
+    final provider = _downloaderProvider;
+    if (provider == null || !provider.isLoaded) return;
+    final show = globals.isDownloaderSupportedPlatform && provider.enabled;
+    if (show == _showDownloader) return;
+    setState(() {
+      _showDownloader = show;
+      _selectedPageId = effectiveAppPageId(_pages, _selectedPageId);
+    });
+  }
+
+  void _handleWindowTraitsChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    SystemWindowTraitsObserver.instance.traits
+        .removeListener(_handleWindowTraitsChanged);
+    _tabChangeNotifier?.removeListener(_handleNavigationRequest);
+    _fileAssociationSubscription?.cancel();
+    _fileAssociationErrorSubscription?.cancel();
+    _webdavProvider?.removeListener(_handleWebDAVChanged);
+    _downloaderProvider?.removeListener(_handleDownloaderChanged);
+    _pluginService?.removeListener(_handleDownloaderChanged);
+    for (final controller in _pageActionControllers.values) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  void _handleNavigationRequest() {
     final notifier = _tabChangeNotifier;
     if (notifier == null) return;
-
-    final targetIndex = notifier.targetTabIndex;
-    if (targetIndex == null) {
-      return;
-    }
-
-    if (targetIndex == 1) {
-      _presentVideoPage();
-      notifier.clearMainTabIndex();
-      return;
-    }
-
-    final int clampedIndex = targetIndex.clamp(0, _pages.length - 1).toInt();
-    _selectTab(clampedIndex);
+    final pageId = notifier.targetPageId ??
+        AppPageIds.fromLegacyIndex(notifier.targetTabIndex ?? -1);
+    if (pageId == null) return;
+    _selectPage(pageId);
     notifier.clearMainTabIndex();
   }
 
-  Future<void> _presentVideoPage() async {
-    if (_isVideoPagePresented || !mounted) {
-      return;
-    }
+  void _selectPage(String pageId) {
+    final effectiveId = effectiveAppPageId(_pages, pageId);
+    if (effectiveId == _selectedPageId) return;
+    FocusManager.instance.primaryFocus?.unfocus();
+    setState(() => _selectedPageId = effectiveId);
+    _playBounce(effectiveId);
+  }
 
-    _isVideoPagePresented = true;
-    final bottomBarProvider = context.read<BottomBarProvider>();
-    bottomBarProvider.hideBottomBar();
-    try {
-      await Navigator.of(context, rootNavigator: true).push(
-        CupertinoPageRoute<void>(
-          fullscreenDialog: true,
-          builder: (_) => const CupertinoPlayVideoPage(),
-        ),
-      );
-    } finally {
-      bottomBarProvider.showBottomBar();
-      if (mounted) {
-        _isVideoPagePresented = false;
-      }
-    }
+  void _selectIndex(int index) {
+    final pages = _pages;
+    if (index < 0 || index >= pages.length) return;
+    _selectPage(pages[index].id);
+  }
+
+  void _playBounce(String pageId) {
+    Future<void>.delayed(const Duration(milliseconds: 50), () {
+      if (!mounted || pageId != _selectedPageId) return;
+      CupertinoBounceWrapper.playAnimation(_bounceKey(pageId));
+    });
+  }
+
+  List<BottomNavigationBarItem> _buildCupertinoItems(
+    BuildContext context,
+    List<UnifiedAppPage> pages,
+  ) {
+    return pages
+        .map(
+          (page) => BottomNavigationBarItem(
+            icon: Icon(page.phoneActiveIcon),
+            activeIcon: Icon(page.phoneActiveIcon),
+            label: page.title(context.l10n),
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  List<AdaptiveNavigationDestination> _buildNativeItems(
+    BuildContext context,
+    List<UnifiedAppPage> pages,
+  ) {
+    return pages
+        .map(
+          (page) => AdaptiveNavigationDestination(
+            icon: page.phoneActiveSymbol,
+            selectedIcon: page.phoneActiveSymbol,
+            label: page.title(context.l10n),
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  List<GlassTab> _buildGlassTabs(
+    BuildContext context,
+    List<UnifiedAppPage> pages,
+  ) {
+    return pages
+        .map(
+          (page) => GlassTab(
+            icon: Icon(page.phoneActiveIcon),
+            activeIcon: Icon(page.phoneActiveIcon),
+            label: page.title(context.l10n),
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  List<CupertinoVerticalGlassTab> _buildVerticalTabs(
+    BuildContext context,
+    List<UnifiedAppPage> pages,
+  ) {
+    return pages
+        .map(
+          (page) => CupertinoVerticalGlassTab(
+            icon: page.phoneActiveIcon,
+            label: page.title(context.l10n),
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pages = _pages;
+    final selectedIndex = _selectedIndex;
+    final selectedPage = pages[selectedIndex];
+    final bottomNavigationColors = resolveCupertinoBottomNavigationColors(
+      brightness: CupertinoTheme.brightnessOf(context),
+      accentColor: AppAccentColors.current,
+    );
+    final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
+    final nativeTabBarHeight = bottomInset > 0 ? 56.0 : 50.0;
+    final glassTabBarBottom = resolveGlassTabBarBottomOffset(
+      viewPaddingBottom: bottomInset,
+    );
+    final usesNativeIOS26Toolbar = PlatformInfo.isIOS26OrHigher();
+    final pageActionsTrailingOffset = resolvePageActionsTrailingOffset(
+      viewPaddingRight: MediaQuery.paddingOf(context).right,
+      iosMajorVersion: PlatformInfo.iOSVersion,
+    );
+    final glassTabBarSettings =
+        CupertinoTheme.brightnessOf(context) == Brightness.light
+            ? _lightPhoneNavigationGlassSettings
+            : _darkPhoneNavigationGlassSettings;
+    final windowTraits = SystemWindowTraitsObserver.instance.traits.value;
+
+    return Selector2<BottomBarProvider, VideoPlayerState,
+        (bool, bool, bool, bool, Rect?, bool)>(
+      selector: (_, bar, video) => (
+        bar.isBottomBarVisible,
+        video.hasVideo,
+        video.isFullscreen,
+        video.player.usesWindowOverlayVideoSurface,
+        video.windowHostedVideoRect,
+        bar.useNativeBottomBar
+      ),
+      builder: (context, snapshot, _) {
+        final bottomBar = context.read<BottomBarProvider>();
+        final videoState = context.read<VideoPlayerState>();
+        final isFullscreenPlayback = selectedPage.id == AppPageIds.video &&
+            videoState.hasVideo &&
+            videoState.isFullscreen;
+        final isBottomNavigationVisible =
+            bottomBar.isBottomBarVisible && !isFullscreenPlayback;
+        final useWindowHostedVideoUnderlay =
+            selectedPage.id == AppPageIds.video &&
+                videoState.hasVideo &&
+                videoState.player.usesWindowOverlayVideoSurface;
+        // Fullscreen playback keeps the whole window, like the bottom bar.
+        final sideNavigation = isFullscreenPlayback
+            ? null
+            : resolveSideNavigationLayout(
+                placement: windowTraits.navigationPlacement,
+                windowSize: MediaQuery.sizeOf(context),
+                viewPadding: MediaQuery.viewPaddingOf(context),
+                occlusions: windowTraits.occlusions,
+                barWidth: cupertinoVerticalGlassTabBarWidth,
+              );
+        Widget pageStack = AppSizeClassScope(
+          isRegularWidth: windowTraits.isRegularWidth,
+          child: LazyPageStack(
+            pageIds: pages.map((page) => page.id).toList(growable: false),
+            selectedId: selectedPage.id,
+            builder: (context, id) => CupertinoPageActionsScope(
+              controller: _actionsFor(id),
+              child: CupertinoBounceWrapper(
+                key: _bounceKey(id),
+                autoPlay: false,
+                child: pages.firstWhere((page) => page.id == id).build(
+                      context,
+                      AppDisplaySurface.phone,
+                    ),
+              ),
+            ),
+          ),
+        );
+        if (sideNavigation != null) {
+          // The column already clears the system inset on the bar edge.
+          pageStack = Padding(
+            padding: sideNavigation.contentPadding,
+            child: MediaQuery.removePadding(
+              context: context,
+              removeLeft: sideNavigation.isLeft,
+              removeRight: !sideNavigation.isLeft,
+              child: pageStack,
+            ),
+          );
+        }
+        final body = BackgroundWithBlur(
+          transparentCutout: useWindowHostedVideoUnderlay
+              ? videoState.windowHostedVideoRect
+              : null,
+          child: CupertinoPageActionsScope(
+            controller: _actionsFor(selectedPage.id),
+            child: AppNavigationScope(
+              selectedPageId: selectedPage.id,
+              pageIds: pages.map((page) => page.id).toList(growable: false),
+              onSelectPage: _selectPage,
+              child: Stack(
+                children: [
+                  pageStack,
+                  if (sideNavigation == null)
+                    Positioned(
+                      top: MediaQuery.paddingOf(context).top + 4,
+                      right: pageActionsTrailingOffset,
+                      child: CupertinoAppPageActions(
+                        actionIds: selectedPage.actionIds,
+                      ),
+                    )
+                  else
+                    Positioned(
+                      top: sideNavigation.pageActionsTop,
+                      left: sideNavigation.isLeft
+                          ? sideNavigation.edgeOffsetFor(
+                              cupertinoPageActionButtonSize,
+                            )
+                          : null,
+                      right: sideNavigation.isLeft
+                          ? null
+                          : sideNavigation.edgeOffsetFor(
+                              cupertinoPageActionButtonSize,
+                            ),
+                      child: CupertinoAppPageActions(
+                        actionIds: selectedPage.actionIds,
+                        direction: Axis.vertical,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        );
+
+        final cupertinoTabBar = CupertinoTabBar(
+          currentIndex: selectedIndex,
+          onTap: _selectIndex,
+          activeColor: bottomNavigationColors.selected,
+          inactiveColor: bottomNavigationColors.unselected,
+          height: nativeTabBarHeight,
+          items: _buildCupertinoItems(context, pages),
+        );
+
+        if (sideNavigation != null) {
+          // iPhone Duo places the tab bar vertically at the bottom of the side
+          // column. UITabBar has no vertical layout outside UITabBarController,
+          // so both iOS paths use the liquid-glass implementation here.
+          final tabBarEdgeOffset =
+              sideNavigation.edgeOffsetFor(cupertinoVerticalGlassTabBarWidth);
+          return CupertinoPageScaffold(
+            backgroundColor: const Color(0x00000000),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                Positioned.fill(child: body),
+                if (isBottomNavigationVisible)
+                  Positioned(
+                    left: sideNavigation.isLeft ? tabBarEdgeOffset : null,
+                    right: sideNavigation.isLeft ? null : tabBarEdgeOffset,
+                    bottom: sideNavigation.tabBarBottom,
+                    child: CupertinoVerticalGlassTabBar(
+                      tabs: _buildVerticalTabs(context, pages),
+                      selectedIndex: selectedIndex,
+                      onTabSelected: _selectIndex,
+                      selectedColor: bottomNavigationColors.selected,
+                      unselectedColor: bottomNavigationColors.unselected,
+                      settings: glassTabBarSettings,
+                    ),
+                  ),
+              ],
+            ),
+          );
+        }
+
+        if (usesNativeIOS26Toolbar) {
+          return AdaptiveScaffold(
+            minimizeBehavior: TabBarMinimizeBehavior.never,
+            enableBlur: true,
+            backgroundColor:
+                useWindowHostedVideoUnderlay ? const Color(0x00000000) : null,
+            body: body,
+            bottomNavigationBar: isBottomNavigationVisible
+                ? AdaptiveBottomNavigationBar(
+                    useNativeBottomBar: bottomBar.useNativeBottomBar,
+                    selectedItemColor: bottomNavigationColors.selected,
+                    unselectedItemColor: bottomNavigationColors.unselected,
+                    cupertinoTabBar: cupertinoTabBar,
+                    items: _buildNativeItems(context, pages),
+                    selectedIndex: selectedIndex,
+                    onTap: _selectIndex,
+                  )
+                : null,
+          );
+        }
+
+        // Older iOS and other phone platforms render the same tab semantics
+        // with the Flutter liquid-glass implementation.
+        return CupertinoPageScaffold(
+          backgroundColor: const Color(0x00000000),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Positioned.fill(child: body),
+              if (isBottomNavigationVisible)
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: glassTabBarBottom,
+                  child: GlassTabBar.bottom(
+                    tabs: _buildGlassTabs(context, pages),
+                    selectedIndex: selectedIndex,
+                    onTabSelected: _selectIndex,
+                    horizontalPadding: 12,
+                    verticalPadding: 0,
+                    barHeight: cupertinoGlassTabBarHeight,
+                    settings: glassTabBarSettings,
+                    selectedIconColor: bottomNavigationColors.selected,
+                    selectedLabelColor: bottomNavigationColors.selected,
+                    unselectedIconColor: bottomNavigationColors.unselected,
+                    unselectedLabelColor: bottomNavigationColors.unselected,
+                    quality: GlassQuality.standard,
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
   }
 }

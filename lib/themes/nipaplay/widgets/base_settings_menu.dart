@@ -3,8 +3,9 @@ import 'dart:math' as math;
 import 'package:nipaplay/utils/video_player_state.dart';
 import 'package:provider/provider.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
-import 'package:nipaplay/providers/appearance_settings_provider.dart';
 import 'arrow_menu_container.dart';
+import 'player_menu_theme.dart';
+import 'settings_no_ripple_theme.dart';
 
 class SettingsMenuScope extends InheritedWidget {
   final double? width;
@@ -19,6 +20,7 @@ class SettingsMenuScope extends InheritedWidget {
   final double pointerHeight;
   final double? height;
   final Future<void> Function()? requestClose;
+  final bool standaloneWindow;
 
   const SettingsMenuScope({
     super.key,
@@ -35,6 +37,7 @@ class SettingsMenuScope extends InheritedWidget {
     this.pointerHeight = 8,
     this.height,
     this.requestClose,
+    this.standaloneWindow = false,
   });
 
   static SettingsMenuScope? maybeOf(BuildContext context) {
@@ -54,7 +57,8 @@ class SettingsMenuScope extends InheritedWidget {
         pointerWidth != oldWidget.pointerWidth ||
         pointerHeight != oldWidget.pointerHeight ||
         height != oldWidget.height ||
-        requestClose != oldWidget.requestClose;
+        requestClose != oldWidget.requestClose ||
+        standaloneWindow != oldWidget.standaloneWindow;
   }
 }
 
@@ -83,33 +87,21 @@ class BaseSettingsMenu extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scope = SettingsMenuScope.maybeOf(context);
-    final appearanceSettings = context.watch<AppearanceSettingsProvider>();
-    final blurValue = appearanceSettings.enableWidgetBlurEffect ? 25.0 : 0.0;
 
     return Consumer<VideoPlayerState>(
       builder: (context, videoState, child) {
-        final baseTheme = Theme.of(context);
-        final colorScheme = baseTheme.colorScheme;
-        const menuTextColor = Colors.white;
-        final backgroundColor = Colors.black.withValues(alpha: 0.58);
-        final borderColor = colorScheme.onSurface.withOpacity(0.2);
-        final menuTheme = baseTheme.copyWith(
-          colorScheme: colorScheme.copyWith(
-            onSurface: menuTextColor,
-            onSurfaceVariant: menuTextColor.withOpacity(0.7),
-          ),
-          textTheme: baseTheme.textTheme.apply(
-            bodyColor: menuTextColor,
-            displayColor: menuTextColor,
-          ),
-          iconTheme: baseTheme.iconTheme.copyWith(color: menuTextColor),
-        );
+        final menuColors = PlayerMenuTheme.colorsOf(context);
+        final menuTheme = PlayerMenuTheme.dataFor(context);
+        final menuTextColor = menuColors.foreground;
+        final backgroundColor = menuColors.surface;
+        final borderColor = menuColors.border;
         final resolvedWidth = scope?.width ?? width;
         final resolvedRightOffset = scope?.rightOffset ?? rightOffset;
         final bool useBackButton = scope?.useBackButton ?? false;
         final bool showHeader = scope?.showHeader ?? true;
         final bool showBackItem = scope?.showBackItem ?? false;
         final bool lockControlsVisible = scope?.lockControlsVisible ?? false;
+        final bool standaloneWindow = scope?.standaloneWindow ?? false;
         final Rect? anchorRect = scope?.anchorRect;
         final bool showPointer = scope?.showPointer ?? (anchorRect != null);
         final double pointerWidth = scope?.pointerWidth ?? 16;
@@ -117,9 +109,19 @@ class BaseSettingsMenu extends StatelessWidget {
         final Size screenSize = MediaQuery.of(context).size;
         final double screenMaxHeight =
             globals.isPhone ? screenSize.height - 120 : screenSize.height - 200;
-        final double resolvedHeight =
-            math.min(scope?.height ?? height, screenMaxHeight);
+        final double resolvedHeight = standaloneWindow
+            ? screenSize.height
+            : math.min(scope?.height ?? height, screenMaxHeight);
+        final double effectiveWidth =
+            standaloneWindow ? screenSize.width : resolvedWidth;
         const double horizontalMargin = 12;
+        final isMobileLandscape = globals.isMobilePlatform &&
+            MediaQuery.orientationOf(context) == Orientation.landscape;
+        final viewPadding = MediaQuery.viewPaddingOf(context);
+        final leftMargin =
+            horizontalMargin + (isMobileLandscape ? viewPadding.left : 0.0);
+        final rightMargin =
+            horizontalMargin + (isMobileLandscape ? viewPadding.right : 0.0);
         const double pointerPadding = 12;
         bool pointUp = true;
         bool useExternalPointer = false;
@@ -135,11 +137,10 @@ class BaseSettingsMenu extends StatelessWidget {
           final spaceBelow = screenSize.height - anchorRect.bottom;
           final showAbove = spaceAbove >= spaceBelow;
           left = (anchorRect.center.dx - resolvedWidth / 2).clamp(
-              horizontalMargin,
-              screenSize.width - resolvedWidth - horizontalMargin);
+              leftMargin, screenSize.width - resolvedWidth - rightMargin);
           pointerX = (anchorRect.center.dx - left)
               .clamp(pointerPadding, resolvedWidth - pointerPadding);
-          useExternalPointer = showPointer && pointerX != null;
+          useExternalPointer = showPointer;
           final double pointerOffset = useExternalPointer ? pointerHeight : 0;
           if (showAbove) {
             bottom = screenSize.height - anchorRect.top + pointerOffset;
@@ -156,140 +157,172 @@ class BaseSettingsMenu extends StatelessWidget {
           return true;
         }());
 
-        return Material(
-          type: MaterialType.transparency,
-          child: SizedBox(
-            width: MediaQuery.of(context).size.width,
-            height: MediaQuery.of(context).size.height,
-            child: Stack(
-              children: [
-                Positioned(
-                  right: anchorRect == null ? resolvedRightOffset : null,
-                  left: anchorRect != null ? left : null,
-                  top: anchorRect != null ? top : (globals.isPhone ? 10 : 80),
-                  bottom: anchorRect != null ? bottom : null,
-                  child: SizedBox(
-                    width: resolvedWidth,
-                    height: resolvedHeight,
-                    child: MouseRegion(
-                      onEnter: (_) {
-                        videoState.setControlsHovered(true);
-                        onHoverChanged?.call(true);
-                      },
-                      onExit: (_) {
-                        if (!lockControlsVisible) {
-                          videoState.setControlsHovered(false);
-                        }
-                        onHoverChanged?.call(false);
-                      },
-                      child: ArrowMenuContainer(
-                        backgroundColor: backgroundColor,
-                        borderColor: borderColor,
-                        blurValue: blurValue,
-                        borderRadius: 15,
-                        showPointer: showPointer &&
-                            pointerX != null &&
-                            !useExternalPointer,
-                        pointUp: pointUp,
-                        pointerX: pointerX ?? resolvedWidth / 2,
-                        pointerWidth: pointerWidth,
-                        pointerHeight: pointerHeight,
-                        contentPadding: EdgeInsets.only(
-                          top: contentPaddingTop,
-                          bottom: contentPaddingBottom,
-                        ),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.max,
-                          children: [
-                            if (showHeader)
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 16,
-                                  vertical: 12,
-                                ),
-                                decoration: BoxDecoration(
-                                  border: Border(
-                                    bottom: BorderSide(
-                                      color: borderColor,
-                                      width: 0.5,
-                                    ),
-                                  ),
-                                ),
-                                child: Row(
+        return SettingsVisualScope(
+          disableBlurEffect: true,
+          child: Theme(
+            data: menuTheme,
+            child: Material(
+              type: MaterialType.transparency,
+              child: SizedBox(
+                width: MediaQuery.of(context).size.width,
+                height: MediaQuery.of(context).size.height,
+                child: Stack(
+                  children: [
+                    Positioned(
+                      right: standaloneWindow
+                          ? 0
+                          : (anchorRect == null
+                              ? resolvedRightOffset +
+                                  (isMobileLandscape ? viewPadding.right : 0.0)
+                              : null),
+                      left: anchorRect != null ? left : null,
+                      top: standaloneWindow
+                          ? 0
+                          : anchorRect != null
+                              ? top
+                              : (globals.isPhone ? 10 : 80),
+                      bottom: anchorRect != null ? bottom : null,
+                      child: SizedBox(
+                        width: effectiveWidth,
+                        height: resolvedHeight,
+                        child: MouseRegion(
+                          onEnter: (_) {
+                            videoState.setControlsHovered(true);
+                            onHoverChanged?.call(true);
+                          },
+                          onExit: (_) {
+                            if (!lockControlsVisible) {
+                              videoState.setControlsHovered(false);
+                            }
+                            onHoverChanged?.call(false);
+                          },
+                          child: ArrowMenuContainer(
+                            backgroundColor: backgroundColor,
+                            borderColor: borderColor,
+                            blurValue: 0,
+                            borderRadius: 15,
+                            shadows: [
+                              BoxShadow(
+                                color: menuColors.shadow,
+                                blurRadius: 18,
+                                offset: const Offset(0, 8),
+                              ),
+                            ],
+                            showPointer: showPointer &&
+                                pointerX != null &&
+                                !useExternalPointer,
+                            pointUp: pointUp,
+                            pointerX: pointerX ?? resolvedWidth / 2,
+                            pointerWidth: pointerWidth,
+                            pointerHeight: pointerHeight,
+                            contentPadding: EdgeInsets.only(
+                              top: contentPaddingTop,
+                              bottom: contentPaddingBottom,
+                            ),
+                            child: DefaultTextStyle(
+                              style: TextStyle(color: menuTextColor),
+                              child: IconTheme(
+                                data: IconThemeData(color: menuTextColor),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.max,
                                   children: [
-                                    if (useBackButton && onClose != null)
-                                      IconButton(
-                                        icon: Icon(
-                                          Icons.arrow_back_ios_new_rounded,
-                                          color: menuTextColor,
+                                    if (showHeader)
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 16,
+                                          vertical: 12,
                                         ),
-                                        onPressed: onClose,
-                                        iconSize: 18,
-                                        padding: EdgeInsets.zero,
-                                        constraints: const BoxConstraints(),
+                                        decoration: BoxDecoration(
+                                          border: Border(
+                                            bottom: BorderSide(
+                                              color: borderColor,
+                                              width: 0.5,
+                                            ),
+                                          ),
+                                        ),
+                                        child: Row(
+                                          children: [
+                                            if (useBackButton &&
+                                                onClose != null)
+                                              IconButton(
+                                                icon: Icon(
+                                                  Icons
+                                                      .arrow_back_ios_new_rounded,
+                                                  color: menuTextColor,
+                                                ),
+                                                onPressed: onClose,
+                                                iconSize: 18,
+                                                padding: EdgeInsets.zero,
+                                                constraints:
+                                                    const BoxConstraints(),
+                                              ),
+                                            if (useBackButton &&
+                                                onClose != null)
+                                              const SizedBox(width: 8),
+                                            Text(
+                                              title,
+                                              style: TextStyle(
+                                                color: menuTextColor,
+                                                fontSize: 16,
+                                                fontWeight: FontWeight.w600,
+                                              ),
+                                            ),
+                                            const Spacer(),
+                                            if (extraButton != null)
+                                              extraButton!,
+                                            if (!useBackButton &&
+                                                onClose != null)
+                                              IconButton(
+                                                icon: Icon(
+                                                  Icons.close,
+                                                  color: menuTextColor,
+                                                ),
+                                                onPressed: onClose,
+                                                iconSize: 18,
+                                                padding: EdgeInsets.zero,
+                                                constraints:
+                                                    const BoxConstraints(),
+                                              ),
+                                          ],
+                                        ),
                                       ),
-                                    if (useBackButton && onClose != null)
-                                      const SizedBox(width: 8),
-                                    Text(
-                                      title,
-                                      style: TextStyle(
-                                        color: menuTextColor,
-                                        fontSize: 16,
-                                        fontWeight: FontWeight.w500,
+                                    Expanded(
+                                      child: _MenuContentList(
+                                        showBackItem: showBackItem,
+                                        onClose: onClose,
+                                        textColor: menuTextColor,
+                                        dividerColor: menuColors.divider,
+                                        content: content,
                                       ),
                                     ),
-                                    const Spacer(),
-                                    if (extraButton != null) extraButton!,
-                                    if (!useBackButton && onClose != null)
-                                      IconButton(
-                                        icon: Icon(
-                                          Icons.close,
-                                          color: menuTextColor,
-                                        ),
-                                        onPressed: onClose,
-                                        iconSize: 18,
-                                        padding: EdgeInsets.zero,
-                                        constraints: const BoxConstraints(),
-                                      ),
                                   ],
                                 ),
                               ),
-                            Expanded(
-                              child: Theme(
-                                data: menuTheme,
-                                child: _MenuContentList(
-                                  showBackItem: showBackItem,
-                                  onClose: onClose,
-                                  textColor: menuTextColor,
-                                  dividerColor: borderColor,
-                                  content: content,
-                                ),
-                              ),
                             ),
-                          ],
+                          ),
                         ),
                       ),
                     ),
-                  ),
+                    if (useExternalPointer && pointerX != null && left != null)
+                      Positioned(
+                        left: left + pointerX - pointerWidth / 2,
+                        top: pointUp ? (top ?? 0) - pointerHeight : null,
+                        bottom: pointUp ? null : (bottom ?? 0) - pointerHeight,
+                        child: IgnorePointer(
+                          child: CustomPaint(
+                            size: Size(pointerWidth, pointerHeight),
+                            painter: _SettingsMenuPointerPainter(
+                              fillColor: backgroundColor,
+                              borderColor: borderColor,
+                              pointUp: pointUp,
+                              borderWidth: 0.5,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
-                if (useExternalPointer && pointerX != null && left != null)
-                  Positioned(
-                    left: left + pointerX - pointerWidth / 2,
-                    top: pointUp ? (top ?? 0) - pointerHeight : null,
-                    bottom: pointUp ? null : (bottom ?? 0) - pointerHeight,
-                    child: IgnorePointer(
-                      child: CustomPaint(
-                        size: Size(pointerWidth, pointerHeight),
-                        painter: _SettingsMenuPointerPainter(
-                          fillColor: backgroundColor,
-                          borderColor: borderColor,
-                          pointUp: pointUp,
-                          borderWidth: 0.5,
-                        ),
-                      ),
-                    ),
-                  ),
-              ],
+              ),
             ),
           ),
         );

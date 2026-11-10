@@ -1,100 +1,41 @@
 import 'package:flutter/foundation.dart';
 import 'package:nipaplay/constants/settings_keys.dart';
 import 'package:nipaplay/utils/settings_storage.dart';
-import 'package:nipaplay/danmaku_abstraction/danmaku_kernel_factory.dart';
 
 class LabsSettingsProvider extends ChangeNotifier {
   LabsSettingsProvider() {
-    _loadSettings();
+    ready = _loadSettings();
   }
 
-  bool _enableLargeScreenMode = false;
-  bool _showRemoteAccessQrCode = false;
-  bool _enableNext2DanmakuKernel = false;
-  bool _enableErikaPlayerKernel = false;
-  bool _enableNextPlusPlusEngine = true; // 默认打开：Next++ 激进优化引擎
+  /// Completes after the persisted lab switches have been restored.
+  ///
+  /// Routes that make a one-shot decision from these values must await this
+  /// future; otherwise an app launch can observe the in-memory defaults before
+  /// SharedPreferences has finished loading.
+  late final Future<void> ready;
+
+  bool _enableImmersiveAnimeDetail = false;
   bool _isLoaded = false;
 
-  bool get enableLargeScreenMode => _enableLargeScreenMode;
-  bool get showRemoteAccessQrCode => _showRemoteAccessQrCode;
-  bool get enableNext2DanmakuKernel => _enableNext2DanmakuKernel;
-  bool get enableErikaPlayerKernel => _enableErikaPlayerKernel;
-  bool get enableNextPlusPlusEngine => _enableNextPlusPlusEngine;
+  bool get enableImmersiveAnimeDetail => _enableImmersiveAnimeDetail;
   bool get isLoaded => _isLoaded;
 
   Future<void> _loadSettings() async {
-    _enableLargeScreenMode = await SettingsStorage.loadBool(
-      SettingsKeys.labsEnableLargeScreenMode,
+    _enableImmersiveAnimeDetail = await SettingsStorage.loadBool(
+      SettingsKeys.labsEnableImmersiveAnimeDetail,
       defaultValue: false,
     );
-    _showRemoteAccessQrCode = await SettingsStorage.loadBool(
-      SettingsKeys.labsShowRemoteAccessQrCode,
-      defaultValue: false,
-    );
-    _enableNext2DanmakuKernel = await SettingsStorage.loadBool(
-      SettingsKeys.labsEnableNext2DanmakuKernel,
-      defaultValue: false,
-    );
-    _enableErikaPlayerKernel = await SettingsStorage.loadBool(
-      SettingsKeys.labsEnableErikaPlayerKernel,
-      defaultValue: false,
-    );
-    _enableNextPlusPlusEngine = await SettingsStorage.loadBool(
-      SettingsKeys.labsEnableNextPlusPlusEngine,
-      defaultValue: true,
-    );
-    DanmakuKernelFactory.setEnableNextPlusPlus(_enableNextPlusPlusEngine);
     _isLoaded = true;
     notifyListeners();
   }
 
-  Future<void> setEnableLargeScreenMode(bool enabled) async {
-    if (_enableLargeScreenMode == enabled) return;
-    _enableLargeScreenMode = enabled;
+  Future<void> setEnableImmersiveAnimeDetail(bool enabled) async {
+    await ready;
+    if (_enableImmersiveAnimeDetail == enabled) return;
+    _enableImmersiveAnimeDetail = enabled;
     notifyListeners();
     await SettingsStorage.saveBool(
-      SettingsKeys.labsEnableLargeScreenMode,
-      enabled,
-    );
-  }
-
-  Future<void> setShowRemoteAccessQrCode(bool enabled) async {
-    if (_showRemoteAccessQrCode == enabled) return;
-    _showRemoteAccessQrCode = enabled;
-    notifyListeners();
-    await SettingsStorage.saveBool(
-      SettingsKeys.labsShowRemoteAccessQrCode,
-      enabled,
-    );
-  }
-
-  Future<void> setEnableNext2DanmakuKernel(bool enabled) async {
-    if (_enableNext2DanmakuKernel == enabled) return;
-    _enableNext2DanmakuKernel = enabled;
-    notifyListeners();
-    await SettingsStorage.saveBool(
-      SettingsKeys.labsEnableNext2DanmakuKernel,
-      enabled,
-    );
-  }
-
-  Future<void> setEnableErikaPlayerKernel(bool enabled) async {
-    if (_enableErikaPlayerKernel == enabled) return;
-    _enableErikaPlayerKernel = enabled;
-    notifyListeners();
-    await SettingsStorage.saveBool(
-      SettingsKeys.labsEnableErikaPlayerKernel,
-      enabled,
-    );
-  }
-
-  Future<void> setEnableNextPlusPlusEngine(bool enabled) async {
-    if (_enableNextPlusPlusEngine == enabled) return;
-    _enableNextPlusPlusEngine = enabled;
-    DanmakuKernelFactory.setEnableNextPlusPlus(enabled);
-    notifyListeners();
-    await SettingsStorage.saveBool(
-      SettingsKeys.labsEnableNextPlusPlusEngine,
+      SettingsKeys.labsEnableImmersiveAnimeDetail,
       enabled,
     );
   }

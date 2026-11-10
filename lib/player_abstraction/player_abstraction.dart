@@ -1,11 +1,24 @@
 // Export all necessary enums, data models, and the abstract interface
 export './player_enums.dart' show PlayerPlaybackState, PlayerMediaType;
+export './playback_ready_gate.dart';
 export './player_data_models.dart';
 export './abstract_player.dart'
-    show AbstractPlayer; // Export only AbstractPlayer type
+    show
+        AbstractPlayer,
+        AsyncDisposablePlayer,
+        AsyncExternalSubtitlePlayer,
+        AsyncSeekPlayer,
+        BufferingAwarePlayer,
+        GifExportCapablePlayer,
+        GifExportQuality,
+        GifExportRequest,
+        GifExportResult,
+        MediaLoadAwarePlayer,
+        networkMediaLoadMaxAttempts;
 export './player_factory.dart'
     show PlayerKernelType; // Export PlayerKernelType enum
 
+import 'dart:async';
 import 'dart:ui' show Rect;
 
 import 'package:flutter/foundation.dart'; // For ValueListenable, used in AbstractPlayer
@@ -32,8 +45,11 @@ enum MediaType { unknown, video, audio, subtitle }
 /// The main player class that client code (like VideoPlayerState) will interact with.
 /// It instantiates to `Player()` and delegates all operations to an internal `AbstractPlayer` instance
 /// obtained from the `PlayerFactory`.
-class Player {
+class Player implements core_player.AsyncExternalSubtitlePlayer {
+  static final ValueNotifier<bool> _noBuffering = ValueNotifier<bool>(false);
   final core_player.AbstractPlayer _delegate;
+  Future<void>? _disposeFuture;
+  bool _disposeErrorHandlerAttached = false;
 
   /// Factory constructor that allows `Player()` to be called.
   /// This is what `VideoPlayerState` will use, e.g., `Player player = Player();`.
@@ -41,6 +57,9 @@ class Player {
     // PlayerFactory 会自动从 SharedPreferences 读取播放器内核设置
     return Player._internal(PlayerFactory().createPlayer());
   }
+
+  @visibleForTesting
+  Player.withDelegate(this._delegate);
 
   // Private internal constructor
   Player._internal(this._delegate);
@@ -98,6 +117,14 @@ class Player {
   set activeAudioTracks(List<int> value) => _delegate.activeAudioTracks = value;
 
   int get position => _delegate.position;
+  ValueListenable<bool> get buffering {
+    final delegate = _delegate;
+    return delegate is core_player.BufferingAwarePlayer
+        ? (delegate as core_player.BufferingAwarePlayer).buffering
+        : _noBuffering;
+  }
+
+  bool get isBuffering => buffering.value;
   int get bufferedPosition => _delegate.bufferedPosition;
   void setBufferRange({int minMs = -1, int maxMs = -1, bool drop = false}) =>
       _delegate.setBufferRange(minMs: minMs, maxMs: maxMs, drop: drop);
@@ -126,14 +153,156 @@ class Player {
     _delegate.setMedia(path, coreType);
   }
 
+  @override
+  Future<void> setExternalSubtitleAsync(String path) async {
+    final delegate = _delegate;
+    if (delegate is core_player.AsyncExternalSubtitlePlayer) {
+      await (delegate as core_player.AsyncExternalSubtitlePlayer)
+          .setExternalSubtitleAsync(path);
+      return;
+    }
+    delegate.setMedia(path, core_enums.PlayerMediaType.subtitle);
+  }
+
   Future<void> prepare() => _delegate.prepare();
+
+  bool get supportsMediaLoadReadiness =>
+      _delegate is core_player.MediaLoadAwarePlayer;
+
+  bool get isMediaReady {
+    final delegate = _delegate;
+    if (delegate is core_player.MediaLoadAwarePlayer) {
+      return (delegate as core_player.MediaLoadAwarePlayer).isMediaReady;
+    }
+    return delegate.mediaInfo.duration > 0;
+  }
+
+  bool get hasReceivedRealPosition {
+    final delegate = _delegate;
+    if (delegate is core_player.MediaLoadAwarePlayer) {
+      return (delegate as core_player.MediaLoadAwarePlayer)
+          .hasReceivedRealPosition;
+    }
+    return true;
+  }
+
+  bool get hasMediaLoadFailed {
+    final delegate = _delegate;
+    return delegate is core_player.MediaLoadAwarePlayer &&
+        (delegate as core_player.MediaLoadAwarePlayer).hasMediaLoadFailed;
+  }
+
+  String? get mediaLoadError {
+    final delegate = _delegate;
+    return delegate is core_player.MediaLoadAwarePlayer
+        ? (delegate as core_player.MediaLoadAwarePlayer).mediaLoadError
+        : null;
+  }
+
+  Future<bool> waitUntilMediaReady({required Duration timeout}) {
+    final delegate = _delegate;
+    if (delegate is core_player.MediaLoadAwarePlayer) {
+      return (delegate as core_player.MediaLoadAwarePlayer)
+          .waitUntilMediaReady(timeout: timeout);
+    }
+    return Future<bool>.value(delegate.mediaInfo.duration > 0);
+  }
+
+  Future<bool> retryCurrentMediaLoad() {
+    final delegate = _delegate;
+    if (delegate is core_player.MediaLoadAwarePlayer) {
+      return (delegate as core_player.MediaLoadAwarePlayer)
+          .retryCurrentMediaLoad();
+    }
+    return Future<bool>.value(false);
+  }
 
   void seek({required int position}) => _delegate.seek(position: position);
 
-  void dispose() => _delegate.dispose();
+  Future<void> seekAndWait({required int position}) {
+    final delegate = _delegate;
+    if (delegate is core_player.AsyncSeekPlayer) {
+      return (delegate as core_player.AsyncSeekPlayer)
+          .seekAndWait(position: position);
+    }
+    delegate.seek(position: position);
+    return Future<void>.value();
+  }
+
+  void dispose() {
+    final future = _startDispose();
+    if (_disposeErrorHandlerAttached) {
+      return;
+    }
+    _disposeErrorHandlerAttached = true;
+    unawaited(
+      future.then<void>(
+        (_) {},
+        onError: (Object error, StackTrace stackTrace) {
+          debugPrint('[Player] asynchronous disposal failed: $error');
+        },
+      ),
+    );
+  }
+
+  Future<void> disposeAsync() => _startDispose();
+
+  Future<void> _startDispose() {
+    final existing = _disposeFuture;
+    if (existing != null) {
+      return existing;
+    }
+
+    // Publish the future before calling the delegate so a re-entrant or
+    // concurrent dispose call observes the same teardown operation.
+    final completer = Completer<void>();
+    _disposeFuture = completer.future;
+    final delegate = _delegate;
+    try {
+      if (delegate is core_player.AsyncDisposablePlayer) {
+        (delegate as core_player.AsyncDisposablePlayer)
+            .disposeAsync()
+            .then<void>(
+          (_) => completer.complete(),
+          onError: (Object error, StackTrace stackTrace) {
+            completer.completeError(error, stackTrace);
+          },
+        );
+      } else {
+        delegate.dispose();
+        completer.complete();
+      }
+    } catch (error, stackTrace) {
+      completer.completeError(error, stackTrace);
+    }
+    return completer.future;
+  }
 
   Future<PlayerFrame?> snapshot({int width = 0, int height = 0}) =>
       _delegate.snapshot(width: width, height: height);
+
+  bool get supportsGifExport {
+    final delegate = _delegate;
+    return (delegate is core_player.GifExportCapablePlayer &&
+            (delegate as core_player.GifExportCapablePlayer)
+                .supportsGifExport) ||
+        ErikaPlayerAdapter.supportsHeadlessGifExport;
+  }
+
+  Future<core_player.GifExportResult> exportGif(
+    core_player.GifExportRequest request,
+  ) {
+    final delegate = _delegate;
+    if (delegate is core_player.GifExportCapablePlayer &&
+        (delegate as core_player.GifExportCapablePlayer).supportsGifExport) {
+      return (delegate as core_player.GifExportCapablePlayer)
+          .exportGif(request);
+    }
+    if (ErikaPlayerAdapter.supportsHeadlessGifExport) {
+      return ErikaPlayerAdapter.exportGifHeadless(request);
+    }
+    throw UnsupportedError('The active player kernel cannot export GIF files.');
+  }
 
   // Delegate new methods for DecoderManager
   void setDecoders(MediaType type, List<String> decoders) {
@@ -179,17 +348,42 @@ class Player {
   void setProperty(String key, String value) =>
       _delegate.setProperty(key, value);
 
+  /// 设置 HTTP User-Agent（播放器请求视频时）。空字符串 = 用内核默认 UA。
+  void setUserAgent(String ua) => _delegate.setUserAgent(ua);
+
   Future<void> setVideoSurfaceSize({int? width, int? height}) =>
       _delegate.setVideoSurfaceSize(width: width, height: height);
+
+  Future<void> setChapter(int index) => _delegate.setChapter(index);
 
   // 直接播放控制方法
   Future<void> playDirectly() => _delegate.playDirectly();
   Future<void> pauseDirectly() => _delegate.pauseDirectly();
 
+  // 逐帧控制方法
+  void stepForward() => _delegate.stepForward();
+
+  void stepBackward() => _delegate.stepBackward();
+
+  /// Erika fits the video inside its surface and composites native overlays
+  /// across that entire surface, including the letterbox/pillarbox area.
+  bool get handlesVideoAspectFit => _delegate is ErikaPlayerAdapter;
+
   bool get prefersPlatformVideoSurface {
     try {
       final dyn = _delegate as dynamic;
       final value = dyn.prefersPlatformVideoSurface;
+      if (value is bool) {
+        return value;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  bool get usesWindowOverlayVideoSurface {
+    try {
+      final dyn = _delegate as dynamic;
+      final value = dyn.usesWindowOverlayVideoSurface;
       if (value is bool) {
         return value;
       }
@@ -318,6 +512,61 @@ class Player {
     return getDetailedMediaInfo();
   }
 
+  /// 读取底层内核的实时属性（绕过适配器的本地缓存 getProperty）。
+  /// 用于需要逐帧新鲜值的场景，如 sub-text（内嵌字幕整块移动模式的
+  /// 文本源）。不支持的内核返回 null。
+  Future<String?> getLiveProperty(String name) async {
+    try {
+      final dyn = _delegate as dynamic;
+      final f = dyn.getLiveProperty(name);
+      if (f is Future) {
+        return await f as String?;
+      }
+    } on NoSuchMethodError {
+      return null;
+    } catch (_) {
+      return null;
+    }
+    return null;
+  }
+
+  bool get supportsUpscaler {
+    try {
+      final value = (_delegate as dynamic).supportsUpscaler;
+      return value is bool ? value : false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> setUpscaler(PlayerUpscalerMode mode) async {
+    try {
+      final result = (_delegate as dynamic).setUpscaler(mode);
+      if (result is Future) {
+        await result;
+      }
+    } catch (_) {}
+  }
+
+  Future<void> loadUpscalerModelFile(String path) async {
+    await (_delegate as dynamic).loadUpscalerModelFile(path);
+  }
+
+  Future<void> clearUpscalerModel() async {
+    await (_delegate as dynamic).clearUpscalerModel();
+  }
+
+  Future<PlayerUpscalerStatus?> getUpscalerStatus() async {
+    try {
+      final result = (_delegate as dynamic).getUpscalerStatus();
+      final status = result is Future ? await result : result;
+      if (status is PlayerUpscalerStatus) {
+        return status;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   // ---- Native danmaku passthrough ----
   // Some kernels (Erika) composite danmaku into the video frame natively.
   // These forward to the delegate via dynamic dispatch so the abstraction
@@ -346,6 +595,13 @@ class Player {
     } catch (_) {}
   }
 
+  Future<void> setNativeDanmakuEnabled(bool enabled) async {
+    try {
+      final r = (_delegate as dynamic).setDanmakuEnabled(enabled);
+      if (r is Future) await r;
+    } catch (_) {}
+  }
+
   Future<void> setNativeDanmakuConfig({
     bool? enabled,
     double? opacity,
@@ -356,6 +612,7 @@ class Player {
     double? scrollDurationSeconds,
     double? trackGapRatio,
     double? outlineWidth,
+    int? shadowStyle,
     String? customFontFamily,
     String? customFontFilePath,
   }) async {
@@ -370,6 +627,7 @@ class Player {
         scrollDurationSeconds: scrollDurationSeconds,
         trackGapRatio: trackGapRatio,
         outlineWidth: outlineWidth,
+        shadowStyle: shadowStyle,
         customFontFamily: customFontFamily,
         customFontFilePath: customFontFilePath,
       );

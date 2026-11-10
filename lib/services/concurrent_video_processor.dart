@@ -5,7 +5,7 @@ import 'dart:collection';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:nipaplay/models/watch_history_model.dart';
-import 'package:nipaplay/services/dandanplay_service.dart';
+import 'package:nipaplay/services/danmaku_matching_service.dart';
 
 /// 视频处理结果
 class VideoProcessResult {
@@ -47,6 +47,7 @@ class ConcurrentVideoProcessor {
     List<String> videoPaths, {
     bool skipPreviouslyMatchedUnwatched = false,
     Function(int processed, int total, String currentFile)? onProgress,
+    Future<Map<String, dynamic>> Function(String)? getVideoInfo,
   }) async {
     if (videoPaths.isEmpty) return [];
 
@@ -67,6 +68,7 @@ class ConcurrentVideoProcessor {
         if (existingItem != null &&
             existingItem.animeId != null &&
             existingItem.episodeId != null &&
+            existingItem.animeName.trim().isNotEmpty &&
             existingItem.watchProgress <= 0.01) {
           skippedCount++;
           onProgress?.call(
@@ -92,7 +94,8 @@ class ConcurrentVideoProcessor {
     for (String videoPath in pathsToProcess) {
       final future = semaphore.acquire().then((_) async {
         try {
-          final result = await _processSingleVideoPath(videoPath);
+          final result = await _processSingleVideoPath(videoPath,
+              getVideoInfo: getVideoInfo);
           processedCount++;
           onProgress?.call(
               processedCount, videoPaths.length, _displayName(videoPath));
@@ -113,10 +116,12 @@ class ConcurrentVideoProcessor {
     return results;
   }
 
-  static Future<VideoProcessResult> _processSingleVideoPath(
-      String videoPath) async {
+  static Future<VideoProcessResult> _processSingleVideoPath(String videoPath,
+      {Future<Map<String, dynamic>> Function(String)? getVideoInfo}) async {
     try {
-      final videoInfo = await DandanplayService.getVideoInfo(videoPath)
+      final videoInfo = await (getVideoInfo == null
+              ? DanmakuMatchingService.instance.getVideoInfo(videoPath)
+              : getVideoInfo(videoPath))
           .timeout(_requestTimeout, onTimeout: () {
         throw TimeoutException('获取视频信息超时 (${_displayName(videoPath)})');
       });
@@ -136,9 +141,21 @@ class ConcurrentVideoProcessor {
         if (animeIdFromMatch != null && episodeIdFromMatch != null) {
           WatchHistoryItem? existingItem =
               await WatchHistoryManager.getHistoryItem(videoPath);
+
+          // Only a cleared match can transfer progress to a replacement path.
+          // An active record is another playable version of the same episode.
+          WatchHistoryItem? migratedItem;
+          if (existingItem == null) {
+            migratedItem =
+                await WatchHistoryManager.getClearedHistoryItemByEpisode(
+              animeIdFromMatch,
+              episodeIdFromMatch,
+            );
+          }
+
           final int durationFromMatch = (videoInfo['duration'] is int)
               ? videoInfo['duration'] as int
-              : (existingItem?.duration ?? 0);
+              : (existingItem?.duration ?? migratedItem?.duration ?? 0);
 
           WatchHistoryItem itemToSave;
           if (existingItem != null) {
@@ -171,6 +188,23 @@ class ConcurrentVideoProcessor {
                   thumbnailPath: existingItem.thumbnailPath,
                   isFromScan: true);
             }
+          } else if (migratedItem != null) {
+            // 从旧文件路径迁移进度到新文件路径
+            itemToSave = WatchHistoryItem(
+                filePath: videoPath,
+                animeName: animeTitleFromMatch,
+                episodeTitle: episodeTitleFromMatch,
+                episodeId: episodeIdFromMatch,
+                animeId: animeIdFromMatch,
+                watchProgress: migratedItem.watchProgress,
+                lastPosition: migratedItem.lastPosition,
+                duration: durationFromMatch,
+                lastWatchTime: DateTime.now(),
+                thumbnailPath: migratedItem.thumbnailPath,
+                isFromScan: true);
+
+            // The donor was explicitly unlinked; its old path can be removed.
+            await WatchHistoryManager.removeHistoryItem(migratedItem.filePath);
           } else {
             // 新扫描项目
             itemToSave = WatchHistoryItem(

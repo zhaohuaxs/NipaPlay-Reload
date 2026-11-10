@@ -1,24 +1,26 @@
 import 'dart:io';
 
 import 'package:nipaplay/themes/cupertino/cupertino_imports.dart';
+import 'package:nipaplay/themes/cupertino/cupertino_adaptive_platform_ui.dart'
+    show AdaptiveButton, AdaptiveButtonStyle;
+import 'package:nipaplay/themes/cupertino/widgets/player_menu/adaptive_player_menu_primitives.dart';
 
 import 'package:path/path.dart' as p;
 import 'package:nipaplay/services/emby_service.dart';
 import 'package:nipaplay/services/jellyfin_service.dart';
-import 'package:nipaplay/models/media_server_playback.dart';
+import 'package:nipaplay/services/media_server_playlist_loader.dart';
 import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
-import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_pane_back_button.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 import 'package:nipaplay/utils/video_player_state.dart';
 import 'package:nipaplay/models/playable_item.dart';
 import 'package:nipaplay/models/shared_remote_library.dart';
-import 'package:nipaplay/providers/settings_provider.dart';
-import 'package:nipaplay/services/external_player_service.dart';
+import 'package:nipaplay/services/playback_service.dart';
 import 'package:nipaplay/services/smb_proxy_service.dart';
 import 'package:nipaplay/services/smb_service.dart';
 import 'package:nipaplay/services/webdav_service.dart';
 import 'package:nipaplay/providers/shared_remote_library_provider.dart';
 import 'package:nipaplay/utils/media_source_utils.dart';
+import 'package:nipaplay/utils/media_identity_resolver.dart';
 import 'package:nipaplay/utils/shared_remote_history_helper.dart';
 import 'package:nipaplay/utils/webdav_file_sorter.dart';
 import 'package:provider/provider.dart';
@@ -27,11 +29,9 @@ class CupertinoPlaylistPane extends StatefulWidget {
   const CupertinoPlaylistPane({
     super.key,
     required this.videoState,
-    required this.onBack,
   });
 
   final VideoPlayerState videoState;
-  final VoidCallback onBack;
 
   @override
   State<CupertinoPlaylistPane> createState() => _CupertinoPlaylistPaneState();
@@ -99,6 +99,11 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
       } else if (MediaSourceUtils.isWebDavPath(path)) {
         _dataSourceType = 'webdav';
         await _loadWebDavEpisodes(path);
+      } else if (Uri.tryParse(path)?.scheme == 'http' ||
+          Uri.tryParse(path)?.scheme == 'https') {
+        // A standalone stream has no local sibling directory to enumerate.
+        _dataSourceType = 'stream';
+        _episodes = [path];
       } else {
         _dataSourceType = 'filesystem';
         await _loadFileSystemEpisodes(path);
@@ -125,11 +130,7 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
   }
 
   bool _isSmbProxyStreamUrl(String path) {
-    final uri = Uri.tryParse(path);
-    if (uri == null) return false;
-    return uri.path == '/smb/stream' &&
-        (uri.queryParameters['conn']?.trim().isNotEmpty ?? false) &&
-        (uri.queryParameters['path']?.trim().isNotEmpty ?? false);
+    return MediaSourceUtils.parseSmbMediaPath(path) != null;
   }
 
   int _effectivePort(Uri uri) {
@@ -191,11 +192,14 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
   }
 
   SMBConnection? _findSmbConnectionByNameOrHost(String connName) {
-    final direct = SMBService.instance.getConnection(connName);
+    final direct = SMBService.instance.getConnectionByIdOrName(connName);
     if (direct != null) return direct;
     final matches = SMBService.instance.connections.where((connection) {
       if (connection.host == connName) return true;
       if ('${connection.host}:${connection.port}' == connName) return true;
+      if (connection.wanHost == connName) return true;
+      if ('${connection.wanHost}:${connection.wanPort}' == connName)
+        return true;
       return false;
     }).toList();
     if (matches.length == 1) return matches.first;
@@ -240,7 +244,7 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
           ),
         )
         .toList()
-      ..sort((a, b) => WebDAVFileSorter.naturalCompare(
+      ..sort((a, b) => WebDAVFileSorter.playlistCompare(
             p.basename(a.path),
             p.basename(b.path),
           ));
@@ -271,7 +275,7 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
         .where((entry) =>
             !entry.isDirectory && provider.isRemoteFilePlayable(entry))
         .toList()
-      ..sort((a, b) => WebDAVFileSorter.naturalCompare(a.name, b.name));
+      ..sort((a, b) => WebDAVFileSorter.playlistCompare(a.name, b.name));
 
     _episodes = playableEntries.map((entry) {
       final streamUrl =
@@ -315,7 +319,7 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
         final aId = a.episodeId ?? 0;
         final bId = b.episodeId ?? 0;
         if (aId != bId) return aId.compareTo(bId);
-        return WebDAVFileSorter.naturalCompare(a.title, b.title);
+        return WebDAVFileSorter.playlistCompare(a.title, b.title);
       });
 
     _episodes = sorted
@@ -337,35 +341,14 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
 
   Future<void> _loadWebDavEpisodes(String path) async {
     await WebDAVService.instance.initialize();
-    final resolved = WebDAVService.instance.resolveFileUrl(path);
+    final resolved = WebDAVService.instance.resolveMediaPath(path);
     if (resolved == null) {
       throw Exception('无法识别WebDAV连接');
     }
 
-    final connectionUri = Uri.parse(resolved.connection.url);
-    final basePath = connectionUri.path.isEmpty ? '/' : connectionUri.path;
-    final normalizedBasePath = basePath.endsWith('/') ? basePath : '$basePath/';
-    final filePath = resolved.relativePath.startsWith('/')
-        ? resolved.relativePath
-        : '/${resolved.relativePath}';
-
-    String parentDir;
-    if (filePath.length > normalizedBasePath.length &&
-        filePath.startsWith(normalizedBasePath)) {
-      parentDir = filePath.substring(normalizedBasePath.length);
-      final lastSlashIndex = parentDir.lastIndexOf('/');
-      if (lastSlashIndex > 0) {
-        parentDir = parentDir.substring(0, lastSlashIndex);
-      } else if (lastSlashIndex == 0) {
-        parentDir = '/';
-      } else {
-        parentDir = '/';
-      }
-    } else {
-      parentDir = p.posix.dirname(resolved.relativePath);
-    }
-
-    parentDir = _normalizeRemoteDirectoryPath(parentDir);
+    final parentDir = _normalizeRemoteDirectoryPath(
+      p.posix.dirname(resolved.relativePath),
+    );
 
     final entries = await WebDAVService.instance.listDirectory(
       resolved.connection,
@@ -376,16 +359,17 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
             !entry.isDirectory &&
             WebDAVService.instance.isVideoFile(entry.name))
         .toList()
-      ..sort((a, b) => WebDAVFileSorter.naturalCompare(a.name, b.name));
+      ..sort((a, b) => WebDAVFileSorter.playlistCompare(a.name, b.name));
 
     _episodes = videoEntries.map((entry) {
-      final fileUrl = WebDAVService.instance.getFileUrl(
-        resolved.connection,
+      final filePath = MediaSourceUtils.buildWebDavPath(
+        resolved.connection.id,
         entry.path,
       );
-      _remoteDisplayNameCache[fileUrl] = p.basenameWithoutExtension(entry.name);
-      _remoteSubtitleCache[fileUrl] = resolved.connection.name;
-      return fileUrl;
+      _remoteDisplayNameCache[filePath] =
+          p.basenameWithoutExtension(entry.name);
+      _remoteSubtitleCache[filePath] = resolved.connection.name;
+      return filePath;
     }).toList();
 
     if (_episodes.isEmpty) {
@@ -394,15 +378,12 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
   }
 
   Future<void> _loadSmbEpisodes(String path) async {
-    final uri = Uri.parse(path);
-    final connName = uri.queryParameters['conn']?.trim();
-    final smbPath = uri.queryParameters['path']?.trim();
-    if (connName == null ||
-        connName.isEmpty ||
-        smbPath == null ||
-        smbPath.isEmpty) {
+    final parsed = MediaSourceUtils.parseSmbMediaPath(path);
+    if (parsed == null) {
       throw Exception('SMB地址缺少必要参数');
     }
+    final connName = parsed.connectionName;
+    final smbPath = parsed.relativePath;
 
     await SMBService.instance.initialize();
     await SMBProxyService.instance.initialize();
@@ -420,14 +401,14 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
         .where((entry) =>
             !entry.isDirectory && SMBService.instance.isVideoFile(entry.name))
         .toList()
-      ..sort((a, b) => WebDAVFileSorter.naturalCompare(a.name, b.name));
+      ..sort((a, b) => WebDAVFileSorter.playlistCompare(a.name, b.name));
 
     _episodes = videoEntries.map((entry) {
-      final url =
-          SMBProxyService.instance.buildStreamUrl(connection, entry.path);
-      _remoteDisplayNameCache[url] = p.basenameWithoutExtension(entry.name);
-      _remoteSubtitleCache[url] = connection.name;
-      return url;
+      final filePath = MediaSourceUtils.buildSmbPath(connection.id, entry.path);
+      _remoteDisplayNameCache[filePath] =
+          p.basenameWithoutExtension(entry.name);
+      _remoteSubtitleCache[filePath] = connection.name;
+      return filePath;
     }).toList();
 
     if (_episodes.isEmpty) {
@@ -440,9 +421,11 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
     final info = await JellyfinService.instance.getEpisodeDetails(episodeId);
     if (info == null) throw Exception('无法获取 Jellyfin 剧集信息');
 
-    final episodes = await JellyfinService.instance.getSeasonEpisodes(
-      info.seriesId!,
-      info.seasonId!,
+    final episodes = await loadMediaServerPlaylist(
+      currentItem: info,
+      seriesId: info.seriesId,
+      seasonId: info.seasonId,
+      loadSeason: JellyfinService.instance.getSeasonEpisodes,
     );
     if (episodes.isEmpty) throw Exception('该季没有剧集');
 
@@ -473,9 +456,11 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
     final info = await EmbyService.instance.getEpisodeDetails(episodeId);
     if (info == null) throw Exception('无法获取 Emby 剧集信息');
 
-    final episodes = await EmbyService.instance.getSeasonEpisodes(
-      info.seriesId!,
-      info.seasonId!,
+    final episodes = await loadMediaServerPlaylist(
+      currentItem: info,
+      seriesId: info.seriesId,
+      seasonId: info.seasonId,
+      loadSeason: EmbyService.instance.getSeasonEpisodes,
     );
     if (episodes.isEmpty) throw Exception('该季没有剧集');
 
@@ -526,7 +511,7 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
       default:
         final uri = Uri.tryParse(path);
         if (uri != null && uri.pathSegments.isNotEmpty) {
-          return Uri.decodeComponent(uri.pathSegments.last);
+          return _safeDecode(uri.pathSegments.last);
         }
         return path.split('/').last;
     }
@@ -553,8 +538,18 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
         return 'WebDAV';
       case 'smb':
         return 'SMB';
+      case 'stream':
+        return '当前播放 · ${Uri.parse(path).host}';
       default:
         return path;
+    }
+  }
+
+  String _safeDecode(String value) {
+    try {
+      return Uri.decodeComponent(value);
+    } catch (_) {
+      return value;
     }
   }
 
@@ -566,6 +561,7 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
       case 'shared_anime':
       case 'webdav':
       case 'smb':
+      case 'stream':
         return CupertinoIcons.cloud;
       default:
         return CupertinoIcons.folder;
@@ -586,6 +582,8 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
         return 'WebDAV';
       case 'smb':
         return 'SMB';
+      case 'stream':
+        return '网络串流';
       default:
         return '本地文件';
     }
@@ -606,72 +604,24 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
         _effectivePort(aUri) == _effectivePort(bUri);
   }
 
-  bool _isSameSmbStream(String a, String b) {
-    if (!_isSmbProxyStreamUrl(a) || !_isSmbProxyStreamUrl(b)) {
-      return false;
-    }
-    final aUri = Uri.tryParse(a);
-    final bUri = Uri.tryParse(b);
-    if (aUri == null || bUri == null) {
-      return false;
-    }
-    final aConn = aUri.queryParameters['conn']?.trim();
-    final bConn = bUri.queryParameters['conn']?.trim();
-    final aPath = _normalizeSmbPath(aUri.queryParameters['path'] ?? '');
-    final bPath = _normalizeSmbPath(bUri.queryParameters['path'] ?? '');
-    return aConn == bConn && aPath == bPath;
-  }
-
   bool _isCurrentEpisode(String path) {
     final currentPath = _currentPath;
     if (currentPath == null) return false;
     if (path == currentPath) return true;
-    if (_isSameSmbStream(path, currentPath)) return true;
     if (_isSameSharedManagementStream(path, currentPath)) return true;
-    return false;
+    return MediaIdentityResolver.samePath(path, currentPath);
   }
 
   Future<void> _playEpisode(String path) async {
     try {
-      PlaybackSession? playbackSession;
-      final settingsProvider =
-          Provider.of<SettingsProvider>(context, listen: false);
-      if (settingsProvider.useExternalPlayer) {
-        if (path.startsWith('jellyfin://')) {
-          final itemId = path.replaceFirst('jellyfin://', '');
-          playbackSession =
-              await JellyfinService.instance.createPlaybackSession(
-            itemId: itemId,
-          );
-        } else if (path.startsWith('emby://')) {
-          final embyPath = path.replaceFirst('emby://', '');
-          final parts = embyPath.split('/');
-          final embyId = parts.isNotEmpty ? parts.last : embyPath;
-          playbackSession = await EmbyService.instance.createPlaybackSession(
-            itemId: embyId,
-          );
-        }
-
-        final playableItem = PlayableItem(
-          videoPath: path,
-          playbackSession: playbackSession,
-        );
-        if (!mounted) return;
-        if (await ExternalPlayerService.tryHandlePlayback(
-            context, playableItem)) {
-          return;
-        }
-      }
-
-      await widget.videoState.initializePlayer(
-        path,
-        playbackSession: playbackSession,
-      );
-      if (!mounted) return;
-      BlurSnackBar.show(context, '已切换到新的播放项');
-    } catch (e) {
-      if (!mounted) return;
-      BlurSnackBar.show(context, '无法播放该条目：$e');
+      final started = await PlaybackService().play(PlayableItem(
+        videoPath: path,
+        mediaKey: MediaIdentityResolver.forPath(path),
+        detailContext: widget.videoState.playbackDetailContext,
+      ));
+      if (started && mounted) BlurSnackBar.show(context, '已切换到新的播放项');
+    } catch (error) {
+      if (mounted) BlurSnackBar.show(context, '无法播放该条目：$error');
     }
   }
 
@@ -695,10 +645,8 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
                     ),
                     const SizedBox(width: 6),
                     Text(
-                      '播放列表 · ${_sourceName()}',
-                      style: CupertinoTheme.of(context)
-                          .textTheme
-                          .navTitleTextStyle,
+                      _sourceName(),
+                      style: CupertinoTheme.of(context).textTheme.textStyle,
                     ),
                   ],
                 ),
@@ -717,7 +665,7 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
           const SliverFillRemaining(
             hasScrollBody: false,
             child: Center(
-              child: CupertinoActivityIndicator(radius: 16),
+              child: AdaptivePlayerMenuProgressIndicator(size: 32),
             ),
           )
         else if (_error != null)
@@ -736,9 +684,10 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
                   ),
                 ),
                 const SizedBox(height: 12),
-                CupertinoButton(
+                AdaptiveButton(
+                  label: '重试',
+                  style: AdaptiveButtonStyle.glass,
                   onPressed: _loadData,
-                  child: const Text('重试'),
                 ),
               ],
             ),
@@ -752,7 +701,7 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
                 return Padding(
                   padding:
                       const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                  child: GestureDetector(
+                  child: AdaptivePlayerMenuActionSurface(
                     onTap: isCurrent ? null : () => _playEpisode(path),
                     child: Container(
                       padding: const EdgeInsets.all(12),
@@ -798,9 +747,6 @@ class _CupertinoPlaylistPaneState extends State<CupertinoPlaylistPane> {
               childCount: _episodes.length,
             ),
           ),
-        SliverToBoxAdapter(
-          child: CupertinoPaneBackButton(onPressed: widget.onBack),
-        ),
       ],
     );
   }

@@ -1,5 +1,4 @@
-import 'dart:collection';
-
+import 'package:nipaplay/player_menu/player_quick_controls.dart';
 import 'package:nipaplay/themes/cupertino/cupertino_imports.dart';
 import 'package:nipaplay/player_abstraction/player_factory.dart';
 import 'package:nipaplay/player_menu/player_menu_definition_builder.dart';
@@ -7,7 +6,6 @@ import 'package:nipaplay/player_menu/player_menu_models.dart';
 import 'package:nipaplay/player_menu/player_menu_pane_controllers.dart';
 import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_audio_tracks_pane.dart';
-import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_control_bar_settings_pane.dart';
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_danmaku_list_pane.dart';
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_danmaku_offset_pane.dart';
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_danmaku_settings_pane.dart';
@@ -15,48 +13,17 @@ import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_danmaku_
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_jellyfin_quality_pane.dart';
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_playback_info_pane.dart';
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_playback_rate_pane.dart';
-import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_pane_back_button.dart';
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_seek_step_pane.dart';
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_playlist_pane.dart';
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_subtitle_list_pane.dart';
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_subtitle_settings_pane.dart';
 import 'package:nipaplay/themes/cupertino/widgets/player_menu/cupertino_subtitle_tracks_pane.dart';
+import 'package:nipaplay/themes/cupertino/widgets/player_menu/adaptive_player_menu_primitives.dart';
 import 'package:nipaplay/utils/video_player_state.dart';
 import 'package:provider/provider.dart';
 
-class CupertinoPlayerMenu extends StatefulWidget {
+class CupertinoPlayerMenu extends StatelessWidget {
   const CupertinoPlayerMenu({super.key});
-
-  @override
-  State<CupertinoPlayerMenu> createState() => _CupertinoPlayerMenuState();
-}
-
-class _CupertinoPlayerMenuState extends State<CupertinoPlayerMenu> {
-  PlayerMenuPaneId? _activePane;
-  final List<PlayerMenuPaneId?> _navigationStack = [null];
-  late final PlayerKernelType _currentKernelType;
-
-  @override
-  void initState() {
-    super.initState();
-    _currentKernelType = PlayerFactory.getKernelType();
-  }
-
-  void _openPane(PlayerMenuPaneId paneId) {
-    if (_activePane == paneId) return;
-    setState(() {
-      _navigationStack.add(paneId);
-      _activePane = paneId;
-    });
-  }
-
-  void _navigateBack() {
-    if (_navigationStack.length <= 1) return;
-    setState(() {
-      _navigationStack.removeLast();
-      _activePane = _navigationStack.last;
-    });
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -65,125 +32,69 @@ class _CupertinoPlayerMenuState extends State<CupertinoPlayerMenu> {
         final menuItems = PlayerMenuDefinitionBuilder(
           context: PlayerMenuContext(
             videoState: videoState,
-            kernelType: _currentKernelType,
+            kernelType: PlayerFactory.getKernelType(),
           ),
         ).build();
-        final Map<PlayerMenuPaneId, PlayerMenuItemDefinition> paneLookup = {
-          for (final item in menuItems) item.paneId: item,
-        };
-
-        if (_activePane != null && !paneLookup.containsKey(_activePane)) {
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (!mounted) return;
-            setState(() {
-              _navigationStack
-                ..clear()
-                ..add(null);
-              _activePane = null;
-            });
-          });
-        }
-
-        final Widget child = _activePane == null
-            ? _CupertinoPlayerMenuHome(
-                items: menuItems,
-                onSelect: _openPane,
-              )
-            : _CupertinoPlayerMenuPaneView(
-                pane: paneLookup[_activePane]!,
-                onBack: _navigateBack,
-                content: _buildPaneContent(
-                    _activePane!, videoState, _navigateBack),
-              );
-
-        return AnimatedSwitcher(
-          duration: const Duration(milliseconds: 250),
-          switchInCurve: Curves.easeOut,
-          switchOutCurve: Curves.easeIn,
-          child: KeyedSubtree(
-            key: ValueKey(_activePane ?? 'root'),
-            child: child,
-          ),
+        return _CupertinoPlayerMenuHome(
+          items: menuItems,
+          onSelect: (item) => _openPane(context, item, videoState),
         );
       },
     );
   }
 
-  Widget _buildPaneContent(PlayerMenuPaneId paneId, VideoPlayerState videoState,
-      VoidCallback onBack) {
+  Future<void> _openPane(
+    BuildContext context,
+    PlayerMenuItemDefinition item,
+    VideoPlayerState videoState,
+  ) {
+    return CupertinoBottomSheetPageNavigator.push<void>(
+      context,
+      title: item.title,
+      builder: (_) => _buildPaneContent(item.paneId, videoState),
+    );
+  }
+
+  Widget _buildPaneContent(
+    PlayerMenuPaneId paneId,
+    VideoPlayerState videoState,
+  ) {
     switch (paneId) {
       case PlayerMenuPaneId.subtitleTracks:
-        return CupertinoSubtitleTracksPane(
-          videoState: videoState,
-          onBack: onBack,
-        );
+        return CupertinoSubtitleTracksPane(videoState: videoState);
       case PlayerMenuPaneId.subtitleSettings:
         return ChangeNotifierProvider(
           create: (_) => SubtitleSettingsPaneController(videoState: videoState),
-          child: CupertinoSubtitleSettingsPane(onBack: onBack),
+          child: const CupertinoSubtitleSettingsPane(),
         );
       case PlayerMenuPaneId.subtitleList:
-        return CupertinoSubtitleListPane(
-          videoState: videoState,
-          onBack: onBack,
-        );
+        return CupertinoSubtitleListPane(videoState: videoState);
       case PlayerMenuPaneId.audioTracks:
-        return CupertinoAudioTracksPane(
-          videoState: videoState,
-          onBack: onBack,
-        );
+        return CupertinoAudioTracksPane(videoState: videoState);
       case PlayerMenuPaneId.danmakuSettings:
-        return CupertinoDanmakuSettingsPane(
-          videoState: videoState,
-          onBack: onBack,
-        );
+        return CupertinoDanmakuSettingsPane(videoState: videoState);
       case PlayerMenuPaneId.danmakuTracks:
-        return CupertinoDanmakuTracksPane(
-          videoState: videoState,
-          onBack: onBack,
-        );
+        return CupertinoDanmakuTracksPane(videoState: videoState);
       case PlayerMenuPaneId.danmakuList:
-        return CupertinoDanmakuListPane(
-          videoState: videoState,
-          onBack: onBack,
-        );
+        return CupertinoDanmakuListPane(videoState: videoState);
       case PlayerMenuPaneId.danmakuOffset:
-        return CupertinoDanmakuOffsetPane(onBack: onBack);
-      case PlayerMenuPaneId.controlBarSettings:
-        return CupertinoControlBarSettingsPane(
-          videoState: videoState,
-          onBack: onBack,
-        );
+        return const CupertinoDanmakuOffsetPane();
       case PlayerMenuPaneId.playbackRate:
         return ChangeNotifierProvider(
           create: (_) => PlaybackRatePaneController(videoState: videoState),
-          child: CupertinoPlaybackRatePane(onBack: onBack),
+          child: const CupertinoPlaybackRatePane(),
         );
       case PlayerMenuPaneId.seekStep:
         return ChangeNotifierProvider(
           create: (_) => SeekStepPaneController(videoState: videoState),
-          child: CupertinoSeekStepPane(onBack: onBack),
+          child: const CupertinoSeekStepPane(),
         );
       case PlayerMenuPaneId.playbackInfo:
-        return CupertinoPlaybackInfoPane(
-          videoState: videoState,
-          onBack: onBack,
-        );
+        return CupertinoPlaybackInfoPane(videoState: videoState);
       case PlayerMenuPaneId.playlist:
-        return CupertinoPlaylistPane(
-          videoState: videoState,
-          onBack: onBack,
-        );
+        return CupertinoPlaylistPane(videoState: videoState);
       case PlayerMenuPaneId.jellyfinQuality:
-        return CupertinoJellyfinQualityPane(
-          videoState: videoState,
-          onBack: onBack,
-        );
-      default:
-        return _CupertinoPlayerMenuPlaceholder(
-          message: '该功能的 Cupertino 样式正在适配中，请使用其他主题或稍后再试。',
-          onBack: onBack,
-        );
+        return CupertinoJellyfinQualityPane(videoState: videoState);
     }
   }
 }
@@ -195,7 +106,7 @@ class _CupertinoPlayerMenuHome extends StatelessWidget {
   });
 
   final List<PlayerMenuItemDefinition> items;
-  final ValueChanged<PlayerMenuPaneId> onSelect;
+  final ValueChanged<PlayerMenuItemDefinition> onSelect;
 
   @override
   Widget build(BuildContext context) {
@@ -218,27 +129,30 @@ class _CupertinoPlayerMenuHome extends StatelessWidget {
       );
     }
 
-    final Map<PlayerMenuCategory, List<PlayerMenuItemDefinition>> grouped =
-        LinkedHashMap();
+    final Map<PlayerMenuCategory, List<PlayerMenuItemDefinition>> grouped = {};
     for (final item in items) {
       grouped.putIfAbsent(item.category, () => []).add(item);
     }
 
-    final sections = <Widget>[];
+    final videoState = context.watch<VideoPlayerState>();
+    final sections = <Widget>[
+      if (videoState.showPlayerMenuQuickControls && videoState.hasVideo)
+        const PlayerQuickControls(cupertino: true),
+    ];
     grouped.forEach((category, defs) {
       sections.add(
-        CupertinoListSection.insetGrouped(
+        AdaptivePlayerMenuSection(
           header: Text(_categoryTitle(category)),
           children: defs
               .map(
-                (item) => CupertinoListTile(
+                (item) => AdaptivePlayerMenuTile(
                   leading: Icon(
                     _iconFor(item.icon),
                     color: CupertinoColors.secondaryLabel.resolveFrom(context),
                   ),
                   title: Text(item.title),
                   trailing: const Icon(CupertinoIcons.chevron_right),
-                  onTap: () => onSelect(item.paneId),
+                  onTap: () => onSelect(item),
                 ),
               )
               .toList(),
@@ -297,8 +211,6 @@ class _CupertinoPlayerMenuHome extends StatelessWidget {
         return CupertinoIcons.list_bullet;
       case PlayerMenuIconToken.danmakuOffset:
         return CupertinoIcons.clock;
-      case PlayerMenuIconToken.controlBarSettings:
-        return CupertinoIcons.slider_horizontal_3;
       case PlayerMenuIconToken.playbackRate:
         return CupertinoIcons.speedometer;
       case PlayerMenuIconToken.playlist:
@@ -310,59 +222,5 @@ class _CupertinoPlayerMenuHome extends StatelessWidget {
       case PlayerMenuIconToken.seekStep:
         return CupertinoIcons.settings;
     }
-  }
-}
-
-class _CupertinoPlayerMenuPaneView extends StatelessWidget {
-  const _CupertinoPlayerMenuPaneView({
-    required this.pane,
-    required this.onBack,
-    required this.content,
-  });
-
-  final PlayerMenuItemDefinition pane;
-  final VoidCallback onBack;
-  final Widget content;
-
-  @override
-  Widget build(BuildContext context) {
-    return content;
-  }
-}
-
-class _CupertinoPlayerMenuPlaceholder extends StatelessWidget {
-  const _CupertinoPlayerMenuPlaceholder({
-    required this.message,
-    required this.onBack,
-  });
-
-  final String message;
-  final VoidCallback onBack;
-
-  @override
-  Widget build(BuildContext context) {
-    return CupertinoBottomSheetContentLayout(
-      sliversBuilder: (context, topSpacing) => [
-        SliverFillRemaining(
-          hasScrollBody: false,
-          child: Center(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 32),
-              child: Text(
-                message,
-                textAlign: TextAlign.center,
-                style: CupertinoTheme.of(context).textTheme.textStyle.copyWith(
-                      color:
-                          CupertinoColors.secondaryLabel.resolveFrom(context),
-                    ),
-              ),
-            ),
-          ),
-        ),
-        SliverToBoxAdapter(
-          child: CupertinoPaneBackButton(onPressed: onBack),
-        ),
-      ],
-    );
   }
 }

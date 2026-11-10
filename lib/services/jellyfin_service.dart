@@ -1,3 +1,5 @@
+import 'package:nipaplay/services/media_server_pagination.dart';
+import 'package:nipaplay/utils/performance_trace.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'package:flutter/foundation.dart';
@@ -6,6 +8,7 @@ import 'package:nipaplay/models/jellyfin_model.dart';
 import 'package:nipaplay/models/media_server_playback.dart';
 import 'package:nipaplay/models/server_profile_model.dart';
 import 'package:nipaplay/services/media_server_playback_client.dart';
+import 'package:nipaplay/services/media_server_image_loader.dart';
 import 'package:nipaplay/services/web_remote_access_service.dart';
 import 'package:path_provider/path_provider.dart'
     if (dart.library.html) 'package:nipaplay/utils/mock_path_provider.dart';
@@ -15,8 +18,37 @@ import '../models/jellyfin_transcode_settings.dart';
 import 'jellyfin_transcode_manager.dart';
 import 'media_server_service_base.dart';
 
+MediaServerPage<JellyfinMediaItem> _decodeJellyfinMediaPage(String body) =>
+    decodeMediaServerPage(body, JellyfinMediaItem.fromJson);
+MediaServerPage<JellyfinMovieInfo> _decodeJellyfinMoviePage(String body) =>
+    decodeMediaServerPage(body, JellyfinMovieInfo.fromJson);
+
 class JellyfinService extends MediaServerServiceBase
     implements MediaServerPlaybackClient {
+  Future<List<T>> _loadItemPages<T>(
+      String endpoint, MediaServerPage<T> Function(String) decoder,
+      {bool Function()? isCurrent}) {
+    final server = _serverUrl;
+    final user = _userId;
+    final token = _accessToken;
+    return loadMediaServerItems(
+      endpoint: endpoint,
+      request: _makeAuthenticatedRequest,
+      decode: (body) => PerformanceTrace.measure(
+          'jellyfin.items.decode',
+          () => body.length < 64 * 1024
+              ? Future.value(decoder(body))
+              : compute(decoder, body),
+          itemCount: (page) => page.items.length),
+      isCurrent: () =>
+          (isCurrent?.call() ?? true) &&
+          _isConnected &&
+          _serverUrl == server &&
+          _userId == user &&
+          _accessToken == token,
+    );
+  }
+
   static final JellyfinService instance = JellyfinService._internal();
 
   JellyfinService._internal();
@@ -38,6 +70,10 @@ class JellyfinService extends MediaServerServiceBase
 
   @override
   String get serviceType => 'jellyfin';
+
+  // Jellyfin 12 disables the legacy X-Emby authorization headers by default.
+  @override
+  String get authorizationHeaderName => 'Authorization';
 
   @override
   String get prefsKeyPrefix => 'jellyfin';
@@ -221,7 +257,11 @@ class JellyfinService extends MediaServerServiceBase
   @override
   String? get serverUrl => _serverUrl;
   @override
-  set serverUrl(String? value) => _serverUrl = value;
+  set serverUrl(String? value) {
+    _serverUrl = value;
+    setMediaServerBaseUrl('jellyfin', value);
+  }
+
   @override
   String? get username => _username;
   @override
@@ -274,13 +314,12 @@ class JellyfinService extends MediaServerServiceBase
   /// 执行完整的认证流程
   Future<void> _performAuthentication(
       String serverUrl, String username, String password) async {
-    final clientInfo = await getClientInfo();
     final authResponse = await sendRequestFollowingRedirects(
       Uri.parse('$serverUrl/Users/AuthenticateByName'),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Emby-Authorization': clientInfo,
+        ...await buildAuthorizationHeaders(includeToken: false),
       },
       body: json.encode({
         'Username': username,
@@ -405,6 +444,7 @@ class JellyfinService extends MediaServerServiceBase
   // 获取媒体库或文件夹下的子项（用于混合类型文件夹导航）
   Future<List<JellyfinMediaItem>> getFolderItems(
     String parentId, {
+    bool Function()? isCurrent,
     int limit = 99999,
   }) async {
     if (!_isConnected) {
@@ -427,24 +467,19 @@ class JellyfinService extends MediaServerServiceBase
           .map((e) => '${e.key}=${Uri.encodeComponent(e.value)}')
           .join('&');
 
-      final response = await _makeAuthenticatedRequest('/Items?$queryString');
+      final results = await _loadItemPages(
+          '/Items?$queryString', _decodeJellyfinMediaPage,
+          isCurrent: isCurrent);
+      results.sort((a, b) {
+        if (a.isFolder != b.isFolder) {
+          return a.isFolder ? -1 : 1;
+        }
+        return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      });
 
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        final List<dynamic> items = data['Items'] ?? [];
-
-        final results =
-            items.map((item) => JellyfinMediaItem.fromJson(item)).toList();
-
-        results.sort((a, b) {
-          if (a.isFolder != b.isFolder) {
-            return a.isFolder ? -1 : 1;
-          }
-          return a.name.toLowerCase().compareTo(b.name.toLowerCase());
-        });
-
-        return results;
-      }
+      return results;
+    } on MediaServerRequestSuperseded {
+      return [];
     } catch (e) {
       debugPrint('Error fetching folder items for parent $parentId: $e');
     }
@@ -455,10 +490,12 @@ class JellyfinService extends MediaServerServiceBase
   // 按特定媒体库获取最新内容
   Future<List<JellyfinMediaItem>> getLatestMediaItemsByLibrary(
     String libraryId, {
+    bool Function()? isCurrent,
     int limit = 20,
     String? sortBy,
     String? sortOrder,
   }) async {
+    final session = (_serverUrl, _userId, _accessToken);
     if (!_isConnected) {
       return [];
     }
@@ -472,6 +509,10 @@ class JellyfinService extends MediaServerServiceBase
       final libraryResponse =
           await _makeAuthenticatedRequest('/Users/$_userId/Items/$libraryId');
 
+      if (session != (_serverUrl, _userId, _accessToken) ||
+          !(isCurrent?.call() ?? true)) {
+        return [];
+      }
       if (libraryResponse.statusCode != 200) {
         return [];
       }
@@ -490,15 +531,12 @@ class JellyfinService extends MediaServerServiceBase
         includeItemTypes = 'Movie,Episode,Video';
       }
 
-      final response = await _makeAuthenticatedRequest(
-          '/Items?ParentId=$libraryId&IncludeItemTypes=$includeItemTypes&Recursive=true&SortBy=$defaultSortBy&SortOrder=$defaultSortOrder&Limit=$limit&userId=$_userId&Fields=Overview,CommunityRating');
-
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        final List<dynamic> items = data['Items'];
-
-        return items.map((item) => JellyfinMediaItem.fromJson(item)).toList();
-      }
+      return await _loadItemPages(
+          '/Items?ParentId=$libraryId&IncludeItemTypes=$includeItemTypes&Recursive=true&SortBy=$defaultSortBy&SortOrder=$defaultSortOrder&Limit=$limit&userId=$_userId&Fields=Overview,CommunityRating',
+          _decodeJellyfinMediaPage,
+          isCurrent: isCurrent);
+    } on MediaServerRequestSuperseded {
+      return [];
     } catch (e) {
       debugPrint('Error fetching media items for library $libraryId: $e');
     }
@@ -556,10 +594,12 @@ class JellyfinService extends MediaServerServiceBase
   }
 
   Future<List<JellyfinMediaItem>> getLatestMediaItems({
+    bool Function()? isCurrent,
     int limit = 99999,
     String? sortBy,
     String? sortOrder,
   }) async {
+    final session = (_serverUrl, _userId, _accessToken);
     if (!_isConnected || _selectedLibraryIds.isEmpty) {
       return [];
     }
@@ -574,12 +614,20 @@ class JellyfinService extends MediaServerServiceBase
     List<JellyfinMediaItem> allItems = [];
 
     // 从每个选中的媒体库获取最新内容
-    for (String libraryId in _selectedLibraryIds) {
+    for (String libraryId in List<String>.of(_selectedLibraryIds)) {
+      if (session != (_serverUrl, _userId, _accessToken) ||
+          !(isCurrent?.call() ?? true)) {
+        return [];
+      }
       try {
         // 首先获取媒体库信息以确定类型
         final libraryResponse =
             await _makeAuthenticatedRequest('/Users/$_userId/Items/$libraryId');
 
+        if (session != (_serverUrl, _userId, _accessToken) ||
+            !(isCurrent?.call() ?? true)) {
+          return [];
+        }
         if (libraryResponse.statusCode == 200) {
           final libraryData = json.decode(libraryResponse.body);
           final String collectionType =
@@ -595,19 +643,13 @@ class JellyfinService extends MediaServerServiceBase
             includeItemTypes = 'Movie,Episode,Video';
           }
 
-          final response = await _makeAuthenticatedRequest(
-              '/Items?ParentId=$libraryId&IncludeItemTypes=$includeItemTypes&Recursive=true&SortBy=$defaultSortBy&SortOrder=$defaultSortOrder&Limit=$limit&userId=$_userId');
-
-          if (response.statusCode == 200) {
-            final data = json.decode(response.body);
-            final List<dynamic> items = data['Items'];
-
-            List<JellyfinMediaItem> libraryItems =
-                items.map((item) => JellyfinMediaItem.fromJson(item)).toList();
-
-            allItems.addAll(libraryItems);
-          }
+          allItems.addAll(await _loadItemPages(
+              '/Items?ParentId=$libraryId&IncludeItemTypes=$includeItemTypes&Recursive=true&SortBy=$defaultSortBy&SortOrder=$defaultSortOrder&Limit=$limit&userId=$_userId',
+              _decodeJellyfinMediaPage,
+              isCurrent: isCurrent));
         }
+      } on MediaServerRequestSuperseded {
+        return [];
       } catch (e, stackTrace) {
         // Log the error and stack trace for debugging purposes
         print('Error processing library $libraryId: $e');
@@ -622,16 +664,25 @@ class JellyfinService extends MediaServerServiceBase
       allItems.sort((a, b) => b.dateAdded.compareTo(a.dateAdded));
     }
 
+    final seenIds = <String>{};
+    allItems.retainWhere((item) => seenIds.add(item.id));
+
     // 限制总数
     if (allItems.length > limit) {
       allItems = allItems.sublist(0, limit);
     }
 
+    if (session != (_serverUrl, _userId, _accessToken) ||
+        !(isCurrent?.call() ?? true)) {
+      return [];
+    }
     return allItems;
   }
 
   // 获取最新电影列表
-  Future<List<JellyfinMovieInfo>> getLatestMovies({int limit = 99999}) async {
+  Future<List<JellyfinMovieInfo>> getLatestMovies(
+      {int limit = 99999, bool Function()? isCurrent}) async {
+    final session = (_serverUrl, _userId, _accessToken);
     if (!_isConnected || _selectedLibraryIds.isEmpty) {
       return [];
     }
@@ -639,20 +690,18 @@ class JellyfinService extends MediaServerServiceBase
     List<JellyfinMovieInfo> allMovies = [];
 
     // 从每个选中的媒体库获取最新电影
-    for (String libraryId in _selectedLibraryIds) {
+    for (String libraryId in List<String>.of(_selectedLibraryIds)) {
+      if (session != (_serverUrl, _userId, _accessToken) ||
+          !(isCurrent?.call() ?? true)) {
+        return [];
+      }
       try {
-        final response = await _makeAuthenticatedRequest(
-            '/Items?ParentId=$libraryId&IncludeItemTypes=Movie&Recursive=true&SortBy=DateCreated,SortName&SortOrder=Descending&Limit=$limit&userId=$_userId');
-
-        if (response.statusCode == 200) {
-          final data = json.decode(response.body);
-          final List<dynamic> items = data['Items'];
-
-          List<JellyfinMovieInfo> libraryMovies =
-              items.map((item) => JellyfinMovieInfo.fromJson(item)).toList();
-
-          allMovies.addAll(libraryMovies);
-        }
+        allMovies.addAll(await _loadItemPages(
+            '/Items?ParentId=$libraryId&IncludeItemTypes=Movie&Recursive=true&SortBy=DateCreated,SortName&SortOrder=Descending&Limit=$limit&userId=$_userId',
+            _decodeJellyfinMoviePage,
+            isCurrent: isCurrent));
+      } on MediaServerRequestSuperseded {
+        return [];
       } catch (e) {
         // Log the error for debugging purposes
         print('Error fetching movies for library $libraryId: $e');
@@ -662,11 +711,18 @@ class JellyfinService extends MediaServerServiceBase
     // 按最近添加日期排序
     allMovies.sort((a, b) => b.dateAdded.compareTo(a.dateAdded));
 
+    final seenIds = <String>{};
+    allMovies.retainWhere((item) => seenIds.add(item.id));
+
     // 限制总数
     if (allMovies.length > limit) {
       allMovies = allMovies.sublist(0, limit);
     }
 
+    if (session != (_serverUrl, _userId, _accessToken) ||
+        !(isCurrent?.call() ?? true)) {
+      return [];
+    }
     return allMovies;
   }
 
@@ -1269,7 +1325,7 @@ class JellyfinService extends MediaServerServiceBase
       'MediaSourceId': resolvedMediaSourceId,
       if (playSessionId != null && playSessionId.isNotEmpty)
         'PlaySessionId': playSessionId,
-      if (_accessToken != null) 'api_key': _accessToken!,
+      if (_accessToken != null) 'ApiKey': _accessToken!,
     };
     final uri = Uri.parse('$_serverUrl/Videos/$itemId/stream')
         .replace(queryParameters: params);
@@ -1285,7 +1341,7 @@ class JellyfinService extends MediaServerServiceBase
     }
 
     final params = <String, String>{
-      'api_key': _accessToken!,
+      'ApiKey': _accessToken!,
       // HLS master.m3u8 需要 MediaSourceId（大多数情况下与 itemId 相同）
       'MediaSourceId': itemId,
       // 指定分片容器，Jellyfin 默认 HLS TS 更通用
@@ -1322,7 +1378,7 @@ class JellyfinService extends MediaServerServiceBase
     }
 
     final params = <String, String>{
-      'api_key': _accessToken!,
+      'ApiKey': _accessToken!,
       'mediaSourceId': itemId, // 修正参数名
       'segmentContainer': 'ts',
     };
@@ -1587,7 +1643,7 @@ class JellyfinService extends MediaServerServiceBase
             if (isExternal) {
               final mediaSourceId = mediaSource['Id'];
               final subtitleUrl =
-                  '$_serverUrl/Videos/$itemId/$mediaSourceId/Subtitles/$realIndex/Stream.$codec?api_key=$_accessToken';
+                  '$_serverUrl/Videos/$itemId/$mediaSourceId/Subtitles/$realIndex/Stream.$codec?ApiKey=$_accessToken';
               trackInfo['downloadUrl'] = subtitleUrl;
             }
 
@@ -1638,15 +1694,20 @@ class JellyfinService extends MediaServerServiceBase
 
       // 构建字幕下载URL
       final subtitleUrl =
-          '$_serverUrl/Videos/$itemId/$mediaSourceId/Subtitles/$subtitleIndex/Stream.$format?api_key=$_accessToken';
+          '$_serverUrl/Videos/$itemId/$mediaSourceId/Subtitles/$subtitleIndex/Stream.$format?ApiKey=$_accessToken';
 
       debugPrint(
         'JellyfinService: 下载字幕文件: ${Uri.parse(subtitleUrl).replace(queryParameters: const <String, String>{})}',
       );
 
       // 下载字幕文件
-      final subtitleResponse = await http
-          .get(WebRemoteAccessService.proxyUri(Uri.parse(subtitleUrl)));
+      final subtitleResponse = await sendRequestFollowingRedirects(
+        WebRemoteAccessService.proxyUri(Uri.parse(subtitleUrl)),
+        method: 'GET',
+        headers: const {},
+        timeout: const Duration(seconds: 30),
+        redirectLogLabel: 'JellyfinService: 下载字幕',
+      );
 
       if (subtitleResponse.statusCode == 200) {
         // 保存到临时文件
@@ -1889,7 +1950,13 @@ class JellyfinService extends MediaServerServiceBase
       {String method = 'GET',
       Map<String, dynamic>? body,
       Duration? timeout}) async {
-    return makeAuthenticatedRequest(endpoint,
-        method: method, body: body, timeout: timeout);
+    return PerformanceTrace.measure(
+        PerformanceTrace.enabled && PerformanceTrace.isItemListing(endpoint)
+            ? 'jellyfin.http.items'
+            : 'jellyfin.http.other',
+        () => makeAuthenticatedRequest(endpoint,
+            method: method, body: body, timeout: timeout),
+        responseBytes: (response) => response.bodyBytes.length,
+        isFailure: (response) => response.statusCode >= 400);
   }
 }

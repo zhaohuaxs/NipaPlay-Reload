@@ -4,7 +4,7 @@ import 'package:nipaplay/danmaku_abstraction/positioned_danmaku_item.dart';
 import 'package:nipaplay/danmaku_next/danmaku_atlas_painter.dart';
 import 'package:nipaplay/danmaku_next/nipaplay_next_engine.dart';
 import 'package:nipaplay/danmaku_next/danmaku_next_log.dart';
-import 'package:nipaplay/utils/video_player_state.dart';
+import 'package:nipaplay/utils/danmaku/style.dart';
 
 const Locale _danmakuLocale = Locale.fromSubtags(
   languageCode: 'zh',
@@ -105,6 +105,9 @@ class _NipaPlayNextOverlayState extends State<NipaPlayNextOverlay>
     if (listIdentity != _listIdentity) {
       _listIdentity = listIdentity;
       _layoutSnapshotPending = true;
+      // 2026-06-22 方案A：danmakuList 变化时触发预构建，
+      // 让初期几帧快速填满 rasterCache + atlas slots，减少运行时 addSprite:new
+      DanmakuAtlasPainter.requestPrebuild();
       DanmakuNextLog.d(
         'Overlay',
         'danmaku list changed size=${widget.danmakuList.length}',

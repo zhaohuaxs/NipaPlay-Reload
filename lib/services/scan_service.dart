@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:io' if (dart.library.io) 'dart:io';
@@ -6,6 +7,8 @@ import 'package:nipaplay/models/watch_history_model.dart';
 import 'package:nipaplay/services/concurrent_video_processor.dart';
 import 'package:nipaplay/services/rust_file_scan_service.dart';
 import 'package:nipaplay/services/android_saf_service.dart';
+import 'package:nipaplay/services/harmony_local_media_service.dart';
+import 'package:nipaplay/utils/platform_identity.dart' as platformIdentity;
 import 'package:nipaplay/utils/ios_container_path_fixer.dart';
 import 'dart:convert';
 // Import Provider if ScanService needs to directly refresh other providers,
@@ -173,11 +176,108 @@ class ScanService with ChangeNotifier {
   int _totalFilesFound = 0;
   int get totalFilesFound => _totalFilesFound;
 
-  ScanService() {
-    _loadScannedFolders();
-    _loadSubFolderHashCache();
-    // 启动时自动检测变化
-    _performStartupChangeDetection();
+  final Future<List<VideoProcessResult>> Function(List<String>)
+      _completedFilesProcessor;
+
+  @visibleForTesting
+  ScanService.forTesting({
+    required Future<List<VideoProcessResult>> Function(List<String>)
+        completedFilesProcessor,
+    Future<void> Function()? startupAction,
+  })  : _completedFilesProcessor = completedFilesProcessor,
+        _startupAction = startupAction;
+
+  static Future<List<VideoProcessResult>> _processCompletedFiles(
+          List<String> paths) =>
+      ConcurrentVideoProcessor.processVideoPaths(paths,
+          skipPreviouslyMatchedUnwatched: true);
+
+  final Future<void> Function()? _startupAction;
+  Future<void> _foldersLoaded = Future.value();
+  Future<void>? _startupRefresh;
+  Timer? _progressNotification;
+  bool _disposed = false;
+  int _scanGeneration = 0;
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _progressNotification?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void notifyListeners() {
+    if (!_disposed) super.notifyListeners();
+  }
+
+  void _notifyScanProgress({bool immediate = false}) {
+    if (_disposed) return;
+    if (immediate) {
+      _progressNotification?.cancel();
+      _progressNotification = null;
+      notifyListeners();
+    } else {
+      _progressNotification ??= Timer(const Duration(milliseconds: 100), () {
+        _progressNotification = null;
+        notifyListeners();
+      });
+    }
+  }
+
+  /// Called by the application after its first frame, not by the constructor.
+  Future<void> startStartupRefresh({Future<void>? playbackReady}) =>
+      _startupRefresh ??= _startAfterPlayback(playbackReady);
+
+  Future<void> _startAfterPlayback(Future<void>? playbackReady) async {
+    try {
+      await playbackReady?.timeout(const Duration(seconds: 20));
+    } catch (error) {
+      debugPrint('启动扫描等待播放就绪结束: $error');
+    }
+    if (_disposed) return;
+    if (_startupAction != null) {
+      await _startupAction();
+      return;
+    }
+    await _startupSmartRefresh(_foldersLoaded);
+  }
+
+  ScanService()
+      : _completedFilesProcessor = _processCompletedFiles,
+        _startupAction = null {
+    // 媒体文件夹列表从 SharedPreferences 异步加载，
+    // 保留这个 Future，等它加载完成后再触发启动智能刷新。
+    _foldersLoaded = Future.wait([
+      _loadScannedFolders(),
+      _loadSubFolderHashCache(),
+    ]);
+    // Startup scanning is explicitly armed by the rendered application.
+  }
+
+  /// 启动时自动执行一次媒体库智能刷新。
+  ///
+  /// 等待已添加的媒体文件夹列表加载完成后执行 [rescanAllFolders]：
+  /// 先用 Rust 快速比对每个文件夹的文件差异，只重新扫描真正发生变化的
+  /// 文件夹；所有文件夹均无变化时会立即结束，不会造成额外开销。
+  /// Web 平台、没有已添加文件夹或已有扫描任务进行中时自动跳过。
+  Future<void> _startupSmartRefresh(Future<void> foldersLoaded) async {
+    if (kIsWeb) return;
+    try {
+      await foldersLoaded;
+    } catch (_) {
+      // 文件夹列表加载失败时静默放弃本次自动刷新
+      return;
+    }
+    if (_disposed || _scannedFolders.isEmpty || _isScanning) return;
+    // 短暂延迟，让主界面先完成首帧渲染，避免差异比对与启动 I/O 争抢资源
+    await Future<void>.delayed(const Duration(seconds: 2));
+    if (_disposed || _isScanning) return;
+    try {
+      await rescanAllFolders();
+    } catch (e) {
+      debugPrint('启动时自动智能刷新失败: $e');
+    }
   }
 
   bool _isAndroidSafPath(String path) {
@@ -225,7 +325,30 @@ class ScanService with ChangeNotifier {
           }
         }
       } else {
-        _scannedFolders = rawFolders;
+        // Android: 将旧版 PR#599 存的 content:// primary tree URI 迁移为文件路径
+        // （恢复 io.File 兼容）。SD/OTG 的 content:// 保留走 SAF。
+        if (Platform.isAndroid) {
+          final migrated = <String>[];
+          int migratedCount = 0;
+          for (final folder in rawFolders) {
+            final converted = AndroidSafService.tryConvertToFilePath(folder);
+            // 验证转换后的真实路径可访问（MANAGE_EXTERNAL_STORAGE 覆盖）。
+            // 不可访问（如 USB OTG 被 OEM 限制）则保留原 content:// 走 SAF。
+            if (converted != folder && !Directory(converted).existsSync()) {
+              migrated.add(folder);
+            } else {
+              if (converted != folder) migratedCount++;
+              migrated.add(converted);
+            }
+          }
+          _scannedFolders = migrated;
+          if (migratedCount > 0) {
+            await prefs.setStringList(_scannedFoldersPrefsKey, migrated);
+            debugPrint('ScanService: 迁移 $migratedCount 个 content:// 文件夹到文件路径');
+          }
+        } else {
+          _scannedFolders = rawFolders;
+        }
       }
 
       notifyListeners();
@@ -294,6 +417,16 @@ class ScanService with ChangeNotifier {
   Future<_FolderFileDiff> _calculateFolderFileDiffWithRust(
     String folderPath,
   ) async {
+    final cachedHashes = _subFolderHashCache[folderPath];
+    if (cachedHashes != null && !_isAndroidSafPath(folderPath)) {
+      _subFolderHashCache[folderPath] = await _matchedFileHashes(
+        folderPath,
+        cachedHashes,
+      );
+    }
+    if (platformIdentity.isHarmonyOS) {
+      await HarmonyLocalMediaService.ensureDirectoryAccess(folderPath);
+    }
     if (_isAndroidSafPath(folderPath)) {
       return _calculateFolderFileDiffWithSaf(folderPath);
     }
@@ -312,7 +445,13 @@ class ScanService with ChangeNotifier {
     String folderUri,
   ) async {
     final entries = await AndroidSafService.scanDirectory(folderUri);
-    final cachedHashes = _subFolderHashCache[folderUri] ?? {};
+    final cachedHashes = await _matchedFileHashes(
+      folderUri,
+      _subFolderHashCache[folderUri] ?? {},
+      filePathsByRelativePath: {
+        for (final entry in entries) entry.relativePath: entry.uri,
+      },
+    );
     final currentHashes = <String, String>{
       for (final entry in entries) entry.relativePath: entry.fileHash,
     };
@@ -354,13 +493,37 @@ class ScanService with ChangeNotifier {
     );
   }
 
+  // A file fingerprint only skips work when recognition was persisted too.
+  // Reconcile old caches as well, so earlier failed matches can recover.
+  Future<Map<String, String>> _matchedFileHashes(
+    String folderPath,
+    Map<String, String> hashes, {
+    Map<String, String>? filePathsByRelativePath,
+  }) async {
+    final history = await WatchHistoryManager.getAllHistory();
+    final matchedPaths = history
+        .where((item) =>
+            item.animeId != null &&
+            item.episodeId != null &&
+            item.animeName.trim().isNotEmpty)
+        .map((item) => item.filePath)
+        .toSet();
+    return Map.fromEntries(hashes.entries.where((entry) {
+      final path =
+          filePathsByRelativePath?[entry.key] ?? p.join(folderPath, entry.key);
+      return matchedPaths.contains(path);
+    }));
+  }
+
   Future<void> _storeFileHashes(
     String folderPath,
     _FolderFileDiff diff,
   ) async {
     if (diff.currentHashes != null) {
-      _subFolderHashCache[folderPath] = Map<String, String>.from(
+      _subFolderHashCache[folderPath] = await _matchedFileHashes(
+        folderPath,
         diff.currentHashes!,
+        filePathsByRelativePath: diff.filePathsByRelativePath,
       );
       await _saveSubFolderHashCache();
       debugPrint("已使用扫描结果更新文件夹 $folderPath 的hash缓存");
@@ -394,6 +557,15 @@ class ScanService with ChangeNotifier {
         continue;
       }
 
+      if (platformIdentity.isHarmonyOS) {
+        try {
+          await HarmonyLocalMediaService.ensureDirectoryAccess(folderPath);
+        } catch (_) {
+          // Lost authorization or a disconnected volume is not a deletion.
+          continue;
+        }
+      }
+
       if (_isAndroidSafPath(folderPath)) {
         if (!await AndroidSafService.canAccessTree(folderPath)) {
           keysToRemove.add(folderPath);
@@ -419,73 +591,6 @@ class ScanService with ChangeNotifier {
     await _saveSubFolderHashCache();
     debugPrint("已清理所有文件夹hash缓存");
     _updateScanMessage("已清理智能扫描缓存，下次扫描将检查所有文件夹。");
-  }
-
-  /// 启动时执行变化检测
-  Future<void> _performStartupChangeDetection() async {
-    if (kIsWeb) return;
-    if (_scannedFolders.isEmpty) {
-      return;
-    }
-
-    debugPrint("开始启动时变化检测，检查 ${_scannedFolders.length} 个文件夹");
-    _detectedChanges.clear();
-
-    for (final folderPath in _scannedFolders) {
-      try {
-        final changes = await _detectDetailedFolderChanges(folderPath);
-        if (changes != null) {
-          _detectedChanges.add(changes);
-        }
-      } catch (e) {
-        debugPrint("检测文件夹 $folderPath 变化时出错: $e");
-      }
-    }
-
-    if (_detectedChanges.isNotEmpty) {
-      debugPrint("启动时检测到 ${_detectedChanges.length} 个文件夹有变化");
-      notifyListeners(); // 通知UI有变化检测结果
-    } else {
-      debugPrint("启动时检测完成，所有文件夹都没有变化");
-    }
-  }
-
-  /// 详细检测文件夹变化，包括子文件夹级别的变化
-  Future<FolderChangeInfo?> _detectDetailedFolderChanges(
-      String folderPath) async {
-    if (kIsWeb) return null;
-    if (!_isAndroidSafPath(folderPath)) {
-      final directory = Directory(folderPath);
-      if (!await directory.exists()) {
-        // 文件夹已删除
-        return FolderChangeInfo(
-          folderPath: folderPath,
-          changeType: 'deleted',
-          detectedAt: DateTime.now(),
-        );
-      }
-    } else if (!await AndroidSafService.canAccessTree(folderPath)) {
-      // 文件夹已删除
-      return FolderChangeInfo(
-        folderPath: folderPath,
-        changeType: 'deleted',
-        detectedAt: DateTime.now(),
-      );
-    }
-
-    final diff = await _calculateFolderFileDiff(folderPath);
-    if (!diff.hasChanges) {
-      return null; // 没有变化
-    }
-
-    return FolderChangeInfo(
-      folderPath: folderPath,
-      changeType: 'modified',
-      newFiles: diff.newFiles,
-      deletedFiles: diff.deletedFiles,
-      changedFiles: diff.modifiedFiles,
-      detectedAt: DateTime.now(),
-    );
   }
 
   /// 计算文件夹内视频文件的变化明细
@@ -553,6 +658,8 @@ class ScanService with ChangeNotifier {
   void _updateScanState(
       {bool? scanning, double? progress, String? message, bool? completed}) {
     bool changed = false;
+    final stateChanged = scanning != null && _isScanning != scanning;
+    if (stateChanged) _scanGeneration++;
     if (scanning != null && _isScanning != scanning) {
       _isScanning = scanning;
       changed = true;
@@ -574,18 +681,15 @@ class ScanService with ChangeNotifier {
     }
 
     if (changed || (completed != null && completed)) {
-      // Ensure listener notification on completion
-      debugPrint(
-          "准备通知监听器状态变化: isScanning=$_isScanning, justFinishedScanning=$_justFinishedScanning, totalFilesFound=$_totalFilesFound");
-      notifyListeners();
-      debugPrint("已通知监听器状态变化");
+      _notifyScanProgress(
+          immediate: stateChanged || completed == true || !_isScanning);
     }
   }
 
   void _updateScanMessage(String message) {
     if (_scanMessage != message) {
       _scanMessage = message;
-      notifyListeners();
+      _notifyScanProgress(immediate: !_isScanning);
     }
   }
 
@@ -848,10 +952,11 @@ class ScanService with ChangeNotifier {
     }
 
     // 第二阶段：并发处理视频文件
+    final generation = _scanGeneration;
     final results = await ConcurrentVideoProcessor.processVideoPaths(videoPaths,
         skipPreviouslyMatchedUnwatched: skipPreviouslyMatchedUnwatched,
         onProgress: (processed, total, currentFile) {
-      if (!_isScanning) return;
+      if (_disposed || !_isScanning || generation != _scanGeneration) return;
       _updateScanState(
           progress: processed / total,
           message: "正在处理: $currentFile ($processed/$total)");
@@ -863,6 +968,7 @@ class ScanService with ChangeNotifier {
       return;
     }
 
+    if (_disposed || generation != _scanGeneration) return;
     // 第三阶段：处理结果
     final successResults = results.where((r) => r.success).toList();
     final failedResults = results.where((r) => !r.success).toList();
@@ -898,6 +1004,39 @@ class ScanService with ChangeNotifier {
     } else if (isPartOfBatch) {
       _totalFilesFound += videoPaths.length;
       await _updateFileHashes(directoryPath, precomputedDiff: diff);
+    }
+  }
+
+  /// Import the exact completed files, without registering a shared download
+  /// directory that could later expose other torrents' unfinished files.
+  Future<bool> scanCompletedFiles(List<String> paths,
+      {required String folderPath}) async {
+    if (kIsWeb || _isScanning) return false;
+    if (paths.isEmpty) return true;
+    _updateScanState(scanning: true, progress: 0, message: '正在扫描已完成的下载文件');
+    try {
+      final results = await _completedFilesProcessor(paths);
+      if (!_isScanning) return false;
+      final failures = results.where((result) => !result.success).toList();
+      final scannedPaths = paths.toSet();
+      _failedScanFiles
+          .removeWhere((file) => scannedPaths.contains(file.filePath));
+      _recordFailedScanFiles(folderPath, failures);
+      _totalFilesFound = paths.length;
+      final succeeded = failures.isEmpty;
+      _updateScanState(
+        scanning: false,
+        progress: 1,
+        message: succeeded ? '下载文件已加入媒体库' : '部分下载文件扫描失败，稍后重试',
+        completed: true,
+      );
+      return succeeded;
+    } catch (error) {
+      _updateScanState(
+          scanning: false, message: '扫描下载文件失败: $error', completed: true);
+      return false;
+    } finally {
+      if (_isScanning) _updateScanState(scanning: false);
     }
   }
 
@@ -997,7 +1136,16 @@ class ScanService with ChangeNotifier {
     }
 
     final missingFolders = <String>[];
+    var inaccessibleFolders = 0;
     for (final folderPath in List<String>.from(_scannedFolders)) {
+      if (platformIdentity.isHarmonyOS) {
+        try {
+          await HarmonyLocalMediaService.ensureDirectoryAccess(folderPath);
+        } catch (_) {
+          inaccessibleFolders++;
+          continue;
+        }
+      }
       if (_isAndroidSafPath(folderPath)) {
         if (!await AndroidSafService.canAccessTree(folderPath)) {
           missingFolders.add(folderPath);
@@ -1012,7 +1160,9 @@ class ScanService with ChangeNotifier {
     }
 
     if (missingFolders.isEmpty) {
-      _updateScanMessage("没有需要清理的不存在文件夹。");
+      _updateScanMessage(inaccessibleFolders > 0
+          ? '有 $inaccessibleFolders 个文件夹暂时无法访问，已保留，请恢复访问授权后重试。'
+          : "没有需要清理的不存在文件夹。");
       return 0;
     }
 

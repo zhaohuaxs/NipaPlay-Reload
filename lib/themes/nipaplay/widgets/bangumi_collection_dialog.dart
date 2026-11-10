@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
 import 'package:flutter/services.dart';
 import 'package:fluent_ui/fluent_ui.dart' as fluent;
 import 'package:kmbal_ionicons/kmbal_ionicons.dart';
@@ -8,6 +10,9 @@ import 'package:nipaplay/themes/nipaplay/widgets/nipaplay_window.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
 import 'package:provider/provider.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bangumi_collection_sheet.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/tvos_remote_text_input_scope.dart';
 
 class BangumiCollectionDialog extends StatefulWidget {
   final String animeTitle;
@@ -40,6 +45,28 @@ class BangumiCollectionDialog extends StatefulWidget {
     required Future<void> Function(BangumiCollectionSubmitResult result)
         onSubmit,
   }) {
+    if (AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone) {
+      return CupertinoBottomSheet.show<void>(
+        context: context,
+        title: '编辑收藏',
+        heightRatio: 0.9,
+        child: CupertinoBangumiCollectionSheet(
+          animeTitle: animeTitle,
+          initialRating: initialRating,
+          initialCollectionType: initialCollectionType,
+          initialComment: initialComment,
+          initialEpisodeStatus: initialEpisodeStatus,
+          totalEpisodes: totalEpisodes,
+          isSubmitting: false,
+          onSubmit: (result) async {
+            await onSubmit(result);
+            return true;
+          },
+          onCancel: () => Navigator.of(context).pop(),
+        ),
+      );
+    }
+
     final enableAnimation = Provider.of<AppearanceSettingsProvider>(
       context,
       listen: false,
@@ -240,19 +267,6 @@ class _BangumiCollectionDialogState extends State<BangumiCollectionDialog> {
   Widget _buildHeader() {
     return Row(
       children: [
-        Container(
-          padding: const EdgeInsets.all(10),
-          decoration: BoxDecoration(
-            color: _accentColor.withOpacity(0.18),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Icon(
-            Icons.star_rate_rounded,
-            color: _accentColor,
-            size: 20,
-          ),
-        ),
-        SizedBox(width: 12),
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -329,25 +343,29 @@ class _BangumiCollectionDialogState extends State<BangumiCollectionDialog> {
             children: List.generate(10, (index) {
               final rating = index + 1;
               final isActive = rating <= _selectedRating;
-              return GestureDetector(
-                onTap: () => setState(() => _selectedRating = rating),
-                child: Container(
-                  width: 32,
-                  height: 32,
-                  decoration: BoxDecoration(
-                    color: isActive
-                        ? _accentColor.withOpacity(_isDarkMode ? 0.2 : 0.12)
-                        : _panelAltColor,
-                    border: Border.all(
-                      color: isActive ? _accentColor : _borderColor,
-                      width: 1,
+              return Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  onTap: () => setState(() => _selectedRating = rating),
+                  borderRadius: BorderRadius.circular(6),
+                  child: Container(
+                    width: 32,
+                    height: 32,
+                    decoration: BoxDecoration(
+                      color: isActive
+                          ? _accentColor.withOpacity(_isDarkMode ? 0.2 : 0.12)
+                          : _panelAltColor,
+                      border: Border.all(
+                        color: isActive ? _accentColor : _borderColor,
+                        width: 1,
+                      ),
+                      borderRadius: BorderRadius.circular(6),
                     ),
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: Icon(
-                    isActive ? Ionicons.star : Ionicons.star_outline,
-                    color: isActive ? _accentColor : _mutedTextColor,
-                    size: 18,
+                    child: Icon(
+                      isActive ? Ionicons.star : Ionicons.star_outline,
+                      color: isActive ? _accentColor : _mutedTextColor,
+                      size: 18,
+                    ),
                   ),
                 ),
               );
@@ -360,29 +378,33 @@ class _BangumiCollectionDialogState extends State<BangumiCollectionDialog> {
           children: List.generate(10, (index) {
             final rating = index + 1;
             final isSelected = rating == _selectedRating;
-            return GestureDetector(
-              onTap: () => setState(() => _selectedRating = rating),
-              child: Container(
-                width: 28,
-                height: 28,
-                decoration: BoxDecoration(
-                  color: isSelected
-                      ? _accentColor.withOpacity(_isDarkMode ? 0.2 : 0.12)
-                      : _panelAltColor,
-                  border: Border.all(
-                    color: isSelected ? _accentColor : _borderColor,
-                    width: 1,
+            return Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: () => setState(() => _selectedRating = rating),
+                borderRadius: BorderRadius.circular(4),
+                child: Container(
+                  width: 28,
+                  height: 28,
+                  decoration: BoxDecoration(
+                    color: isSelected
+                        ? _accentColor.withOpacity(_isDarkMode ? 0.2 : 0.12)
+                        : _panelAltColor,
+                    border: Border.all(
+                      color: isSelected ? _accentColor : _borderColor,
+                      width: 1,
+                    ),
+                    borderRadius: BorderRadius.circular(4),
                   ),
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Center(
-                  child: Text(
-                    '$rating',
-                    style: TextStyle(
-                      color: isSelected ? _accentColor : _textColor,
-                      fontSize: 12,
-                      fontWeight:
-                          isSelected ? FontWeight.bold : FontWeight.normal,
+                  child: Center(
+                    child: Text(
+                      '$rating',
+                      style: TextStyle(
+                        color: isSelected ? _accentColor : _textColor,
+                        fontSize: 12,
+                        fontWeight:
+                            isSelected ? FontWeight.bold : FontWeight.normal,
+                      ),
                     ),
                   ),
                 ),
@@ -414,30 +436,34 @@ class _BangumiCollectionDialogState extends State<BangumiCollectionDialog> {
             final value = option['value'] as int;
             final label = option['label'] as String;
             final isSelected = value == _selectedCollectionType;
-            return GestureDetector(
-              onTap: () => setState(() => _selectedCollectionType = value),
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 160),
-                curve: Curves.easeInOut,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                decoration: BoxDecoration(
-                  color: isSelected
-                      ? _accentColor.withOpacity(_isDarkMode ? 0.2 : 0.12)
-                      : _panelAltColor,
-                  border: Border.all(
-                    color: isSelected ? _accentColor : _borderColor,
-                    width: 1,
+            return Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: () => setState(() => _selectedCollectionType = value),
+                borderRadius: BorderRadius.circular(6),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 160),
+                  curve: Curves.easeInOut,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: isSelected
+                        ? _accentColor.withOpacity(_isDarkMode ? 0.2 : 0.12)
+                        : _panelAltColor,
+                    border: Border.all(
+                      color: isSelected ? _accentColor : _borderColor,
+                      width: 1,
+                    ),
+                    borderRadius: BorderRadius.circular(6),
                   ),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Text(
-                  label,
-                  style: TextStyle(
-                    color: isSelected ? _accentColor : _textColor,
-                    fontSize: 13,
-                    fontWeight:
-                        isSelected ? FontWeight.w600 : FontWeight.normal,
+                  child: Text(
+                    label,
+                    style: TextStyle(
+                      color: isSelected ? _accentColor : _textColor,
+                      fontSize: 13,
+                      fontWeight:
+                          isSelected ? FontWeight.w600 : FontWeight.normal,
+                    ),
                   ),
                 ),
               ),
@@ -499,46 +525,49 @@ class _BangumiCollectionDialogState extends State<BangumiCollectionDialog> {
             SizedBox(width: 12),
             SizedBox(
               width: 72,
-              child: TextField(
-                controller: _episodeController,
-                enabled: !_isSubmitting,
-                keyboardType: TextInputType.number,
-                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                onTapOutside: (_) => _dismissKeyboard(),
-                textAlign: TextAlign.center,
-                style: TextStyle(color: _textColor, fontSize: 14),
-                decoration: InputDecoration(
-                  isDense: true,
-                  contentPadding:
-                      const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
-                  filled: true,
-                  fillColor: _panelAltColor,
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(6),
-                    borderSide: BorderSide(color: _borderColor),
+              child: TvOSRemoteTextInputControl(
+                title: '观看进度',
+                child: TextField(
+                  controller: _episodeController,
+                  enabled: !_isSubmitting,
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                  onTapOutside: (_) => _dismissKeyboard(),
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: _textColor, fontSize: 14),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    contentPadding:
+                        const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+                    filled: true,
+                    fillColor: _panelAltColor,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(6),
+                      borderSide: BorderSide(color: _borderColor),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(6),
+                      borderSide: BorderSide(color: _borderColor),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(6),
+                      borderSide: BorderSide(color: _accentColor),
+                    ),
                   ),
-                  enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(6),
-                    borderSide: BorderSide(color: _borderColor),
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(6),
-                    borderSide: BorderSide(color: _accentColor),
-                  ),
+                  onChanged: (value) {
+                    if (value.isEmpty) {
+                      _updateEpisodeStatus(0);
+                      return;
+                    }
+                    final parsed = int.tryParse(value);
+                    if (parsed != null) {
+                      final int sanitized = parsed < 0
+                          ? 0
+                          : (parsed > maxValue ? maxValue : parsed);
+                      _updateEpisodeStatus(sanitized);
+                    }
+                  },
                 ),
-                onChanged: (value) {
-                  if (value.isEmpty) {
-                    _updateEpisodeStatus(0);
-                    return;
-                  }
-                  final parsed = int.tryParse(value);
-                  if (parsed != null) {
-                    final int sanitized = parsed < 0
-                        ? 0
-                        : (parsed > maxValue ? maxValue : parsed);
-                    _updateEpisodeStatus(sanitized);
-                  }
-                },
               ),
             ),
             SizedBox(width: 12),
@@ -616,27 +645,31 @@ class _BangumiCollectionDialogState extends State<BangumiCollectionDialog> {
           ),
         ),
         SizedBox(height: 8),
-        TextField(
-          controller: _commentController,
-          minLines: 3,
-          maxLines: 4,
+        TvOSRemoteTextInputControl(
+          title: '短评',
           maxLength: 200,
-          onTapOutside: (_) => _dismissKeyboard(),
-          style: TextStyle(color: _textColor, fontSize: 13, height: 1.4),
-          cursorColor: _accentColor,
-          decoration: InputDecoration(
-            counterStyle: TextStyle(color: _mutedTextColor, fontSize: 11),
-            hintText: '写下你的短评（可选）',
-            hintStyle: TextStyle(color: _mutedTextColor, fontSize: 13),
-            filled: true,
-            fillColor: _panelAltColor,
-            enabledBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(8),
-              borderSide: BorderSide(color: _borderColor, width: 1),
-            ),
-            focusedBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(8),
-              borderSide: BorderSide(color: _accentColor, width: 1.2),
+          child: TextField(
+            controller: _commentController,
+            minLines: 3,
+            maxLines: 4,
+            maxLength: 200,
+            onTapOutside: (_) => _dismissKeyboard(),
+            style: TextStyle(color: _textColor, fontSize: 13, height: 1.4),
+            cursorColor: _accentColor,
+            decoration: InputDecoration(
+              counterStyle: TextStyle(color: _mutedTextColor, fontSize: 11),
+              hintText: '写下你的短评（可选）',
+              hintStyle: TextStyle(color: _mutedTextColor, fontSize: 13),
+              filled: true,
+              fillColor: _panelAltColor,
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+                borderSide: BorderSide(color: _borderColor, width: 1),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+                borderSide: BorderSide(color: _accentColor, width: 1.2),
+              ),
             ),
           ),
         ),

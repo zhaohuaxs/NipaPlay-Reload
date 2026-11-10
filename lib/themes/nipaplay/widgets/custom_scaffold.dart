@@ -19,6 +19,8 @@ class CustomScaffold extends StatefulWidget {
   final bool shouldShowAppBar;
   final TabController? tabController;
   final bool useLargeScreenLayout;
+  final String currentPageId;
+  final List<String> pageIds;
   final VoidCallback? onToggleLargeScreen;
   final Future<void> Function(Offset globalOrigin)? onToggleThemeFromOrigin;
   final VoidCallback? onOpenSettings;
@@ -31,6 +33,8 @@ class CustomScaffold extends StatefulWidget {
     required this.shouldShowAppBar,
     this.tabController,
     this.useLargeScreenLayout = false,
+    this.currentPageId = '',
+    this.pageIds = const [],
     this.onToggleLargeScreen,
     this.onToggleThemeFromOrigin,
     this.onOpenSettings,
@@ -43,13 +47,36 @@ class CustomScaffold extends StatefulWidget {
 class _CustomScaffoldState extends State<CustomScaffold> {
   int? _lastTabIndex;
   String? _lastAppBarOverlayLogSignature;
+  String? _lastVideoUnderlayLogSignature;
 
-  bool get _macOSHdrTransparentUnderlayEnabled {
-    return !kIsWeb &&
-        defaultTargetPlatform == TargetPlatform.macOS &&
-        Platform.environment['NIPAPLAY_MACOS_HDR_TRANSPARENT_FLUTTER'] != '0' &&
-        Platform.environment['NIPAPLAY_MACOS_HDR_USE_APPKIT_VIEW'] != '1' &&
-        Platform.environment['NIPAPLAY_DISABLE_MACOS_WINDOW_OVERLAY'] != '1';
+  bool get _nativeVideoUnderlayDebugLogsEnabled {
+    if (kReleaseMode || kIsWeb) {
+      return false;
+    }
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      return Platform.environment['NIPAPLAY_WINDOWS_HDR_EXIT_TRACE'] == '1';
+    }
+    if (defaultTargetPlatform == TargetPlatform.macOS) {
+      return Platform.environment['NIPAPLAY_MACOS_HDR_EXIT_TRACE'] == '1';
+    }
+    return false;
+  }
+
+  bool get _windowHostedVideoUnderlayEnabled {
+    if (kIsWeb) {
+      return false;
+    }
+    if (defaultTargetPlatform == TargetPlatform.macOS) {
+      return Platform.environment['NIPAPLAY_MACOS_HDR_TRANSPARENT_FLUTTER'] !=
+              '0' &&
+          Platform.environment['NIPAPLAY_MACOS_HDR_USE_APPKIT_VIEW'] != '1' &&
+          Platform.environment['NIPAPLAY_DISABLE_MACOS_WINDOW_OVERLAY'] != '1';
+    }
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      return Platform.environment['NIPAPLAY_DISABLE_WINDOWS_WINDOW_OVERLAY'] !=
+          '1';
+    }
+    return false;
   }
 
   void _handlePageChangedBySwitchableView(int index) {
@@ -109,27 +136,24 @@ class _CustomScaffoldState extends State<CustomScaffold> {
   @override
   Widget build(BuildContext context) {
     if (widget.tabController == null) {
-      return Center(
+      return const Center(
         child: Text("Error: TabController not provided to CustomScaffold"),
       );
     }
 
     final bool isDesktop = globals.isDesktop;
     final bool isTablet = globals.isTablet;
-    final bool isDesktopOrTablet = isDesktop || isTablet;
+    final bool isDesktopOrTablet = globals.isDesktopOrTablet;
     final bool useLargeScreenLayout = widget.useLargeScreenLayout &&
         widget.pageIsHome &&
         isDesktopOrTablet &&
         widget.tabPage.isNotEmpty;
-    const enableAnimation = true;
+    const enableAnimation = false;
 
     final currentIndex = widget.tabController!.index;
-    final preloadIndices = widget.pageIsHome
-        ? List<int>.generate(
-            widget.pages.length,
-            (i) => i,
-          ).where((i) => i != 1).toList()
-        : const <int>[];
+    // Create tabs on first visit and retain them thereafter. Constructing
+    // every hidden page at launch competes with the visible page's first load.
+    const preloadIndices = <int>[];
 
     final isDarkMode = Theme.of(context).brightness == Brightness.dark;
     final bool hasVideo = context.select<VideoPlayerState, bool>(
@@ -138,14 +162,21 @@ class _CustomScaffoldState extends State<CustomScaffold> {
     final bool hasNativeVideoSurface = context.select<VideoPlayerState, bool>(
       (videoState) => videoState.player.prefersPlatformVideoSurface,
     );
-    final Rect? videoUnderlayRect = context.select<VideoPlayerState, Rect?>(
-      (videoState) => videoState.macOSWindowHostedVideoRect,
+    final bool hasWindowHostedVideoSurface =
+        context.select<VideoPlayerState, bool>(
+      (videoState) => videoState.player.usesWindowOverlayVideoSurface,
     );
-    final bool useVideoUnderlay = _macOSHdrTransparentUnderlayEnabled &&
-        hasNativeVideoSurface &&
+    final bool useVideoUnderlay = (hasWindowHostedVideoSurface ||
+            (_windowHostedVideoUnderlayEnabled && hasNativeVideoSurface)) &&
         widget.pageIsHome &&
         currentIndex == 1 &&
         hasVideo;
+    _logVideoUnderlayState(
+      enabled: useVideoUnderlay,
+      hasNativeVideoSurface: hasNativeVideoSurface,
+      hasVideo: hasVideo,
+      currentIndex: currentIndex,
+    );
     final bool showTabDivider =
         widget.pageIsHome && widget.tabController?.index == 1 && hasVideo;
     final Color tabDividerColor = isDarkMode ? Colors.white24 : Colors.black12;
@@ -166,13 +197,13 @@ class _CustomScaffoldState extends State<CustomScaffold> {
       currentIndex: currentIndex,
       physics: const PageScrollPhysics(),
       onPageChanged: _handlePageChangedBySwitchableView,
-      children: widget.pages.asMap().entries.map((entry) {
-        final index = entry.key;
-        final page = entry.value;
-        final bool useLargeScreenHomePage =
-            useLargeScreenLayout && widget.pageIsHome && index == 0;
-        if (useLargeScreenHomePage) {
-          return const RepaintBoundary(child: NipaplayLargeScreenHomePage());
+      children: widget.pages.map((page) {
+        final bool wrapLargeScreenContent =
+            useLargeScreenLayout && widget.pageIsHome;
+        if (wrapLargeScreenContent) {
+          return RepaintBoundary(
+            child: NipaplayLargeScreenContentPage(child: page),
+          );
         }
         return RepaintBoundary(child: page);
       }).toList(),
@@ -196,7 +227,7 @@ class _CustomScaffoldState extends State<CustomScaffold> {
               leading: widget.pageIsHome
                   ? null
                   : IconButton(
-                      icon: Icon(Ionicons.chevron_back_outline),
+                      icon: const Icon(Ionicons.chevron_back_outline),
                       color: isDarkMode ? Colors.white : Colors.black,
                       onPressed: () {
                         Navigator.of(context).pop();
@@ -221,6 +252,8 @@ class _CustomScaffoldState extends State<CustomScaffold> {
         child: useLargeScreenLayout
             ? NipaplayLargeScreenScaffoldLayout(
                 currentIndex: currentIndex,
+                currentPageId: widget.currentPageId,
+                pageIds: widget.pageIds,
                 isDarkMode: isDarkMode,
                 tabPage: widget.tabPage,
                 tabController: widget.tabController!,
@@ -233,8 +266,8 @@ class _CustomScaffoldState extends State<CustomScaffold> {
       ),
     );
 
-    return BackgroundWithBlur(
-      transparentCutout: useVideoUnderlay ? videoUnderlayRect : null,
+    return _WindowHostedVideoBackground(
+      enabled: useVideoUnderlay,
       child: scaffold,
     );
   }
@@ -258,6 +291,60 @@ class _CustomScaffoldState extends State<CustomScaffold> {
       'isDark=$isDarkMode, '
       'icon=${overlayStyle.statusBarIconBrightness?.name}, '
       'ios=${overlayStyle.statusBarBrightness?.name}',
+    );
+  }
+
+  void _logVideoUnderlayState({
+    required bool enabled,
+    required bool hasNativeVideoSurface,
+    required bool hasVideo,
+    required int currentIndex,
+  }) {
+    if (!_nativeVideoUnderlayDebugLogsEnabled) {
+      return;
+    }
+    final signature = [
+      defaultTargetPlatform.name,
+      enabled.toString(),
+      hasNativeVideoSurface.toString(),
+      hasVideo.toString(),
+      currentIndex.toString(),
+    ].join('|');
+    if (signature == _lastVideoUnderlayLogSignature) {
+      return;
+    }
+    _lastVideoUnderlayLogSignature = signature;
+    debugPrint(
+      '[NativeVideoUnderlay] platform=${defaultTargetPlatform.name} '
+      'enabled=$enabled hasNativeVideoSurface=$hasNativeVideoSurface '
+      'hasVideo=$hasVideo currentIndex=$currentIndex',
+    );
+  }
+}
+
+class _WindowHostedVideoBackground extends StatelessWidget {
+  const _WindowHostedVideoBackground({
+    required this.enabled,
+    required this.child,
+  });
+
+  final bool enabled;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!enabled) {
+      return BackgroundWithBlur(child: child);
+    }
+    return Selector<VideoPlayerState, Rect?>(
+      selector: (_, videoState) => videoState.windowHostedVideoRect,
+      builder: (context, videoUnderlayRect, child) {
+        return BackgroundWithBlur(
+          transparentCutout: videoUnderlayRect,
+          child: child!,
+        );
+      },
+      child: child,
     );
   }
 }

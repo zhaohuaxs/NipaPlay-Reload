@@ -1,5 +1,7 @@
 import 'package:nipaplay/themes/cupertino/cupertino_imports.dart';
 import 'package:intl/intl.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
+import 'package:nipaplay/widgets/media_server_network_image.dart';
 
 /// Cupertino风格的番剧卡片控件
 /// 专门用于显示共享媒体库中的番剧信息
@@ -31,6 +33,9 @@ class CupertinoAnimeCard extends StatelessWidget {
   /// 简介
   final String? summary;
 
+  /// 是否显示红色 NEW 标识（新番剧 / 有新集数）
+  final bool showNewBadge;
+
   const CupertinoAnimeCard({
     super.key,
     required this.title,
@@ -42,7 +47,14 @@ class CupertinoAnimeCard extends StatelessWidget {
     this.sourceLabel,
     this.rating,
     this.summary,
+    this.showNewBadge = false,
   });
+
+  static const double _padding = 12;
+  static const double _posterHeight = 168;
+
+  /// Fixed card height: the poster plus the card padding.
+  static const double height = _posterHeight + _padding * 2;
 
   @override
   Widget build(BuildContext context) {
@@ -70,7 +82,7 @@ class CupertinoAnimeCard extends StatelessWidget {
     return GestureDetector(
       onTap: isLoading ? null : onTap,
       child: Container(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(_padding),
         decoration: BoxDecoration(
           color: resolvedCardColor,
           borderRadius: BorderRadius.circular(20),
@@ -95,8 +107,14 @@ class CupertinoAnimeCard extends StatelessWidget {
                 borderRadius: BorderRadius.circular(12),
                 child: SizedBox(
                   width: 120,
-                  height: 168,
-                  child: _buildPosterImage(context),
+                  height: _posterHeight,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      _buildPosterImage(context),
+                      if (showNewBadge) const MediaLibraryNewBadge(),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -104,7 +122,7 @@ class CupertinoAnimeCard extends StatelessWidget {
             // 右侧：文字信息
             Expanded(
               child: SizedBox(
-                height: 168, // 与封面高度对齐
+                height: _posterHeight, // 与封面高度对齐
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -136,7 +154,8 @@ class CupertinoAnimeCard extends StatelessWidget {
                                   color: secondaryLabelColor,
                                 ),
                               ),
-                              if (rating != null && rating! > 0) const SizedBox(width: 12),
+                              if (rating != null && rating! > 0)
+                                const SizedBox(width: 12),
                             ],
                             if (rating != null && rating! > 0) ...[
                               Icon(
@@ -209,21 +228,25 @@ class CupertinoAnimeCard extends StatelessWidget {
                               ],
                             ),
                             // 简介预览 - 占用剩余空间
-                            if (summary != null && summary!.trim().isNotEmpty) ...[
+                            if (summary != null &&
+                                summary!.trim().isNotEmpty) ...[
                               const SizedBox(height: 4),
                               Expanded(
                                 child: LayoutBuilder(
                                   builder: (context, constraints) {
                                     // 根据可用高度计算最大行数
                                     const lineHeight = 12; // fontSize * height
-                                    final maxLines = (constraints.maxHeight / lineHeight).floor();
+                                    final maxLines =
+                                        (constraints.maxHeight / lineHeight)
+                                            .floor();
                                     return Text(
                                       _cleanSummary(summary!),
                                       maxLines: maxLines > 0 ? maxLines : 1,
                                       overflow: TextOverflow.ellipsis,
                                       style: TextStyle(
                                         fontSize: 12,
-                                        color: secondaryLabelColor.withOpacity(0.9),
+                                        color: secondaryLabelColor
+                                            .withOpacity(0.9),
                                         height: 1.4,
                                       ),
                                     );
@@ -269,7 +292,7 @@ class CupertinoAnimeCard extends StatelessWidget {
       );
     }
 
-    return Image.network(
+    return MediaServerAwareNetworkImage(
       imageUrl!,
       fit: BoxFit.cover,
       width: double.infinity,

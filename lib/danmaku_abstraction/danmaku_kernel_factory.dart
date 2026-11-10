@@ -1,6 +1,11 @@
 import 'package:shared_preferences/shared_preferences.dart';
+
 import 'dart:async';
+
+import 'package:nipaplay/constants/settings_keys.dart';
 import 'package:nipaplay/danmaku_next/next2_platform_support.dart';
+import 'package:nipaplay/plugins/models/plugin_danmaku_renderer.dart';
+import 'package:nipaplay/utils/linux_nvidia_gpu.dart';
 
 /// 弹幕渲染引擎枚举
 enum DanmakuRenderEngine {
@@ -25,20 +30,44 @@ enum DanmakuRenderEngine {
 
 /// 负责读写弹幕渲染引擎设置的工厂类
 class DanmakuKernelFactory {
-  static const String _danmakuRenderEngineKey = 'danmaku_render_engine';
-  // Default to NipaPlay Next if no user setting exists
-  static DanmakuRenderEngine _cachedEngine = DanmakuRenderEngine.nipaplayNext;
+  // Default to DFM+ where it is supported; fall back to NipaPlay Next on Web.
+  static DanmakuRenderEngine _cachedEngine = _defaultEngine;
   static bool _initialized = false;
+  static String? _selectedPluginRendererId;
+  static List<PluginDanmakuRenderer> _availablePluginRenderers = const [];
 
-  /// Next++ 激进优化引擎开关（由 LabsSettingsProvider 同步）
-  static bool _enableNextPlusPlus = true;
+  /// Next++ 激进优化引擎开关
+  static bool _enableNextPlusPlus = false;
 
-  /// 同步 Next++ 开关状态（由 LabsSettingsProvider 调用）
-  static void setEnableNextPlusPlus(bool enabled) {
+  static DanmakuRenderEngine get _defaultEngine =>
+      Next2PlatformSupport.isKernelSupported &&
+              !isLinuxNvidiaGraphicsStackActive()
+          ? DanmakuRenderEngine.dfmPlus
+          : DanmakuRenderEngine.nipaplayNext;
+
+  static bool get isNextPlusPlusEnabled => _enableNextPlusPlus;
+
+  static void _setEnableNextPlusPlus(bool enabled) {
     if (_enableNextPlusPlus == enabled) return;
     _enableNextPlusPlus = enabled;
-    // 通知 UI 更新显示名称（如开发者模式右上角）
+  }
+
+  /// 保存 Next++ 开关状态，并通知 UI 更新显示名称和渲染路径。
+  static Future<void> saveEnableNextPlusPlus(bool enabled) async {
+    if (_enableNextPlusPlus == enabled) return;
+
+    _setEnableNextPlusPlus(enabled);
     _kernelChangeController.add(DanmakuRenderEngine.nipaplayNext);
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(
+        SettingsKeys.danmakuEnableNextPlusPlusEngine,
+        enabled,
+      );
+    } catch (e) {
+      // ignore
+    }
   }
 
   /// 获取 NipaPlay Next 引擎的显示名称
@@ -63,18 +92,24 @@ class DanmakuKernelFactory {
 
     try {
       final prefs = await SharedPreferences.getInstance();
-      final engineIndex = prefs.getInt(_danmakuRenderEngineKey);
+      final engineIndex = prefs.getInt(SettingsKeys.danmakuRenderEngine);
+      _selectedPluginRendererId =
+          prefs.getString(SettingsKeys.danmakuPluginRenderer);
+      _setEnableNextPlusPlus(
+        prefs.getBool(SettingsKeys.danmakuEnableNextPlusPlusEngine) ?? false,
+      );
 
       if (engineIndex != null &&
           engineIndex >= 0 &&
           engineIndex < DanmakuRenderEngine.values.length) {
-        _cachedEngine =
-            _sanitizeEngine(DanmakuRenderEngine.values[engineIndex]);
+        _cachedEngine = _sanitizeEngine(
+          DanmakuRenderEngine.values[engineIndex],
+        );
       } else {
-        _cachedEngine = DanmakuRenderEngine.nipaplayNext; // 默认使用 NipaPlay Next
+        _cachedEngine = _defaultEngine;
       }
     } catch (e) {
-      _cachedEngine = DanmakuRenderEngine.nipaplayNext;
+      _cachedEngine = _defaultEngine;
     }
 
     _initialized = true;
@@ -85,17 +120,71 @@ class DanmakuKernelFactory {
     return _cachedEngine;
   }
 
+  static List<PluginDanmakuRenderer> get availablePluginRenderers =>
+      List<PluginDanmakuRenderer>.unmodifiable(_availablePluginRenderers);
+
+  static PluginDanmakuRenderer? get activePluginRenderer {
+    final selectedId = _selectedPluginRendererId;
+    if (selectedId == null) return null;
+    for (final renderer in _availablePluginRenderers) {
+      if (renderer.selectionId == selectedId &&
+          renderer.isSupportedOnCurrentPlatform) {
+        return renderer;
+      }
+    }
+    return null;
+  }
+
+  static String? get selectedPluginRendererId => _selectedPluginRendererId;
+
+  /// Refreshes renderers exposed by enabled and successfully loaded plugins.
+  /// The stored selection is intentionally retained when a plugin is disabled,
+  /// but it cannot become active again until that plugin is enabled.
+  static void setAvailablePluginRenderers(
+    List<PluginDanmakuRenderer> renderers,
+  ) {
+    final oldActive = activePluginRenderer;
+    _availablePluginRenderers = renderers
+        .where((renderer) => renderer.isSupportedOnCurrentPlatform)
+        .toList(growable: false);
+    final newActive = activePluginRenderer;
+    if (oldActive?.selectionId != newActive?.selectionId ||
+        !identical(oldActive, newActive)) {
+      _rendererChangeController.add(null);
+    }
+  }
+
+  static Future<void> savePluginRenderer(String selectionId) async {
+    if (!_availablePluginRenderers.any(
+      (renderer) => renderer.selectionId == selectionId,
+    )) {
+      throw StateError('插件弹幕渲染器不可用: $selectionId');
+    }
+    if (_selectedPluginRendererId == selectionId) return;
+    _selectedPluginRendererId = selectionId;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(SettingsKeys.danmakuPluginRenderer, selectionId);
+    _rendererChangeController.add(null);
+  }
+
   /// 保存弹幕渲染引擎设置
   static Future<void> saveKernelType(DanmakuRenderEngine engine) async {
     try {
       final sanitizedEngine = _sanitizeEngine(engine);
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setInt(_danmakuRenderEngineKey, sanitizedEngine.index);
+      await prefs.setInt(
+        SettingsKeys.danmakuRenderEngine,
+        sanitizedEngine.index,
+      );
       final oldEngine = _cachedEngine;
+      final hadPluginRenderer = _selectedPluginRendererId != null;
       _cachedEngine = sanitizedEngine;
+      _selectedPluginRendererId = null;
+      await prefs.remove(SettingsKeys.danmakuPluginRenderer);
 
-      if (oldEngine != sanitizedEngine) {
+      if (oldEngine != sanitizedEngine || hadPluginRenderer) {
         _kernelChangeController.add(sanitizedEngine);
+        _rendererChangeController.add(null);
       }
     } catch (e) {
       // ignore
@@ -110,4 +199,8 @@ class DanmakuKernelFactory {
     }
     return engine;
   }
+
+  static final StreamController<void> _rendererChangeController =
+      StreamController<void>.broadcast();
+  static Stream<void> get onRendererChanged => _rendererChangeController.stream;
 }

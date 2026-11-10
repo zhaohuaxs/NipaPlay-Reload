@@ -1,12 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:ui' show Rect;
+import 'dart:io';
+import 'dart:math' as math;
 
-import 'package:flutter/foundation.dart';
-import 'package:flutter/widgets.dart' show Widget;
+import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:erika_flutter/erika_flutter.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 
 import './abstract_player.dart';
+import './erika_gif_export.dart';
 import './player_data_models.dart';
 import './player_enums.dart';
 
@@ -100,27 +103,21 @@ class _ErikaDanmakuConfigPatch {
     );
   }
 
-  _ErikaDanmakuConfigPatch differenceFrom(
-    _ErikaDanmakuConfigPatch? previous,
-  ) {
+  _ErikaDanmakuConfigPatch differenceFrom(_ErikaDanmakuConfigPatch? previous) {
     return _ErikaDanmakuConfigPatch(
       enabled: _changed(enabled, previous?.enabled) ? enabled : null,
       fontSize: _changed(fontSize, previous?.fontSize) ? fontSize : null,
       opacity: _changed(opacity, previous?.opacity) ? opacity : null,
       displayArea:
           _changed(displayArea, previous?.displayArea) ? displayArea : null,
-      scrollDurationSeconds: _changed(
-        scrollDurationSeconds,
-        previous?.scrollDurationSeconds,
-      )
-          ? scrollDurationSeconds
-          : null,
-      scrollSpeedFactor: _changed(
-        scrollSpeedFactor,
-        previous?.scrollSpeedFactor,
-      )
-          ? scrollSpeedFactor
-          : null,
+      scrollDurationSeconds:
+          _changed(scrollDurationSeconds, previous?.scrollDurationSeconds)
+              ? scrollDurationSeconds
+              : null,
+      scrollSpeedFactor:
+          _changed(scrollSpeedFactor, previous?.scrollSpeedFactor)
+              ? scrollSpeedFactor
+              : null,
       trackGapRatio: _changed(trackGapRatio, previous?.trackGapRatio)
           ? trackGapRatio
           : null,
@@ -163,8 +160,431 @@ class _ErikaDanmakuConfigPatch {
       value != null && !listEquals(value, previous);
 }
 
-class ErikaPlayerAdapter implements AbstractPlayer {
-  ErikaPlayerAdapter() {
+bool get _erikaWindowOverlayTraceEnabled =>
+    !kIsWeb && Platform.environment['ERIKA_WINDOW_OVERLAY_TRACE'] == '1';
+
+void _traceErikaWindowOverlay(String message) {
+  if (_erikaWindowOverlayTraceEnabled) {
+    debugPrint('[NipaPlayErikaWindowOverlay] $message');
+  }
+}
+
+Rect _transformedGlobalRectOf(RenderBox box) {
+  final topLeft = box.localToGlobal(Offset.zero);
+  final topRight = box.localToGlobal(Offset(box.size.width, 0));
+  final bottomLeft = box.localToGlobal(Offset(0, box.size.height));
+  final bottomRight = box.localToGlobal(
+    Offset(box.size.width, box.size.height),
+  );
+
+  final left = math.min(
+    math.min(topLeft.dx, topRight.dx),
+    math.min(bottomLeft.dx, bottomRight.dx),
+  );
+  final top = math.min(
+    math.min(topLeft.dy, topRight.dy),
+    math.min(bottomLeft.dy, bottomRight.dy),
+  );
+  final right = math.max(
+    math.max(topLeft.dx, topRight.dx),
+    math.max(bottomLeft.dx, bottomRight.dx),
+  );
+  final bottom = math.max(
+    math.max(topLeft.dy, topRight.dy),
+    math.max(bottomLeft.dy, bottomRight.dy),
+  );
+
+  return Rect.fromLTRB(left, top, right, bottom);
+}
+
+Rect _screenRectToScaledFlutterRect(BuildContext context, Rect rect) {
+  final view = View.maybeOf(context);
+  if (view == null) {
+    return rect;
+  }
+  final mediaSize = MediaQuery.maybeSizeOf(context);
+  if (mediaSize == null || mediaSize.isEmpty) {
+    return rect;
+  }
+  final screenSize = view.physicalSize / view.devicePixelRatio;
+  final scaleX = screenSize.width / mediaSize.width;
+  final scaleY = screenSize.height / mediaSize.height;
+  if (!scaleX.isFinite || !scaleY.isFinite || scaleX <= 0 || scaleY <= 0) {
+    return rect;
+  }
+  return Rect.fromLTRB(
+    rect.left / scaleX,
+    rect.top / scaleY,
+    rect.right / scaleX,
+    rect.bottom / scaleY,
+  );
+}
+
+class _NipaplayErikaWindowOverlayVideoView extends StatefulWidget {
+  const _NipaplayErikaWindowOverlayVideoView({
+    required this.player,
+    this.debugLabel,
+    this.onPlatformViewIdChanged,
+    this.onFrameRectChanged,
+  });
+
+  final ErikaPlayer player;
+  final String? debugLabel;
+  final ValueChanged<int?>? onPlatformViewIdChanged;
+  final ValueChanged<Rect?>? onFrameRectChanged;
+
+  @override
+  State<_NipaplayErikaWindowOverlayVideoView> createState() =>
+      _NipaplayErikaWindowOverlayVideoViewState();
+}
+
+class _NipaplayErikaWindowOverlayVideoViewState
+    extends State<_NipaplayErikaWindowOverlayVideoView>
+    with WidgetsBindingObserver {
+  static final Expando<Object> _cutoutOwners =
+      Expando<Object>('Erika overlay cutout owners');
+
+  final Object _cutoutOwner = Object();
+  Timer? _retryTimer;
+  Timer? _frameTimer;
+  int _bindAttempts = 0;
+  bool _isBound = false;
+  bool _bindInFlight = false;
+  late final int _surfaceGeneration;
+  String? _lastFrameSignature;
+  int? _flutterViewId;
+  bool _secondaryWindow = false;
+  int _targetRevision = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _surfaceGeneration = identityHashCode(this);
+    widget.onPlatformViewIdChanged?.call(ErikaPlayer.windowOverlayViewId);
+    _startFrameTimer();
+    _scheduleAttach();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_captureWindowTarget()) {
+      _handleWindowTargetChanged();
+    }
+  }
+
+  @override
+  void didUpdateWidget(
+      covariant _NipaplayErikaWindowOverlayVideoView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.player != widget.player) {
+      _retryTimer?.cancel();
+      _bindAttempts = 0;
+      _isBound = false;
+      _lastFrameSignature = null;
+      unawaited(
+        oldWidget.player.detachWindowOverlay(generation: _surfaceGeneration),
+      );
+      widget.onPlatformViewIdChanged?.call(ErikaPlayer.windowOverlayViewId);
+      _scheduleAttach();
+    }
+  }
+
+  @override
+  void didChangeMetrics() {
+    _scheduleFrameUpdate(force: true);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _retryTimer?.cancel();
+    _frameTimer?.cancel();
+    widget.onPlatformViewIdChanged?.call(null);
+    // Removing this surface can happen while Flutter has locked the widget
+    // tree for a rebuild. Clearing the shared cutout synchronously would call
+    // notifyListeners() from dispose(), so defer it until that frame finishes.
+    final onFrameRectChanged = widget.onFrameRectChanged;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (onFrameRectChanged != null &&
+          identical(_cutoutOwners[onFrameRectChanged], _cutoutOwner)) {
+        _cutoutOwners[onFrameRectChanged] = null;
+        onFrameRectChanged(null);
+      }
+    });
+    unawaited(_releaseOverlaySurface());
+    super.dispose();
+  }
+
+  Future<void> _releaseOverlaySurface() async {
+    await _hideOverlayFrame();
+    try {
+      await widget.player.detachWindowOverlay(
+        generation: _surfaceGeneration,
+      );
+    } catch (error) {
+      debugPrint(
+        'NipaplayErikaWindowOverlayVideoView: detach overlay failed: $error',
+      );
+    }
+  }
+
+  void _startFrameTimer() {
+    _frameTimer?.cancel();
+    // The Windows plugin follows WM_MOVE/WM_SIZE natively. This timer is only a
+    // fallback for Flutter-only layout changes; polling at display refresh rate
+    // duplicates native window movement work and makes live dragging stutter.
+    const interval = Duration(milliseconds: 250);
+    _frameTimer = Timer.periodic(
+      interval,
+      (_) => _scheduleFrameUpdate(),
+    );
+  }
+
+  void _scheduleAttach() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      unawaited(_attachOverlaySurface());
+      _scheduleFrameUpdate(force: true);
+    });
+  }
+
+  Future<void> _attachOverlaySurface() async {
+    if (!mounted || _isBound || _bindInFlight || kIsWeb) {
+      return;
+    }
+
+    final targetChanged = _captureWindowTarget();
+    if (targetChanged) {
+      _handleWindowTargetChanged();
+    }
+    final player = widget.player;
+    final targetRevision = _targetRevision;
+    final flutterViewId = _flutterViewId;
+    final secondaryWindow = _secondaryWindow;
+    var attachCurrentTargetAgain = false;
+    _bindInFlight = true;
+    try {
+      _traceErikaWindowOverlay(
+        'attach generation=$_surfaceGeneration revision=$targetRevision '
+        'flutterView=$flutterViewId secondary=$secondaryWindow',
+      );
+      await player.attachWindowOverlay(
+        flutterViewId: flutterViewId,
+        secondaryWindow: secondaryWindow,
+      );
+      if (!mounted ||
+          widget.player != player ||
+          _targetRevision != targetRevision ||
+          _flutterViewId != flutterViewId ||
+          _secondaryWindow != secondaryWindow) {
+        attachCurrentTargetAgain = mounted;
+        return;
+      }
+      _bindAttempts = 0;
+      _isBound = true;
+      _traceErikaWindowOverlay(
+        'attached generation=$_surfaceGeneration revision=$targetRevision '
+        'flutterView=$flutterViewId secondary=$secondaryWindow',
+      );
+    } catch (error) {
+      debugPrint('NipaplayErikaWindowOverlayVideoView: bind failed: $error');
+      if (mounted && _targetRevision == targetRevision) {
+        _scheduleRetry();
+      } else {
+        attachCurrentTargetAgain = mounted;
+      }
+    } finally {
+      _bindInFlight = false;
+      if (attachCurrentTargetAgain) {
+        _scheduleAttach();
+      } else if (_isBound) {
+        _scheduleFrameUpdate(force: true);
+      }
+    }
+  }
+
+  void _scheduleRetry() {
+    if (_isBound || !mounted) {
+      return;
+    }
+    final attempt = _bindAttempts;
+    _bindAttempts += 1;
+    final delay = switch (attempt) {
+      0 => const Duration(milliseconds: 150),
+      1 => const Duration(milliseconds: 300),
+      2 => const Duration(milliseconds: 600),
+      3 => const Duration(milliseconds: 1200),
+      _ => const Duration(seconds: 2),
+    };
+    _retryTimer?.cancel();
+    _retryTimer = Timer(delay, () => unawaited(_attachOverlaySurface()));
+  }
+
+  void _scheduleFrameUpdate({bool force = false}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      unawaited(_sendOverlayFrame(visible: true, force: force));
+    });
+  }
+
+  Future<void> _sendOverlayFrame({
+    required bool visible,
+    bool force = false,
+  }) async {
+    if (kIsWeb) {
+      return;
+    }
+
+    final Rect nativeFrame;
+    Rect? flutterCutout;
+    if (visible) {
+      if (!mounted) {
+        return;
+      }
+      final renderObject = context.findRenderObject();
+      if (renderObject is! RenderBox) {
+        return;
+      }
+      final box = renderObject;
+      if (!box.hasSize || box.size.isEmpty) {
+        return;
+      }
+      if (_captureWindowTarget()) {
+        _handleWindowTargetChanged();
+      }
+      nativeFrame = _transformedGlobalRectOf(box);
+      flutterCutout = _screenRectToScaledFlutterRect(context, nativeFrame);
+    } else {
+      nativeFrame = Rect.zero;
+    }
+
+    final signature = <Object>[
+      visible,
+      nativeFrame.left.toStringAsFixed(2),
+      nativeFrame.top.toStringAsFixed(2),
+      nativeFrame.width.toStringAsFixed(2),
+      nativeFrame.height.toStringAsFixed(2),
+      _flutterViewId ?? -1,
+      _secondaryWindow,
+    ].join('|');
+    if (!force && signature == _lastFrameSignature) {
+      return;
+    }
+    _lastFrameSignature = signature;
+    final flutterViewId = _flutterViewId;
+    final secondaryWindow = _secondaryWindow;
+    final targetRevision = _targetRevision;
+    _traceErikaWindowOverlay(
+      'frame generation=$_surfaceGeneration flutterView=$flutterViewId '
+      'secondary=$secondaryWindow visible=$visible rect=$nativeFrame',
+    );
+
+    try {
+      await widget.player.setWindowOverlayFrame(
+        frame: nativeFrame,
+        visible: visible,
+        generation: _surfaceGeneration,
+        flutterViewId: flutterViewId,
+        secondaryWindow: secondaryWindow,
+        debugLabel: widget.debugLabel,
+      );
+      if (!mounted ||
+          _targetRevision != targetRevision ||
+          _flutterViewId != flutterViewId ||
+          _secondaryWindow != secondaryWindow) {
+        return;
+      }
+      final onFrameRectChanged = widget.onFrameRectChanged;
+      if (onFrameRectChanged != null) {
+        if (visible) {
+          _cutoutOwners[onFrameRectChanged] = _cutoutOwner;
+          onFrameRectChanged(flutterCutout);
+        } else if (identical(_cutoutOwners[onFrameRectChanged], _cutoutOwner)) {
+          _cutoutOwners[onFrameRectChanged] = null;
+          onFrameRectChanged(null);
+        }
+      }
+    } catch (error) {
+      _lastFrameSignature = null;
+      debugPrint(
+        'NipaplayErikaWindowOverlayVideoView: frame update failed: $error',
+      );
+    }
+  }
+
+  Future<void> _hideOverlayFrame() async {
+    try {
+      await widget.player.setWindowOverlayFrame(
+        frame: Rect.zero,
+        visible: false,
+        generation: _surfaceGeneration,
+        flutterViewId: _flutterViewId,
+        secondaryWindow: _secondaryWindow,
+        debugLabel: widget.debugLabel,
+      );
+    } catch (error) {
+      debugPrint(
+        'NipaplayErikaWindowOverlayVideoView: hide overlay failed: $error',
+      );
+    }
+  }
+
+  bool _captureWindowTarget() {
+    final flutterViewId = View.maybeOf(context)?.viewId;
+    final secondaryWindow = DesktopMultiWindow.isSecondaryWindow(context);
+    if (_flutterViewId == flutterViewId &&
+        _secondaryWindow == secondaryWindow) {
+      return false;
+    }
+    _flutterViewId = flutterViewId;
+    _secondaryWindow = secondaryWindow;
+    _targetRevision += 1;
+    _traceErikaWindowOverlay(
+      'target generation=$_surfaceGeneration revision=$_targetRevision '
+      'flutterView=$_flutterViewId secondary=$_secondaryWindow',
+    );
+    return true;
+  }
+
+  void _handleWindowTargetChanged() {
+    _retryTimer?.cancel();
+    _bindAttempts = 0;
+    _isBound = false;
+    _lastFrameSignature = null;
+    _scheduleAttach();
+    _scheduleFrameUpdate(force: true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (kIsWeb) {
+      return const SizedBox.shrink();
+    }
+    _scheduleFrameUpdate();
+    return const SizedBox.expand();
+  }
+}
+
+class ErikaPlayerAdapter
+    implements
+        AbstractPlayer,
+        AsyncDisposablePlayer,
+        AsyncSeekPlayer,
+        AsyncExternalSubtitlePlayer,
+        BufferingAwarePlayer,
+        GifExportCapablePlayer {
+  ErikaPlayerAdapter({
+    PlayerErikaAndroidOutputMode androidOutputMode =
+        PlayerErikaAndroidOutputMode.sdr,
+  }) : _player = ErikaPlayer(
+          outputMode: _resolveNativeOutputMode(androidOutputMode),
+        ) {
     if (_isSupported) {
       _eventSubscription = _player.events.listen(
         _handleEvent,
@@ -175,7 +595,11 @@ class ErikaPlayerAdapter implements AbstractPlayer {
     }
   }
 
-  final ErikaPlayer _player = ErikaPlayer();
+  final ErikaPlayer _player;
+  final ValueNotifier<bool> _buffering = ValueNotifier<bool>(false);
+
+  @override
+  ValueListenable<bool> get buffering => _buffering;
   final ValueNotifier<int?> _textureIdNotifier = ValueNotifier<int?>(null);
   final Map<PlayerMediaType, List<String>> _decoders = {
     PlayerMediaType.video: const <String>[],
@@ -186,19 +610,28 @@ class ErikaPlayerAdapter implements AbstractPlayer {
   final Map<String, String> _properties = <String, String>{};
 
   StreamSubscription<ErikaPlayerEvent>? _eventSubscription;
+  Future<void>? _disposeFuture;
   PlayerPlaybackState _state = PlayerPlaybackState.stopped;
   PlayerMediaInfo _mediaInfo = PlayerMediaInfo(duration: 0);
   String _media = '';
+  String _userAgent = '';
   double _volume = 1.0;
   double _playbackRate = 1.0;
+  PlayerUpscalerStatus _lastUpscalerStatus = const PlayerUpscalerStatus.off();
+  Map<String, dynamic> _lastPresenterStats = const <String, dynamic>{};
+  Map<String, dynamic> _lastOutputStatus = const <String, dynamic>{};
+  Map<String, dynamic> _lastDecoderStatus = const <String, dynamic>{};
+  Map<String, dynamic> _lastAudioOutputStatus = const <String, dynamic>{};
+  String? _lastNativeError;
   int _lastPositionMs = 0;
   DateTime _lastPositionUpdate = DateTime.now();
   int? _pendingSeekTargetMs;
   DateTime? _seekFenceUntil;
   bool _disposed = false;
 
-  static const Duration _danmakuConfigCoalesceDelay =
-      Duration(milliseconds: 50);
+  static const Duration _danmakuConfigCoalesceDelay = Duration(
+    milliseconds: 50,
+  );
   Timer? _danmakuConfigTimer;
   bool _danmakuConfigInFlight = false;
   _ErikaDanmakuConfigPatch? _pendingDanmakuConfig;
@@ -208,17 +641,118 @@ class ErikaPlayerAdapter implements AbstractPlayer {
 
   // Real Erika track descriptors, kept so the UI's index-based
   // activeAudioTracks/activeSubtitleTracks can be mapped back to native ids.
+  List<ErikaTrackInfo> _videoTrackInfos = const <ErikaTrackInfo>[];
   List<ErikaTrackInfo> _audioTrackInfos = const <ErikaTrackInfo>[];
   List<ErikaTrackInfo> _subtitleTrackInfos = const <ErikaTrackInfo>[];
   List<int> _activeAudioTracks = const <int>[];
   List<int> _activeSubtitleTracks = const <int>[];
+  final Set<int> _externalSubtitleTrackIds = <int>{};
+  int _externalSubtitleGeneration = 0;
+  Future<void> _externalSubtitleOperation = Future<void>.value();
+
+  static const bool _subtitleTraceEnabled = bool.fromEnvironment(
+    'NIPAPLAY_ERIKA_SUBTITLE_TRACE',
+  );
+
+  static ErikaOutputMode? _resolveNativeOutputMode(
+    PlayerErikaAndroidOutputMode mode,
+  ) {
+    if (!kIsWeb &&
+        defaultTargetPlatform == TargetPlatform.linux &&
+        linuxNativeSurfaceEnabled) {
+      return ErikaOutputMode.auto;
+    }
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return null;
+    }
+    return switch (mode) {
+      PlayerErikaAndroidOutputMode.sdr => ErikaOutputMode.sdr,
+      PlayerErikaAndroidOutputMode.extendedLinearHdr =>
+        ErikaOutputMode.extendedLinear,
+    };
+  }
+
+  static bool get _isHarmonyOS =>
+      !kIsWeb && defaultTargetPlatform.name == 'ohos';
+
+  // Enabled by Linux builds that bundle the matching Erika native runtime.
+  static const bool linuxBuildEnabled =
+      bool.fromEnvironment('NIPAPLAY_LINUX_ERIKA');
+
+  static bool get linuxNativeSurfaceEnabled =>
+      linuxBuildEnabled &&
+      !kIsWeb &&
+      defaultTargetPlatform == TargetPlatform.linux &&
+      Platform.environment['ERIKA_LINUX_PRESENTATION'] != 'texture' &&
+      Platform.environment['GDK_BACKEND']?.split(',').first.trim() != 'x11' &&
+      (Platform.environment['WAYLAND_DISPLAY']?.isNotEmpty ?? false);
 
   static bool get _isSupported =>
       !kIsWeb &&
       (defaultTargetPlatform == TargetPlatform.macOS ||
-          defaultTargetPlatform == TargetPlatform.iOS);
+          defaultTargetPlatform == TargetPlatform.iOS ||
+          defaultTargetPlatform == TargetPlatform.windows ||
+          defaultTargetPlatform == TargetPlatform.android ||
+          (defaultTargetPlatform == TargetPlatform.linux && linuxBuildEnabled) ||
+          _isHarmonyOS);
+
+  @override
+  bool get supportsGifExport => supportsHeadlessGifExport;
+
+  static bool get supportsHeadlessGifExport => _isSupported;
+
+  @override
+  Future<GifExportResult> exportGif(GifExportRequest request) =>
+      exportGifHeadless(request);
+
+  static Future<GifExportResult> exportGifHeadless(
+    GifExportRequest request,
+  ) async {
+    if (!supportsHeadlessGifExport) {
+      throw UnsupportedError(
+        'Erika GIF export is unavailable on this platform.',
+      );
+    }
+    if (request.start.isNegative || request.end <= request.start) {
+      throw ArgumentError('GIF export end must be later than its start.');
+    }
+    if (request.framesPerSecond < 1 || request.framesPerSecond > 60) {
+      throw ArgumentError('GIF export frame rate must be in 1..=60.');
+    }
+    if (request.outputWidth < 1 ||
+        request.outputWidth > 8192 ||
+        request.outputHeight < 1 ||
+        request.outputHeight > 8192) {
+      throw ArgumentError('GIF export dimensions must be in 1..=8192.');
+    }
+    final exported = await exportGifWithErika(<String, Object?>{
+      'inputUri': request.inputUri,
+      'outputPath': request.outputPath,
+      'startMillis': request.start.inMilliseconds,
+      'endMillis': request.end.inMilliseconds,
+      'framesPerSecond': request.framesPerSecond,
+      'outputWidth': request.outputWidth,
+      'outputHeight': request.outputHeight,
+      'quality': request.quality == GifExportQuality.high ? 1 : 0,
+      if (request.httpHeaders.isNotEmpty) 'httpHeaders': request.httpHeaders,
+    });
+    return GifExportResult(
+      outputPath: exported['outputPath'] as String,
+      width: exported['width'] as int,
+      height: exported['height'] as int,
+      frameCount: exported['frameCount'] as int,
+      fileSize: exported['fileSize'] as int,
+    );
+  }
 
   bool get prefersPlatformVideoSurface => _isSupported;
+
+  bool get usesWindowOverlayVideoSurface =>
+      _isSupported &&
+      defaultTargetPlatform != TargetPlatform.android &&
+      (defaultTargetPlatform != TargetPlatform.linux ||
+          linuxNativeSurfaceEnabled) &&
+      !_isHarmonyOS;
 
   @override
   double get volume => _volume;
@@ -249,17 +783,30 @@ class ErikaPlayerAdapter implements AbstractPlayer {
     }
     switch (value) {
       case PlayerPlaybackState.playing:
-        unawaited(playDirectly());
+        _dispatchStateCommand('play', playDirectly);
         break;
       case PlayerPlaybackState.paused:
-        unawaited(pauseDirectly());
+        _dispatchStateCommand('pause', pauseDirectly);
         break;
       case PlayerPlaybackState.stopped:
         _state = PlayerPlaybackState.stopped;
         _lastPositionMs = 0;
-        unawaited(_player.stop());
+        _dispatchStateCommand('stop', _player.stop);
         break;
     }
+  }
+
+  void _dispatchStateCommand(
+    String operation,
+    Future<void> Function() command,
+  ) {
+    unawaited(
+      command().catchError((Object error, StackTrace stackTrace) {
+        final message = '$operation failed: $error';
+        _lastNativeError = message;
+        debugPrint('[Erika] $message');
+      }),
+    );
   }
 
   @override
@@ -282,17 +829,31 @@ class ErikaPlayerAdapter implements AbstractPlayer {
   @override
   set activeSubtitleTracks(List<int> value) {
     _activeSubtitleTracks = List<int>.from(value);
+    _subtitleTrace(
+      'activeSubtitleTracks set value=$value '
+      'known=${_subtitleTrackInfos.map(_subtitleTrackLabel).join(', ')}',
+    );
     if (!_isSupported) {
       return;
     }
     // Empty selection means "no subtitle".
     if (value.isEmpty) {
-      unawaited(_player.selectSubtitleTrack(null));
+      unawaited(_selectSubtitleTrack(null, reason: 'activeSubtitleTracks=off'));
       return;
     }
     final index = value.first;
     if (index >= 0 && index < _subtitleTrackInfos.length) {
-      unawaited(_player.selectSubtitleTrack(_subtitleTrackInfos[index].id));
+      unawaited(
+        _selectSubtitleTrack(
+          _subtitleTrackInfos[index].id,
+          reason: 'activeSubtitleTracks index=$index',
+        ),
+      );
+    } else {
+      _subtitleTrace(
+        'activeSubtitleTracks ignored out-of-range index=$index '
+        'known_count=${_subtitleTrackInfos.length}',
+      );
     }
   }
 
@@ -320,7 +881,7 @@ class ErikaPlayerAdapter implements AbstractPlayer {
 
   @override
   int get position {
-    if (_state != PlayerPlaybackState.playing) {
+    if (_state != PlayerPlaybackState.playing || _buffering.value) {
       return _lastPositionMs;
     }
     final elapsedMs =
@@ -335,18 +896,34 @@ class ErikaPlayerAdapter implements AbstractPlayer {
   void setBufferRange({int minMs = -1, int maxMs = -1, bool drop = false}) {}
 
   @override
-  bool get supportsExternalSubtitles => false;
+  bool get supportsExternalSubtitles => _isSupported;
 
   @override
   Future<int?> updateTexture() async => null;
 
   @override
   void setMedia(String path, PlayerMediaType type) {
+    if (type == PlayerMediaType.subtitle) {
+      _subtitleTrace('setMedia subtitle path=${_describeSubtitlePath(path)}');
+      _setExternalSubtitle(path);
+      return;
+    }
     if (type == PlayerMediaType.video || type == PlayerMediaType.unknown) {
+      _subtitleTrace('setMedia video path=$path clears external tracks');
       _media = path;
       _lastPositionMs = 0;
       _lastPositionUpdate = DateTime.now();
+      _buffering.value = false;
       _mediaInfo = PlayerMediaInfo(duration: 0);
+      _lastPresenterStats = const <String, dynamic>{};
+      _lastOutputStatus = const <String, dynamic>{};
+      _lastDecoderStatus = const <String, dynamic>{};
+      _properties.remove('decoder.video');
+      _properties.remove('video.decoder');
+      _lastAudioOutputStatus = const <String, dynamic>{};
+      _lastNativeError = null;
+      _externalSubtitleTrackIds.clear();
+      _externalSubtitleGeneration++;
     }
   }
 
@@ -357,26 +934,53 @@ class ErikaPlayerAdapter implements AbstractPlayer {
       return;
     }
     await _player.ensureCreated();
-    await _player.open(_media);
+    await _player.open(
+      _media,
+      httpHeaders: _userAgent.isEmpty ? null : {'User-Agent': _userAgent},
+    );
+    _subtitleTrace('prepare open complete media=$_media');
     _state = PlayerPlaybackState.paused;
   }
 
   @override
   void seek({required int position}) {
+    unawaited(
+      seekAndWait(position: position).catchError(
+        (Object error, StackTrace stackTrace) {
+          _lastNativeError = 'seek failed: $error';
+          debugPrint('[Erika] seek failed: $error');
+        },
+      ),
+    );
+  }
+
+  @override
+  Future<void> seekAndWait({required int position}) async {
     final clamped = position < 0 ? 0 : position;
     _lastPositionMs = clamped;
     _lastPositionUpdate = DateTime.now();
     _pendingSeekTargetMs = clamped;
     _seekFenceUntil = DateTime.now().add(const Duration(milliseconds: 1500));
-    unawaited(_player.seek(Duration(milliseconds: clamped)));
+    await _player.seek(Duration(milliseconds: clamped));
   }
 
   @override
   void dispose() {
-    if (_disposed) {
-      return;
+    unawaited(
+      disposeAsync().catchError((Object error, StackTrace stackTrace) {
+        debugPrint('Erika: asynchronous dispose failed: $error');
+      }),
+    );
+  }
+
+  @override
+  Future<void> disposeAsync() {
+    final existing = _disposeFuture;
+    if (existing != null) {
+      return existing;
     }
     _disposed = true;
+    _buffering.dispose();
     _danmakuConfigTimer?.cancel();
     _danmakuConfigTimer = null;
     for (final completer in _pendingDanmakuConfigCompleters) {
@@ -386,10 +990,20 @@ class ErikaPlayerAdapter implements AbstractPlayer {
     }
     _pendingDanmakuConfigCompleters.clear();
     _pendingDanmakuConfig = null;
-    unawaited(_eventSubscription?.cancel());
+    final eventSubscription = _eventSubscription;
     _eventSubscription = null;
-    unawaited(_player.dispose());
     _textureIdNotifier.dispose();
+    return _disposeFuture = _finishDispose(eventSubscription);
+  }
+
+  Future<void> _finishDispose(
+    StreamSubscription<ErikaPlayerEvent>? eventSubscription,
+  ) async {
+    try {
+      await eventSubscription?.cancel();
+    } finally {
+      await _player.dispose();
+    }
   }
 
   @override
@@ -398,9 +1012,24 @@ class ErikaPlayerAdapter implements AbstractPlayer {
       return null;
     }
     try {
-      final Uint8List? bytes = await _player.screenshot();
+      final captureWidth = width > 0 ? width : null;
+      final captureHeight = height > 0 ? height : null;
+      final Uint8List? bytes = await _player.screenshot(
+        width: captureWidth,
+        height: captureHeight,
+      );
       if (bytes == null || bytes.isEmpty) {
         return null;
+      }
+      if (captureWidth != null && captureHeight != null) {
+        final expectedRgbaBytes = captureWidth * captureHeight * 4;
+        if (bytes.length != expectedRgbaBytes) {
+          debugPrint(
+            'Erika: screenshot native capture unavailable '
+            '(expected $expectedRgbaBytes RGBA bytes, got ${bytes.length})',
+          );
+          return null;
+        }
       }
       final video = _mediaInfo.video;
       final codec =
@@ -431,10 +1060,105 @@ class ErikaPlayerAdapter implements AbstractPlayer {
   @override
   void setProperty(String key, String value) {
     _properties[key] = value;
+    if (!_isSupported || _disposed) {
+      return;
+    }
+    switch (key) {
+      case 'sub-scale':
+        final scale = double.tryParse(value);
+        if (scale != null && scale.isFinite) {
+          unawaited(
+            _player.setSubtitleScale(scale).catchError((Object error) {
+              debugPrint('Erika: set subtitle scale failed: $error');
+            }),
+          );
+        }
+      case final style when _subtitleStyleKeys.contains(style):
+        // NipaPlay sets the subtitle style one mpv property at a time; Erika
+        // takes it whole, once per batch.
+        if (_subtitleStyleQueued) return;
+        _subtitleStyleQueued = true;
+        scheduleMicrotask(() {
+          _subtitleStyleQueued = false;
+          unawaited(_applySubtitleStyle());
+        });
+    }
+  }
+
+  /// The mpv subtitle properties NipaPlay sets on a kernel that draws the
+  /// subtitles itself, which Erika takes as one `setSubtitleStyle`. It has no
+  /// subtitle position (`sub-pos`) nor a shadow colour, and liberika 0.2.1 no
+  /// subtitle delay.
+  static const _subtitleStyleKeys = {
+    'sub-color',
+    'sub-border-color',
+    'sub-opacity',
+    'sub-border-size',
+    'sub-shadow-offset',
+    'sub-bold',
+    'sub-italic',
+    'sub-align-x',
+    'sub-align-y',
+    'sub-margin-x',
+    'sub-margin-y',
+    'sub-font',
+    'sub-fonts-dir',
+    'sub-ass-override',
+  };
+  bool _subtitleStyleQueued = false;
+
+  Future<void> _applySubtitleStyle() async {
+    if (!_isSupported || _disposed) return;
+    final force = _properties['sub-ass-override'] == 'force';
+    final fontFile = await _subtitleFontFile(
+        force ? _properties['sub-font'] ?? '' : '',
+        _properties['sub-fonts-dir'] ?? '');
+    if (_disposed) return;
+    final style = erikaSubtitleStyleFromMpv(_properties, fontFile: fontFile);
+    try {
+      await _player.setSubtitleStyle(
+        primaryColorRgba: style['primaryColorRgba'] as int?,
+        outlineColorRgba: style['outlineColorRgba'] as int?,
+        outlineWidth: style['outlineWidth'] as double?,
+        shadowDepth: style['shadowDepth'] as double?,
+        bold: style['bold'] as bool?,
+        italic: style['italic'] as bool?,
+        alignment: style['alignment'] as int?,
+        marginLeft: style['marginLeft'] as int?,
+        marginRight: style['marginRight'] as int?,
+        marginVertical: style['marginVertical'] as int?,
+        fontFamily: style['fontFamily'] as String?,
+        fontFilePath: style['fontFilePath'] as String?,
+        overrideMask: style['overrideMask'] as int?,
+      );
+    } catch (error) {
+      debugPrint('Erika: set subtitle style failed: $error');
+    }
+  }
+
+  /// [font]'s file in [dir], when the custom fonts folder has one by that
+  /// name.
+  static Future<String?> _subtitleFontFile(String font, String dir) async {
+    if (font.isEmpty || dir.isEmpty) return null;
+    for (final ext in const ['ttf', 'otf', 'ttc']) {
+      final file = File('$dir${Platform.pathSeparator}$font.$ext');
+      if (await file.exists()) return file.path;
+    }
+    return null;
+  }
+
+  @override
+  void setUserAgent(String ua) {
+    _userAgent = ua;
   }
 
   @override
   Future<void> setVideoSurfaceSize({int? width, int? height}) async {}
+
+  @override
+  Future<void> setChapter(int index) async {
+    // Erika 内核不支持 MKV 章节标识。
+  }
 
   @override
   Future<void> playDirectly() async {
@@ -448,9 +1172,21 @@ class ErikaPlayerAdapter implements AbstractPlayer {
   @override
   Future<void> pauseDirectly() async {
     _ensureSupported();
+    if (_state != PlayerPlaybackState.playing) {
+      return;
+    }
     await _player.ensureCreated();
     _lastPositionMs = position;
-    await _player.pause();
+    try {
+      await _player.pause();
+    } catch (error) {
+      if (_state == PlayerPlaybackState.stopped) {
+        debugPrint(
+            '[Erika] pause ignored after native playback stopped: $error');
+        return;
+      }
+      rethrow;
+    }
     _state = PlayerPlaybackState.paused;
     _lastPositionUpdate = DateTime.now();
   }
@@ -463,20 +1199,225 @@ class ErikaPlayerAdapter implements AbstractPlayer {
     }
   }
 
+  void _setExternalSubtitle(String path) {
+    if (!_isSupported || _disposed) {
+      return;
+    }
+    unawaited(
+      setExternalSubtitleAsync(path).catchError(
+        (Object error, StackTrace stackTrace) {
+          debugPrint('Erika: set external subtitle failed: $error');
+        },
+      ),
+    );
+  }
+
+  @override
+  Future<void> setExternalSubtitleAsync(String path) {
+    if (!_isSupported || _disposed) {
+      return Future<void>.value();
+    }
+    final generation = ++_externalSubtitleGeneration;
+    final previousOperation = _externalSubtitleOperation;
+    final operation = () async {
+      try {
+        await previousOperation;
+      } catch (_) {
+        // A failed replacement must not block a newer subtitle request.
+      }
+      await _replaceExternalSubtitle(path, generation);
+    }();
+    _externalSubtitleOperation = operation.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace __) {},
+    );
+    return operation;
+  }
+
+  Future<void> _replaceExternalSubtitle(String path, int generation) async {
+    if (_disposed || generation != _externalSubtitleGeneration) return;
+    final oldTrackIds = Set<int>.from(_externalSubtitleTrackIds);
+    _subtitleTrace(
+      'setExternalSubtitle generation=$generation '
+      'path=${_describeSubtitlePath(path)} old_track_ids=$oldTrackIds',
+    );
+
+    for (final trackId in oldTrackIds) {
+      await _player.removeSubtitleTrack(trackId);
+      _externalSubtitleTrackIds.remove(trackId);
+      if (_disposed || generation != _externalSubtitleGeneration) return;
+    }
+
+    if (path.trim().isEmpty) {
+      _activeSubtitleTracks = const <int>[];
+      await _player.selectSubtitleTrack(null);
+      return;
+    }
+
+    final addWatch = Stopwatch()..start();
+    _subtitleTrace(
+      'addExternalSubtitle begin generation=$generation '
+      'path=${_describeSubtitlePath(path)}',
+    );
+    final trackId = await _player.addExternalSubtitle(path);
+    addWatch.stop();
+    _subtitleTrace(
+      'addExternalSubtitle ok generation=$generation track_id=$trackId '
+      'elapsed_ms=${addWatch.elapsedMilliseconds}',
+    );
+    if (_disposed || generation != _externalSubtitleGeneration) {
+      await _player.removeSubtitleTrack(trackId);
+      _subtitleTrace(
+        'addExternalSubtitle stale generation=$generation '
+        'current=$_externalSubtitleGeneration removed track_id=$trackId',
+      );
+      return;
+    }
+    _externalSubtitleTrackIds.add(trackId);
+    await _player.selectSubtitleTrack(trackId);
+    if (_disposed || generation != _externalSubtitleGeneration) {
+      await _player.removeSubtitleTrack(trackId);
+      _externalSubtitleTrackIds.remove(trackId);
+    }
+  }
+
+  Future<void> _selectSubtitleTrack(
+    int? trackId, {
+    required String reason,
+  }) async {
+    final watch = Stopwatch()..start();
+    try {
+      _subtitleTrace(
+        'selectSubtitleTrack begin track_id=$trackId reason=$reason',
+      );
+      await _player.selectSubtitleTrack(trackId);
+      watch.stop();
+      _subtitleTrace(
+        'selectSubtitleTrack ok track_id=$trackId '
+        'elapsed_ms=${watch.elapsedMilliseconds} reason=$reason',
+      );
+    } catch (error) {
+      watch.stop();
+      debugPrint('Erika: select subtitle track failed: $error');
+      _subtitleTrace(
+        'selectSubtitleTrack failed track_id=$trackId '
+        'elapsed_ms=${watch.elapsedMilliseconds} reason=$reason error=$error',
+      );
+    }
+  }
+
+  // Neural modes remain hidden on Android/OHOS pending phone performance
+  // validation. FSR 1.0 is available there without a neural network.
+  static bool get supportsNeuralUpscaler =>
+      _isSupported && defaultTargetPlatform != TargetPlatform.android && !_isHarmonyOS;
+
+  static List<PlayerUpscalerMode> get availableUpscalerModes {
+    final apple = defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.iOS;
+    final desktop = defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.windows ||
+        (defaultTargetPlatform == TargetPlatform.linux && !_isHarmonyOS);
+    return PlayerUpscalerMode.values.where((mode) {
+      if (mode == PlayerUpscalerMode.off) return true;
+      if (!_isSupported) return false;
+      if (mode == PlayerUpscalerMode.erikaFsr1) return true;
+      if (mode == PlayerUpscalerMode.erikaPlatformVideo) {
+        return apple || defaultTargetPlatform == TargetPlatform.windows;
+      }
+      if (mode == PlayerUpscalerMode.erikaMetalFxSpatial) return apple;
+      if (mode == PlayerUpscalerMode.erikaArtCnnR8F64) return desktop;
+      return supportsNeuralUpscaler;
+    }).toList(growable: false);
+  }
+
+  bool get supportsUpscaler => _isSupported;
+
+  Future<void> setUpscaler(PlayerUpscalerMode mode) async {
+    if (!availableUpscalerModes.contains(mode)) return;
+    _lastUpscalerStatus = PlayerUpscalerStatus(
+      requestedMode: mode,
+      activeBackend: mode == PlayerUpscalerMode.off
+          ? PlayerUpscalerBackendStatus.off
+          : PlayerUpscalerBackendStatus.inactive,
+      fallbackCount: _lastUpscalerStatus.fallbackCount,
+      upscaledFrames: _lastUpscalerStatus.upscaledFrames,
+      lastEncodeDuration: _lastUpscalerStatus.lastEncodeDuration,
+      lastGpuDuration: _lastUpscalerStatus.lastGpuDuration,
+    );
+    if (!_isSupported) return;
+    try {
+      await _player.setUpscaler(_toNativeUpscalerMode(mode));
+      _lastUpscalerStatus = await getUpscalerStatus();
+    } catch (error) {
+      debugPrint('Erika: set upscaler failed: $error');
+    }
+  }
+
+  Future<void> loadUpscalerModelFile(String path) async {
+    if (defaultTargetPlatform == TargetPlatform.linux && !_isHarmonyOS) {
+      final response = await _player.invokeJson('loadUpscalerModelFile', {'path': path});
+      if (response['ok'] != true) {
+        throw StateError('${response['error'] ?? response['status']}');
+      }
+    } else {
+      await _player.loadUpscalerModel(await File(path).readAsBytes(),
+          name: path.split(RegExp(r'[/\\]')).last);
+    }
+  }
+
+  Future<void> clearUpscalerModel() => _player.clearUpscalerModel();
+
+  Future<PlayerUpscalerStatus> getUpscalerStatus() async {
+    if (!_isSupported) {
+      return _lastUpscalerStatus;
+    }
+    try {
+      final status = await _player.getUpscalerStatus();
+      _lastUpscalerStatus = _convertUpscalerStatus(status);
+    } catch (error) {
+      debugPrint('Erika: get upscaler status failed: $error');
+    }
+    return _lastUpscalerStatus;
+  }
+
+  @override
+  void stepForward() {
+    if (!_isSupported) return;
+    const frameDuration = 42; // ~24fps
+    final currentPos = position;
+    seek(position: currentPos + frameDuration);
+  }
+
+  @override
+  void stepBackward() {
+    if (!_isSupported) return;
+    const frameDuration = 42; // ~24fps
+    final currentPos = position;
+    seek(position: (currentPos - frameDuration).clamp(0, currentPos));
+  }
+
   Widget buildPlatformVideoSurface({
     String? debugLabel,
     ValueChanged<int?>? onPlatformViewIdChanged,
     ValueChanged<Rect?>? onFrameRectChanged,
   }) {
     _ensureSupported();
-    if (defaultTargetPlatform == TargetPlatform.iOS) {
+    if (defaultTargetPlatform == TargetPlatform.linux &&
+        !linuxNativeSurfaceEnabled) {
+      return ErikaTextureVideoView(
+        player: _player,
+        debugLabel: debugLabel,
+        onTextureIdChanged: onPlatformViewIdChanged,
+      );
+    }
+    if (defaultTargetPlatform == TargetPlatform.android || _isHarmonyOS) {
       return ErikaVideoView(
         player: _player,
         debugLabel: debugLabel,
         onPlatformViewIdChanged: onPlatformViewIdChanged,
       );
     }
-    return ErikaWindowOverlayVideoView(
+    return _NipaplayErikaWindowOverlayVideoView(
       player: _player,
       debugLabel: debugLabel,
       onPlatformViewIdChanged: onPlatformViewIdChanged,
@@ -670,6 +1611,17 @@ class ErikaPlayerAdapter implements AbstractPlayer {
       'state': _state.name,
       'position': position,
       'duration': _mediaInfo.duration,
+      'upscaler': _lastUpscalerStatus.toMap(),
+      'presenterStats': _lastPresenterStats,
+      'outputStatus': _lastOutputStatus,
+      'decoder': _lastDecoderStatus,
+      'audioOutput': _lastAudioOutputStatus,
+      if (_lastNativeError != null) 'lastError': _lastNativeError,
+      'tracks': <String, dynamic>{
+        'video': _videoTrackInfos.map(_erikaTrackToDebugMap).toList(),
+        'audio': _audioTrackInfos.map(_erikaTrackToDebugMap).toList(),
+        'subtitle': _subtitleTrackInfos.map(_erikaTrackToDebugMap).toList(),
+      },
       'videoWidth': _mediaInfo.video?.isNotEmpty == true
           ? _mediaInfo.video!.first.codec.width
           : null,
@@ -679,10 +1631,148 @@ class ErikaPlayerAdapter implements AbstractPlayer {
     };
   }
 
-  Future<Map<String, dynamic>> getDetailedMediaInfoAsync() async =>
-      getDetailedMediaInfo();
+  Future<Map<String, dynamic>> getDetailedMediaInfoAsync() async {
+    await getUpscalerStatus();
+    await _refreshPresenterStats();
+    return getDetailedMediaInfo();
+  }
+
+  Future<void> _refreshPresenterStats() async {
+    if (!_isSupported) {
+      return;
+    }
+    try {
+      final stats = await _player.getPresenterStats();
+      _lastPresenterStats = Map<String, dynamic>.from(stats.toMap());
+    } catch (error) {
+      debugPrint('Erika: get presenter stats failed: $error');
+    }
+    try {
+      final output = await _player.getOutputStatus();
+      _lastOutputStatus = _outputStatusToMap(output);
+    } catch (error) {
+      debugPrint('Erika: get output status failed: $error');
+    }
+  }
+
+  static Map<String, dynamic> _outputStatusToMap(ErikaOutputStatus status) {
+    return <String, dynamic>{
+      'requestedMode': status.requestedMode.name,
+      'activeEncoding': status.activeEncoding.name,
+      'surfaceFormat': status.surfaceFormat.name,
+      'nativeDataSpace': status.nativeDataSpace,
+      'requestedHeadroom': status.requestedHeadroom,
+      'activeHeadroom': status.activeHeadroom,
+      'activeHeadroomKnown': status.activeHeadroomKnown,
+      'extendedLinearActive': status.extendedLinearActive,
+      'fallbackReason': status.fallbackReason.label,
+      'fallbackCount': status.fallbackCount,
+      'dataSpaceFailures': status.dataSpaceFailures,
+      'headroomUpdates': status.headroomUpdates,
+      'extendedLinearFrames': status.extendedLinearFrames,
+    };
+  }
+
+  ErikaUpscalerMode _toNativeUpscalerMode(PlayerUpscalerMode mode) =>
+      ErikaUpscalerMode.values.byName(mode.nativeName);
+
+  PlayerUpscalerMode _fromNativeUpscalerMode(ErikaUpscalerMode mode) =>
+      PlayerUpscalerMode.values.firstWhere((value) => value.nativeName == mode.name);
+
+  PlayerUpscalerBackendStatus _fromNativeUpscalerBackend(
+    ErikaUpscalerBackendStatus status,
+  ) => PlayerUpscalerBackendStatus.values.byName(status.name);
+
+  PlayerUpscalerStatus _convertUpscalerStatus(ErikaUpscalerStatus status) {
+    return PlayerUpscalerStatus(
+      requestedMode: _fromNativeUpscalerMode(status.requestedMode),
+      activeBackend: _fromNativeUpscalerBackend(status.activeBackend),
+      fallbackCount: status.fallbackCount,
+      upscaledFrames: status.upscaledFrames,
+      lastEncodeDuration: status.lastEncodeDuration,
+      lastGpuDuration: status.lastGpuDuration,
+    );
+  }
 
   void _handleEvent(ErikaPlayerEvent event) {
+    if (_disposed) {
+      return;
+    }
+    if (event.kind == ErikaEventKind.bufferingChanged) {
+      // BufferingChanged is a sparse event: its position field defaults to 0.
+      // Freeze the current anchor on entry, then reuse the latest real
+      // PositionChanged sample on recovery without extrapolating the wait.
+      if (event.buffering) {
+        _lastPositionMs = position;
+      }
+      _lastPositionUpdate = DateTime.now();
+      _buffering.value = event.buffering;
+    }
+    if (event.kind == ErikaEventKind.error) {
+      final errorMessage = _formatPlaybackError(event);
+      _lastNativeError = errorMessage;
+      _mediaInfo = _mediaInfo.copyWith(specificErrorMessage: errorMessage);
+      debugPrint(
+        '[Erika] playback error '
+        'player=${event.playerId} state=${event.state.name} '
+        'status=${event.status} error=${event.error ?? '-'} '
+        'message=${event.message ?? '-'}',
+      );
+    }
+
+    final decoder = event.decoder;
+    if (event.kind == ErikaEventKind.videoDecoderChanged && decoder != null) {
+      final decoderName = switch (decoder.activeBackend) {
+        'cuda' => 'CUDA / NVDEC',
+        'vaapi' => 'VA-API',
+        'videotoolbox' => 'VideoToolbox',
+        'd3d11va' => 'D3D11VA',
+        'mediacodec' => 'MediaCodec',
+        'software' => 'FFmpeg (software)',
+        final backend => backend,
+      };
+      _properties['decoder.video'] = decoderName;
+      _properties['video.decoder'] = decoderName;
+      _lastDecoderStatus = <String, dynamic>{
+        'stage': decoder.stage,
+        'requestedBackend': decoder.requestedBackend,
+        'previousBackend': decoder.previousBackend,
+        'activeBackend': decoder.activeBackend,
+        'fallbackCount': decoder.fallbackCount,
+        'codec': decoder.codec,
+        'pixelFormat': decoder.pixelFormat,
+        'lineSizes': decoder.lineSizes,
+        'reason': decoder.reason,
+      };
+      debugPrint(
+        '[Erika] video decoder changed '
+        'stage=${decoder.stage} requested=${decoder.requestedBackend} '
+        'previous=${decoder.previousBackend ?? '-'} '
+        'active=${decoder.activeBackend} fallbacks=${decoder.fallbackCount} '
+        'codec=${decoder.codec ?? '-'} format=${decoder.pixelFormat ?? '-'} '
+        'reason=${decoder.reason ?? '-'}',
+      );
+    }
+
+    final audio = event.audio;
+    if (event.kind == ErikaEventKind.audioOutputChanged && audio != null) {
+      _lastAudioOutputStatus = <String, dynamic>{
+        'recoveryState': audio.recoveryState,
+        'lastErrorCode': audio.lastErrorCode,
+        'recoveryAttempts': audio.recoveryAttempts,
+        'recoveryCount': audio.recoveryCount,
+        'recoveryFailures': audio.recoveryFailures,
+        'transitionSequence': audio.transitionSequence,
+      };
+      debugPrint(
+        '[Erika] audio output changed '
+        'state=${audio.recoveryState} errorCode=${audio.lastErrorCode} '
+        'attempts=${audio.recoveryAttempts} recoveries=${audio.recoveryCount} '
+        'failures=${audio.recoveryFailures} '
+        'sequence=${audio.transitionSequence}',
+      );
+    }
+
     if (event.kind == ErikaEventKind.stateChanged ||
         event.kind == ErikaEventKind.error) {
       switch (event.state) {
@@ -728,45 +1818,71 @@ class ErikaPlayerAdapter implements AbstractPlayer {
 
     var updatedInfo = _mediaInfo;
     if (event.duration > Duration.zero) {
-      updatedInfo =
-          updatedInfo.copyWith(duration: event.duration.inMilliseconds);
+      updatedInfo = updatedInfo.copyWith(
+        duration: event.duration.inMilliseconds,
+      );
     }
+    // The video's parameters follow its track list; they give the size of
+    // tracks that state none, and stand alone only until the list arrives.
     if (event.video.width > 0 && event.video.height > 0) {
       updatedInfo = updatedInfo.copyWith(
-        video: <PlayerVideoStreamInfo>[
-          PlayerVideoStreamInfo(
-            codec: PlayerVideoCodecParams(
-              width: event.video.width,
-              height: event.video.height,
-              name: 'Erika Video',
-            ),
-            codecName: 'unknown',
-          ),
-        ],
+        video: _videoTrackInfos.isEmpty
+            ? <PlayerVideoStreamInfo>[
+                PlayerVideoStreamInfo(
+                  codec: PlayerVideoCodecParams(
+                    width: event.video.width,
+                    height: event.video.height,
+                    name: 'Erika Video',
+                  ),
+                  codecName: 'unknown',
+                ),
+              ]
+            : _videoStreams(event.video.width, event.video.height),
       );
     }
     // Erika emits the full descriptor list (with native ids, titles and the
     // selected flag) on TracksChanged/TrackSelectionChanged. Use it to build
     // mediaInfo so the UI's index-based track selection maps to real ids.
     if (event.trackList.isNotEmpty) {
+      final videoInfos = event.trackList
+          .where((t) => t.kind == ErikaTrackKind.video)
+          .toList(growable: false);
       final audioInfos = event.trackList
           .where((t) => t.kind == ErikaTrackKind.audio)
           .toList(growable: false);
       final subtitleInfos = event.trackList
           .where((t) => t.kind == ErikaTrackKind.subtitle)
           .toList(growable: false);
+      _subtitleTrace(
+        'event trackList kind=${event.kind} '
+        'subtitles=${subtitleInfos.map(_subtitleTrackLabel).join(', ')}',
+      );
       _audioTrackInfos = audioInfos;
+      _videoTrackInfos = videoInfos;
       _subtitleTrackInfos = subtitleInfos;
       updatedInfo = updatedInfo.copyWith(
+        video: videoInfos.isEmpty
+            ? null
+            : _videoStreams(event.video.width, event.video.height),
         audio: <PlayerAudioStreamInfo>[
           for (var i = 0; i < audioInfos.length; i++)
             PlayerAudioStreamInfo(
               codec: PlayerAudioCodecParams(
                 name: audioInfos[i].codec ?? 'unknown',
+                channels:
+                    audioInfos[i].channels > 0 ? audioInfos[i].channels : null,
+                sampleRate: audioInfos[i].sampleRate > 0
+                    ? audioInfos[i].sampleRate
+                    : null,
+                bitRate: audioInfos[i].bitRate,
               ),
               title: audioInfos[i].title ?? 'Audio ${i + 1}',
               language: audioInfos[i].language,
-              metadata: <String, String>{'id': '${audioInfos[i].id}'},
+              metadata: <String, String>{
+                'id': '${audioInfos[i].id}',
+                if (audioInfos[i].sampleFormat != null)
+                  'sampleFormat': audioInfos[i].sampleFormat!,
+              },
               rawRepresentation: 'Erika Audio ${i + 1}',
             ),
         ],
@@ -788,13 +1904,155 @@ class ErikaPlayerAdapter implements AbstractPlayer {
         for (var i = 0; i < subtitleInfos.length; i++)
           if (subtitleInfos[i].selected) i,
       ];
+      _subtitleTrace(
+        'event activeSubtitleTracks=$_activeSubtitleTracks '
+        'external_track_ids=$_externalSubtitleTrackIds',
+      );
     }
     _mediaInfo = updatedInfo;
   }
 
-  void _ensureSupported() {
-    if (!_isSupported) {
-      throw UnsupportedError('Erika is currently only wired on macOS/iOS.');
+  static String _formatPlaybackError(ErikaPlayerEvent event) {
+    final error = event.error?.trim();
+    final message = event.message?.trim();
+    final details = <String>[
+      if (error != null && error.isNotEmpty) error,
+      if (message != null && message.isNotEmpty && message != error) message,
+      if (event.status != 0) 'status=${event.status}',
+    ];
+    return details.isEmpty
+        ? 'Erika 播放失败（未返回详细原因）'
+        : 'Erika 播放失败：${details.join('；')}';
+  }
+
+  List<PlayerVideoStreamInfo> _videoStreams(int width, int height) => [
+        for (final track in _videoTrackInfos)
+          PlayerVideoStreamInfo(
+            codec: PlayerVideoCodecParams(
+              width: track.width > 0 ? track.width : width,
+              height: track.height > 0 ? track.height : height,
+              name: _formatErikaVideoCodecParams(track),
+            ),
+            codecName: track.codec ?? 'unknown',
+          ),
+      ];
+
+  static String _formatErikaVideoCodecParams(ErikaTrackInfo track) {
+    final parts = <String>[
+      if (track.codec != null) 'codec: ${track.codec}',
+      if (track.profile != null) 'profile: ${track.profile}',
+      if (track.level > 0) 'level: ${track.level}',
+      if (track.bitRate != null) 'bitRate: ${track.bitRate}',
+      if (track.width > 0 && track.height > 0) '${track.width}x${track.height}',
+      if (track.framesPerSecond case final fps?) '${fps}fps',
+      if (track.pixelFormat != null) 'format: ${track.pixelFormat}',
+    ];
+    return parts.isEmpty ? 'Erika Video' : parts.join(', ');
+  }
+
+  static Map<String, dynamic> _erikaTrackToDebugMap(ErikaTrackInfo track) {
+    return <String, dynamic>{
+      'id': track.id,
+      'kind': track.kind.name,
+      'source': track.source.name,
+      'selected': track.selected,
+      'canRemove': track.canRemove,
+      if (track.title != null) 'title': track.title,
+      if (track.language != null) 'language': track.language,
+      if (track.codec != null) 'codec': track.codec,
+      if (track.width > 0) 'width': track.width,
+      if (track.height > 0) 'height': track.height,
+      if (track.sampleRate > 0) 'sampleRate': track.sampleRate,
+      if (track.channels > 0) 'channels': track.channels,
+      if (track.pixelFormat != null) 'pixelFormat': track.pixelFormat,
+      if (track.sampleFormat != null) 'sampleFormat': track.sampleFormat,
+      if (track.profile != null) 'profile': track.profile,
+      if (track.level > 0) 'level': track.level,
+      if (track.bitRate != null) 'bitRate': track.bitRate,
+      if (track.framesPerSecond case final fps?) 'frameRate': fps,
+    };
+  }
+
+  static void _subtitleTrace(String message) {
+    if (_subtitleTraceEnabled) {
+      debugPrint('[nipa-erika-subtitle-trace] $message');
     }
   }
+
+  static String _subtitleTrackLabel(ErikaTrackInfo track) {
+    return '{id=${track.id}, source=${track.source.name}, '
+        'selected=${track.selected}, canRemove=${track.canRemove}, '
+        'title=${track.title}, lang=${track.language}, codec=${track.codec}}';
+  }
+
+  static String _describeSubtitlePath(String path) {
+    final trimmed = path.trim();
+    if (trimmed.isEmpty) {
+      return '<empty>';
+    }
+    try {
+      final file = File(trimmed);
+      final stat = file.statSync();
+      return '$trimmed exists=${stat.type != FileSystemEntityType.notFound} '
+          'size=${stat.size} modified=${stat.modified.toIso8601String()}';
+    } catch (error) {
+      return '$trimmed stat_error=$error';
+    }
+  }
+
+  void _ensureSupported() {
+    if (!_isSupported) {
+      throw UnsupportedError(
+        'Erika requires a supported platform and a matching native plugin.',
+      );
+    }
+  }
+}
+
+/// What Erika's `setSubtitleStyle` takes from the mpv subtitle properties
+/// NipaPlay sets, by argument name: colours `#RRGGBB` with `sub-opacity`
+/// (0–255) as their alpha, mpv alignment as the ASS numpad, the font only in
+/// the custom style (`sub-ass-override=force`, which also pushes the style
+/// onto ASS dialogue), as [fontFile] when the fonts folder holds it.
+@visibleForTesting
+Map<String, Object?> erikaSubtitleStyleFromMpv(Map<String, String> p,
+    {String? fontFile}) {
+  int? rgb(String? value) => value == null
+      ? null
+      : int.tryParse(value.replaceFirst('#', ''), radix: 16);
+  int? whole(String? value) => value == null ? null : int.tryParse(value);
+  double? number(String? value) =>
+      value == null ? null : double.tryParse(value);
+  bool? yes(String? value) => value == null ? null : value == 'yes';
+  final alpha = (whole(p['sub-opacity']) ?? 255).clamp(0, 255);
+  final color = rgb(p['sub-color']);
+  final border = rgb(p['sub-border-color']);
+  final row = switch (p['sub-align-y']) {
+    'top' => 6,
+    'center' => 3,
+    _ => 0,
+  };
+  final column = switch (p['sub-align-x']) {
+    'left' => 1,
+    'right' => 3,
+    _ => 2,
+  };
+  final force = p['sub-ass-override'] == 'force';
+  final font = force ? p['sub-font'] ?? '' : '';
+  final marginX = whole(p['sub-margin-x']);
+  return {
+    'primaryColorRgba': color == null ? null : (color << 8) | alpha,
+    'outlineColorRgba': border == null ? null : (border << 8) | alpha,
+    'outlineWidth': number(p['sub-border-size']),
+    'shadowDepth': number(p['sub-shadow-offset']),
+    'bold': yes(p['sub-bold']),
+    'italic': yes(p['sub-italic']),
+    'alignment': row + column,
+    'marginLeft': marginX,
+    'marginRight': marginX,
+    'marginVertical': whole(p['sub-margin-y']),
+    'fontFamily': fontFile == null ? font : '',
+    'fontFilePath': fontFile ?? '',
+    'overrideMask': force ? kErikaSubtitleOverrideAll : 0,
+  };
 }

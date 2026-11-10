@@ -1,13 +1,11 @@
-import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/cached_network_image_widget.dart';
+import 'package:nipaplay/services/bangumi_service.dart';
 import 'package:nipaplay/utils/globals.dart' as globals;
 import 'package:shared_preferences/shared_preferences.dart';
-
-import 'typing_text.dart';
 
 class LoadingOverlay extends StatefulWidget {
   final List<String> messages;
@@ -29,6 +27,7 @@ class LoadingOverlay extends StatefulWidget {
   final String? episodeTitle;
   final String? fileName;
   final int? animeId;
+  final String? coverImageUrl;
 
   const LoadingOverlay({
     super.key,
@@ -49,6 +48,7 @@ class LoadingOverlay extends StatefulWidget {
     this.episodeTitle,
     this.fileName,
     this.animeId,
+    this.coverImageUrl,
   });
 
   @override
@@ -58,36 +58,17 @@ class LoadingOverlay extends StatefulWidget {
 class _LoadingOverlayState extends State<LoadingOverlay>
     with SingleTickerProviderStateMixin {
   final ScrollController _scrollController = ScrollController();
-  late AnimationController _cursorController;
-  late Animation<double> _cursorAnimation;
+  late AnimationController _dotsController;
   String? _coverImageUrl;
-
-  // 滚动到底部的通用方法
-  void _scrollToBottom() {
-    if (_scrollController.hasClients && mounted) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_scrollController.hasClients) {
-          _scrollController.animateTo(
-            _scrollController.position.maxScrollExtent,
-            duration: const Duration(milliseconds: 200),
-            curve: Curves.easeOut,
-          );
-        }
-      });
-    }
-  }
 
   @override
   void initState() {
     super.initState();
-    // 设置光标闪烁动画
-    _cursorController = AnimationController(
+    _coverImageUrl = _resolveImmediateCoverUrl();
+    _dotsController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 500), // 闪烁频率
-    )..repeat(reverse: true); // 重复执行并反向（产生闪烁效果）
-
-    _cursorAnimation =
-        Tween<double>(begin: 0.0, end: 1.0).animate(_cursorController);
+      duration: const Duration(milliseconds: 900),
+    )..repeat();
     _updateAnimeCoverUrl();
   }
 
@@ -112,8 +93,9 @@ class _LoadingOverlayState extends State<LoadingOverlay>
         }
       });
     }
-    if (oldWidget.animeId != widget.animeId) {
-      _coverImageUrl = null; // 清空前URL 避免显示上一部视频的封面
+    if (oldWidget.animeId != widget.animeId ||
+        oldWidget.coverImageUrl != widget.coverImageUrl) {
+      _coverImageUrl = _resolveImmediateCoverUrl();
       _updateAnimeCoverUrl();
     }
   }
@@ -121,7 +103,7 @@ class _LoadingOverlayState extends State<LoadingOverlay>
   @override
   void dispose() {
     _scrollController.dispose();
-    _cursorController.dispose();
+    _dotsController.dispose();
     super.dispose();
   }
 
@@ -132,6 +114,7 @@ class _LoadingOverlayState extends State<LoadingOverlay>
     final bool isDark = theme.brightness == Brightness.dark;
     final bool hasCoverImage =
         _coverImageUrl != null && _coverImageUrl!.isNotEmpty;
+    final bool isPhoneSurface = globals.isPhone && !globals.isTablet;
 
     // 计算比例尺寸时考虑屏幕大小，修复clamp参数顺序问题
     final screenWidth = MediaQuery.of(context).size.width;
@@ -161,14 +144,16 @@ class _LoadingOverlayState extends State<LoadingOverlay>
       colorScheme.onSurface,
       isDark ? 0.12 : 0.04,
     )!;
-    final Color cardColor = baseSurface.withOpacity(isDark ? 0.92 : 0.96);
-    final Color cardBorderColor =
-        colorScheme.onSurface.withOpacity(isDark ? 0.2 : 0.12);
+    final Color cardColor = isPhoneSurface
+        ? (isDark ? const Color(0xF2252527) : const Color(0xFAF7F7F8))
+        : baseSurface.withOpacity(isDark ? 0.92 : 0.96);
+    final Color cardBorderColor = isPhoneSurface
+        ? (isDark
+            ? Colors.white.withValues(alpha: 0.14)
+            : Colors.black.withValues(alpha: 0.09))
+        : colorScheme.onSurface.withOpacity(isDark ? 0.2 : 0.12);
     final Color cardShadowColor =
         Colors.black.withOpacity(isDark ? 0.45 : 0.16);
-    final Color cursorColor =
-        effectiveTextColor.withOpacity(widget.textOpacity);
-
     // 获取文本样式
     final textStyle = TextStyle(
       color: effectiveTextColor.withOpacity(widget.textOpacity),
@@ -208,8 +193,8 @@ class _LoadingOverlayState extends State<LoadingOverlay>
                     child: CachedNetworkImageWidget(
                       imageUrl: _coverImageUrl!,
                       fit: BoxFit.cover,
-                      shouldCompress: false,
-                      loadMode: CachedImageLoadMode.hybrid,
+                      fadeDuration: Duration.zero,
+                      loadMode: CachedImageLoadMode.legacy,
                     ),
                   ),
                 ),
@@ -293,10 +278,7 @@ class _LoadingOverlayState extends State<LoadingOverlay>
                           ),
                           // 下方：加载信息区域
                           Expanded(
-                            child: _buildLoadingMessagesSection(
-                              textStyle,
-                              cursorColor,
-                            ),
+                            child: _buildLoadingMessagesSection(textStyle),
                           ),
                         ],
                       )
@@ -333,10 +315,7 @@ class _LoadingOverlayState extends State<LoadingOverlay>
                           // 右侧：加载信息区域 (2/3 宽度)
                           Expanded(
                             flex: 2,
-                            child: _buildLoadingMessagesSection(
-                              textStyle,
-                              cursorColor,
-                            ),
+                            child: _buildLoadingMessagesSection(textStyle),
                           ),
                         ],
                       ),
@@ -395,10 +374,12 @@ class _LoadingOverlayState extends State<LoadingOverlay>
       child: _coverImageUrl != null
           ? ClipRRect(
               borderRadius: BorderRadius.circular(8),
-              child: Image.network(
-                _coverImageUrl!,
+              child: CachedNetworkImageWidget(
+                imageUrl: _coverImageUrl!,
                 fit: BoxFit.cover,
-                errorBuilder: (context, error, stackTrace) {
+                fadeDuration: Duration.zero,
+                loadMode: CachedImageLoadMode.legacy,
+                errorBuilder: (context, error) {
                   return Container(
                     decoration: BoxDecoration(
                       color: accentColor.withOpacity(0.1),
@@ -469,10 +450,7 @@ class _LoadingOverlayState extends State<LoadingOverlay>
   }
 
   // 构建右侧加载消息区域
-  Widget _buildLoadingMessagesSection(
-    TextStyle textStyle,
-    Color cursorColor,
-  ) {
+  Widget _buildLoadingMessagesSection(TextStyle textStyle) {
     return ScrollConfiguration(
       // 隐藏滚动条
       behavior: ScrollConfiguration.of(context).copyWith(
@@ -487,43 +465,35 @@ class _LoadingOverlayState extends State<LoadingOverlay>
             )
           : ListView.builder(
               controller: _scrollController,
+              // 卡片已提供内边距，避免继承页面安全区域而将加载文字挤到下方。
+              padding: EdgeInsets.zero,
               physics: const BouncingScrollPhysics(),
               itemCount: widget.messages.length,
               itemBuilder: (context, index) {
-                // 最新的消息使用打字机效果并添加闪烁光标
-                if (index == widget.messages.length - 1) {
+                final message = widget.messages[index];
+                final isCurrentStage = index == widget.messages.length - 1 &&
+                    message.endsWith('...') &&
+                    !message.endsWith('...[完成]') &&
+                    !message.endsWith('...[失败]');
+                if (isCurrentStage) {
+                  final base = message.substring(0, message.length - 3);
                   return Padding(
                     padding: const EdgeInsets.only(bottom: 4.0),
-                    child: Stack(
-                      children: [
-                        // 打字机文本
-                        TypingText(
-                          messages: [widget.messages[index]],
-                          style: textStyle,
-                          typingSpeed: const Duration(milliseconds: 50),
-                          deleteSpeed: const Duration(milliseconds: 30),
-                          pauseDuration: const Duration(seconds: 1),
-                          onTextChanged: _scrollToBottom, // 每次文本变化时滚动到底部
-                        ),
-                        // 闪烁的下划线光标
-                        Positioned.fill(
-                          child: TypingTextCursor(
-                            text: widget.messages[index],
-                            style: textStyle,
-                            cursorAnimation: _cursorAnimation,
-                            cursorColor: cursorColor,
-                            typingSpeed: const Duration(milliseconds: 50),
-                          ),
-                        ),
-                      ],
+                    child: AnimatedBuilder(
+                      animation: _dotsController,
+                      builder: (context, _) {
+                        final dotCount =
+                            (_dotsController.value * 3).floor() % 3 + 1;
+                        final dots = List<String>.filled(dotCount, '.').join();
+                        return Text('$base$dots', style: textStyle);
+                      },
                     ),
                   );
                 }
-                // 历史消息直接显示
                 return Padding(
                   padding: const EdgeInsets.only(bottom: 4.0),
                   child: Text(
-                    widget.messages[index],
+                    message,
                     style: textStyle,
                   ),
                 );
@@ -548,104 +518,33 @@ class _LoadingOverlayState extends State<LoadingOverlay>
 
   Future<void> _updateAnimeCoverUrl() async {
     final animeId = widget.animeId;
-    final url = await _getAnimeCoverUrl(animeId);
+    final immediateUrl = _resolveImmediateCoverUrl();
+    final url = immediateUrl ?? await _getAnimeCoverUrl(animeId);
     if (mounted && widget.animeId == animeId && _coverImageUrl != url) {
       setState(() {
         _coverImageUrl = url;
       });
     }
   }
-}
 
-/// 自定义打字机文本光标组件
-class TypingTextCursor extends StatefulWidget {
-  final String text;
-  final TextStyle style;
-  final Animation<double> cursorAnimation;
-  final Color cursorColor;
-  final Duration typingSpeed;
+  String? _resolveImmediateCoverUrl() {
+    final suppliedUrl = _validNetworkUrl(widget.coverImageUrl);
+    if (suppliedUrl != null) return suppliedUrl;
 
-  const TypingTextCursor({
-    super.key,
-    required this.text,
-    required this.style,
-    required this.cursorAnimation,
-    required this.cursorColor,
-    required this.typingSpeed,
-  });
-
-  @override
-  State<TypingTextCursor> createState() => _TypingTextCursorState();
-}
-
-class _TypingTextCursorState extends State<TypingTextCursor> {
-  String _currentText = '';
-  int _charIndex = 0;
-  Timer? _timer;
-
-  @override
-  void initState() {
-    super.initState();
-    _startTypingAnimation();
+    final animeId = widget.animeId;
+    if (animeId == null || animeId <= 0) return null;
+    return _validNetworkUrl(
+      BangumiService.instance.getAnimeDetailsFromMemory(animeId)?.imageUrl,
+    );
   }
 
-  @override
-  void dispose() {
-    _timer?.cancel();
-    super.dispose();
-  }
-
-  @override
-  void didUpdateWidget(TypingTextCursor oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.text != widget.text) {
-      _currentText = '';
-      _charIndex = 0;
-      _startTypingAnimation();
+  String? _validNetworkUrl(String? value) {
+    final normalized = value?.trim();
+    if (normalized == null || normalized.isEmpty) return null;
+    final uri = Uri.tryParse(normalized);
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+      return null;
     }
-  }
-
-  void _startTypingAnimation() {
-    _timer?.cancel();
-    _timer = Timer.periodic(widget.typingSpeed, (timer) {
-      if (_charIndex < widget.text.length) {
-        setState(() {
-          _charIndex++;
-          _currentText = widget.text.substring(0, _charIndex);
-        });
-      } else {
-        timer.cancel();
-      }
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    // 计算光标位置
-    final textPainter = TextPainter(
-      text: TextSpan(
-        text: _currentText,
-        style: widget.style,
-      ),
-      textDirection: TextDirection.ltr,
-    );
-    textPainter.layout();
-
-    return Stack(
-      children: [
-        Positioned(
-          left: textPainter.width,
-          bottom: 5, // 绝对贴于底部
-          child: FadeTransition(
-            opacity: widget.cursorAnimation,
-            child: Container(
-              width: 10, // 光标宽度
-              height: 3, // 光标高度（下划线厚度）
-              color: widget.cursorColor,
-            ),
-          ),
-        ),
-      ],
-    );
+    return normalized;
   }
 }

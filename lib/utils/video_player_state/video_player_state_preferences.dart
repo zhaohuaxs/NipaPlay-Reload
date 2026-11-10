@@ -37,7 +37,9 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
         await initializePlayer(
           path,
           actualPlayUrl: actualUrl,
+          playbackDetailContext: _playbackDetailContext,
           resetManualDanmakuOffset: false,
+          episodeFileSelectionHandled: true,
         );
       } else {
         _setStatus(PlayerStatus.idle, message: '请重新选择视频');
@@ -56,7 +58,7 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _minimalProgressBarColor =
         prefs.getInt(_minimalProgressBarColorKey) ?? 0xFFFF7274;
     _showDanmakuDensityChart =
-        prefs.getBool(_showDanmakuDensityChartKey) ?? false;
+        prefs.getBool(SettingsKeys.showDanmakuDensityChart) ?? false;
     _notifyListeners();
   }
 
@@ -193,6 +195,115 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _notifyListeners();
   }
 
+  Future<void> _loadPlayerTopButtonVisibilitySettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    final sendDanmaku =
+        prefs.getBool(SettingsKeys.playerTopSendDanmakuButtonVisible) ?? true;
+    final skip = prefs.getBool(_playerTopSkipButtonVisibleKey) ?? false;
+    final resize = prefs.getBool(_playerTopResizeButtonVisibleKey) ?? false;
+    final frameStep =
+        prefs.getBool(_playerTopFrameStepButtonsVisibleKey) ?? false;
+    final changed = _playerTopSendDanmakuButtonVisible != sendDanmaku ||
+        _playerTopSkipButtonVisible != skip ||
+        _playerTopResizeButtonVisible != resize ||
+        _playerTopFrameStepButtonsVisible != frameStep;
+
+    _playerTopSendDanmakuButtonVisible = sendDanmaku;
+    _playerTopSkipButtonVisible = skip;
+    _playerTopResizeButtonVisible = resize;
+    _playerTopFrameStepButtonsVisible = frameStep;
+    if (changed) {
+      _notifyListeners();
+    }
+  }
+
+  Future<void> _loadPlayerMenuQuickControlsVisibility() async {
+    final prefs = await SharedPreferences.getInstance();
+    final visible =
+        prefs.getBool(SettingsKeys.showPlayerMenuQuickControls) ?? false;
+    if (_showPlayerMenuQuickControls == visible) return;
+    _showPlayerMenuQuickControls = visible;
+    _notifyListeners();
+  }
+
+  Future<void> setShowPlayerMenuQuickControls(bool visible) async {
+    if (_showPlayerMenuQuickControls == visible) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(SettingsKeys.showPlayerMenuQuickControls, visible);
+    _showPlayerMenuQuickControls = visible;
+    _notifyListeners();
+  }
+
+  Future<void> setPlayerTopSendDanmakuButtonVisible(bool visible) =>
+      _setPlayerTopButtonVisibility(
+        key: SettingsKeys.playerTopSendDanmakuButtonVisible,
+        currentValue: _playerTopSendDanmakuButtonVisible,
+        newValue: visible,
+        apply: () => _playerTopSendDanmakuButtonVisible = visible,
+      );
+
+  Future<void> setPlayerTopSkipButtonVisible(bool visible) =>
+      _setPlayerTopButtonVisibility(
+        key: _playerTopSkipButtonVisibleKey,
+        currentValue: _playerTopSkipButtonVisible,
+        newValue: visible,
+        apply: () => _playerTopSkipButtonVisible = visible,
+      );
+
+  Future<void> setPlayerTopResizeButtonVisible(bool visible) =>
+      _setPlayerTopButtonVisibility(
+        key: _playerTopResizeButtonVisibleKey,
+        currentValue: _playerTopResizeButtonVisible,
+        newValue: visible,
+        apply: () => _playerTopResizeButtonVisible = visible,
+      );
+
+  Future<void> setPlayerTopFrameStepButtonsVisible(bool visible) =>
+      _setPlayerTopButtonVisibility(
+        key: _playerTopFrameStepButtonsVisibleKey,
+        currentValue: _playerTopFrameStepButtonsVisible,
+        newValue: visible,
+        apply: () => _playerTopFrameStepButtonsVisible = visible,
+      );
+
+  Future<void> _setPlayerTopButtonVisibility({
+    required String key,
+    required bool currentValue,
+    required bool newValue,
+    required VoidCallback apply,
+  }) async {
+    if (currentValue == newValue) {
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(key, newValue);
+    apply();
+    _notifyListeners();
+  }
+
+  /// 加载 MKV 章节标记开关（进度条分割线标记 + 当前章节高亮 + 点击跳转）。
+  Future<void> _loadChapterMarkersEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    final resolved = prefs.getBool(_chapterMarkersEnabledKey) ?? true;
+    if (_chapterMarkersEnabled != resolved) {
+      _chapterMarkersEnabled = resolved;
+      _notifyListeners();
+    } else {
+      _chapterMarkersEnabled = resolved;
+    }
+  }
+
+  /// 设置 MKV 章节标记开关。
+  Future<void> setChapterMarkersEnabled(bool enabled) async {
+    if (_chapterMarkersEnabled == enabled) {
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_chapterMarkersEnabledKey, enabled);
+    _chapterMarkersEnabled = enabled;
+    _notifyListeners();
+  }
+
   // 保存最小化进度条启用状态
   Future<void> setMinimalProgressBarEnabled(bool enabled) async {
     _minimalProgressBarEnabled = enabled;
@@ -213,47 +324,55 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
   Future<void> setShowDanmakuDensityChart(bool show) async {
     _showDanmakuDensityChart = show;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_showDanmakuDensityChartKey, show);
+    await prefs.setBool(SettingsKeys.showDanmakuDensityChart, show);
     _notifyListeners();
   }
 
   // 加载弹幕不透明度
   Future<void> _loadDanmakuOpacity() async {
     final prefs = await SharedPreferences.getInstance();
-    _danmakuOpacity = prefs.getDouble(_danmakuOpacityKey) ?? 1.0;
+    _danmakuOpacity = prefs.getDouble(SettingsKeys.danmakuOpacity) ?? 1.0;
     _notifyListeners();
   }
 
   // 保存弹幕不透明度
   Future<void> setDanmakuOpacity(double opacity) async {
+    if (_danmakuOpacity == opacity) {
+      return;
+    }
     _danmakuOpacity = opacity;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble(_danmakuOpacityKey, opacity);
-    _syncErikaDanmakuConfig();
+    _syncErikaDanmakuOpacity();
     _notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(SettingsKeys.danmakuOpacity, opacity);
   }
 
-  // 获取映射后的弹幕不透明度
-  double get mappedDanmakuOpacity {
-    // 使用平方函数进行映射，使低值区域变化更平缓
-    return _danmakuOpacity * _danmakuOpacity;
-  }
+  // 交给 Flutter 弹幕渲染器的不透明度，与 Erika 原生弹幕、ASS 导出一致，直接取设置值（线性）
+  double get mappedDanmakuOpacity => danmakuOpacity;
 
   // 加载弹幕可见性
   Future<void> _loadDanmakuVisible() async {
     final prefs = await SharedPreferences.getInstance();
-    _danmakuVisible = prefs.getBool(_danmakuVisibleKey) ?? true;
+    if (_hasExplicitDanmakuVisibility) return;
+    _danmakuVisible = prefs.getBool(SettingsKeys.danmakuVisible) ?? true;
     _notifyListeners();
   }
 
-  void setDanmakuVisible(bool visible) async {
+  Future<void> setDanmakuVisible(bool visible) async {
+    _hasExplicitDanmakuVisibility = true;
     if (_danmakuVisible != visible) {
       _danmakuVisible = visible;
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_danmakuVisibleKey, visible);
-      _syncErikaDanmakuConfig();
+      // Visibility is latency-sensitive and Erika exposes a dedicated toggle.
+      // Start it before persistence, and bypass the coalesced full-config path
+      // so hiding cannot arrive together with a layout change and reset motion.
+      if (_erikaNativeDanmaku) {
+        unawaited(player.setNativeDanmakuEnabled(visible));
+      }
       _notifyListeners();
     }
+    // 即使内存值相同也保存显式选择，避免启动默认值掩盖旧存档。
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(SettingsKeys.danmakuVisible, visible);
   }
 
   void toggleDanmakuVisible() {
@@ -263,7 +382,7 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
   // 加载弹幕合并设置
   Future<void> _loadMergeDanmaku() async {
     final prefs = await SharedPreferences.getInstance();
-    _mergeDanmaku = prefs.getBool(_mergeDanmakuKey) ?? false;
+    _mergeDanmaku = prefs.getBool(SettingsKeys.mergeDanmaku) ?? false;
     _notifyListeners();
   }
 
@@ -272,7 +391,8 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     if (_mergeDanmaku != merge) {
       _mergeDanmaku = merge;
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_mergeDanmakuKey, merge);
+      await prefs.setBool(SettingsKeys.mergeDanmaku, merge);
+      _syncErikaDanmakuConfig();
       _notifyListeners();
     }
   }
@@ -285,7 +405,7 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
   // 加载弹幕堆叠设置
   Future<void> _loadDanmakuStacking() async {
     final prefs = await SharedPreferences.getInstance();
-    _danmakuStacking = prefs.getBool(_danmakuStackingKey) ?? false;
+    _danmakuStacking = prefs.getBool(SettingsKeys.danmakuStacking) ?? false;
     _notifyListeners();
   }
 
@@ -293,7 +413,7 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
   Future<void> _loadDanmakuRandomColorEnabled() async {
     final prefs = await SharedPreferences.getInstance();
     _danmakuRandomColorEnabled =
-        prefs.getBool(_danmakuRandomColorEnabledKey) ?? false;
+        prefs.getBool(SettingsKeys.danmakuRandomColorEnabled) ?? false;
     _notifyListeners();
   }
 
@@ -301,28 +421,30 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
   Future<void> _loadTimelineDanmakuEnabled() async {
     final prefs = await SharedPreferences.getInstance();
     _isTimelineDanmakuEnabled =
-        prefs.getBool(_timelineDanmakuEnabledKey) ?? true;
+        prefs.getBool(SettingsKeys.timelineDanmakuEnabled) ?? true;
     _notifyListeners();
   }
 
   Future<void> _loadHardwareDecoderSetting() async {
-    if (kIsWeb) return;
-    final prefs = await SharedPreferences.getInstance();
-    final resolved = prefs.getBool(_useHardwareDecoderKey) ?? true;
-    final bool changed = resolved != _useHardwareDecoder;
-    _useHardwareDecoder = resolved;
-    await applyHardwareDecoderPreference();
-    if (changed) {
-      _notifyListeners();
+      if (kIsWeb) return;
+      final prefs = await SharedPreferences.getInstance();
+      final resolved = prefs.getBool(_useHardwareDecoderKey) ?? true;
+      final bool changed = resolved != _useHardwareDecoder;
+      _useHardwareDecoder = resolved;
+      PlayerFactory.setUseHardwareDecoder(resolved);
+      await applyHardwareDecoderPreference();
+      if (changed) {
+        _notifyListeners();
+      }
     }
-  }
 
   // 设置弹幕堆叠
   Future<void> setDanmakuStacking(bool stacking) async {
     if (_danmakuStacking != stacking) {
       _danmakuStacking = stacking;
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_danmakuStackingKey, stacking);
+      await prefs.setBool(SettingsKeys.danmakuStacking, stacking);
+      _syncErikaDanmakuConfig();
       _notifyListeners();
     }
   }
@@ -334,7 +456,7 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     }
     _danmakuRandomColorEnabled = enabled;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_danmakuRandomColorEnabledKey, enabled);
+    await prefs.setBool(SettingsKeys.danmakuRandomColorEnabled, enabled);
     _updateMergedDanmakuList();
   }
 
@@ -358,35 +480,76 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
   }
 
   Future<void> setHardwareDecoderEnabled(bool enabled) async {
-    if (_useHardwareDecoder == enabled) {
-      return;
+      if (_useHardwareDecoder == enabled) {
+        return;
+      }
+      _useHardwareDecoder = enabled;
+      PlayerFactory.setUseHardwareDecoder(enabled);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_useHardwareDecoderKey, enabled);
+      await applyHardwareDecoderPreference();
+      _notifyListeners();
     }
-    _useHardwareDecoder = enabled;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_useHardwareDecoderKey, enabled);
-    await applyHardwareDecoderPreference();
-    _notifyListeners();
-  }
 
   String _resolveMpvHwdecValue() {
-    if (Platform.isAndroid) {
-      return 'mediacodec-copy';
+      if (Platform.isAndroid) {
+        return 'mediacodec-copy';
+      }
+      // 非 Android（iOS 等）：iOS libmpv 用 vo=libmpv，videotoolbox 直接输出
+      // 会回退 copy-back，统一用 auto-copy（copy-back）保证兼容。
+      return 'auto-copy';
     }
-    return 'auto-copy';
-  }
 
   Future<void> applyHardwareDecoderPreference() async {
-    if (kIsWeb || _isDisposed) return;
-    final kernelName = player.getPlayerKernelName();
-    if (kernelName == 'MDK') {
-      await _decoderManager.applyHardwareDecodingPreference(
-        _useHardwareDecoder,
-      );
-    } else if (kernelName == 'Media Kit') {
-      final hwdecValue = _useHardwareDecoder ? _resolveMpvHwdecValue() : 'no';
-      player.setProperty('hwdec', hwdecValue);
-    }
-  }
+        if (kIsWeb || _isDisposed) return;
+        final kernelName = player.getPlayerKernelName();
+        if (kernelName == 'MDK') {
+          // 硬解模式 → mdk decoder 列表（auto 系列用现有偏好；specific 强制该解码器）
+          final isAutoMode = const {
+                HwDecType.auto,
+                HwDecType.autoSafe,
+                HwDecType.autoCopy,
+                HwDecType.no,
+              }.contains(_hwdecMode);
+          if (isAutoMode) {
+            await _decoderManager.applyHardwareDecodingPreference(
+              _useHardwareDecoder,
+            );
+          } else {
+            // 特定硬解（videotoolbox/mediacodec/nvdec...）：copy 版用基础名
+            final decoder =
+                _hwdecMode.hwdec.replaceAll('-copy', '').split('-').first;
+            player.setDecoders(MediaType.video, [decoder, 'FFmpeg']);
+            debugPrint('[Decoder] mdk 硬解模式: ${_hwdecMode.hwdec} -> $decoder');
+          }
+          // 软解输出颜色格式：mdk 解码器属性（FFmpeg AVOption，软解生效；
+                  // 硬解输出由硬件决定，pixel_format 不适用）
+                  if (_softDecodePixelFormat.isNotEmpty) {
+                    try {
+                      player.setProperty(
+                        'video.decoder',
+                        'pixel_format=$_softDecodePixelFormat',
+                      );
+                    } catch (_) {}
+                    debugPrint('[Decoder] 软解颜色格式已应用: $_softDecodePixelFormat');
+                  } else {
+                    debugPrint('[Decoder] 软解颜色格式: 自动（内核默认）');
+                  }
+                  SystemResourceMonitor().setPixelFormat(
+                    _softDecodePixelFormat.isEmpty ? 'auto' : _softDecodePixelFormat,
+                  );
+        } else if (kernelName == 'Media Kit') {
+          // 硬解模式直设 mpv hwdec（照搬 PiliPlus）；软解开关关闭时强制 no
+          final hwdecValue =
+              _useHardwareDecoder ? _hwdecMode.hwdec : 'no';
+          player.setProperty('hwdec', hwdecValue);
+          debugPrint('[Decoder] libmpv hwdec: $hwdecValue');
+          // libmpv 的解码器由 hwdec 属性控制（不 setDecoders）；但资源监视器
+          // 的解码器信息来自 DecoderManager，需同步更新，否则开关后仍显示旧的
+          // "硬解 - VT（尝试）"。setDecoders 对 media_kit 仅存 map，无副作用。
+          await _decoderManager.applyHardwareDecodingPreference(_useHardwareDecoder);
+        }
+      }
 
   // 播放速度相关方法
 
@@ -472,11 +635,12 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
       return;
     }
     _playbackRate = resolved;
+    if (_isSpeedBoostActive) _normalPlaybackRate = resolved;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_playbackRateKey, resolved);
 
     // 立即应用新的播放速度
-    if (hasVideo) {
+    if (hasVideo && !_isSpeedBoostActive) {
       player.setPlaybackRate(resolved);
       debugPrint('设置播放速度: ${resolved}x');
     }
@@ -498,18 +662,20 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     // 保存当前播放速度，以便长按结束时恢复
     _normalPlaybackRate = _playbackRate;
 
-    // ✅ P6修复：速率变化前重设锚点，防止 playbackTimeMs 跳变
+    //  P6修复：速率变化前重设锚点，防止 playbackTimeMs 跳变
     // 根因：smoothMs = anchorMs + elapsedDelta * newRate，elapsedDelta是旧速率期间积累的，
     // 乘以新速率会导致 playbackTimeMs 瞬间跳变 elapsedDelta*(newRate-oldRate)。
     // 修复：将锚点重设到当前 playbackTimeMs 和 elapsed，使新速率从当前位置平滑推进。
     if (!kReleaseMode) {
       final elapsedDeltaMs = (_lastElapsedUs - _smoothAnchorElapsedUs) / 1000.0;
-      final predictedJumpMs = elapsedDeltaMs * (_speedBoostRate - _normalPlaybackRate);
-      debugPrint('[RATE-CHANGE-DIAG] START BOOST: ${_normalPlaybackRate}x → ${_speedBoostRate}x '
+      final predictedJumpMs =
+          elapsedDeltaMs * (_speedBoostRate - _normalPlaybackRate);
+      debugPrint(
+          '[RATE-CHANGE-DIAG] START BOOST: ${_normalPlaybackRate}x  ${_speedBoostRate}x '
           'anchorMs=${_smoothAnchorMs.toStringAsFixed(1)} '
           'elapsedDelta=${elapsedDeltaMs.toStringAsFixed(1)}ms '
           'PREDICTED_JUMP=${predictedJumpMs.toStringAsFixed(1)}ms '
-          'ptm=${_playbackTimeMs.value.toStringAsFixed(1)} ← ANCHOR RESET to ptm');
+          'ptm=${_playbackTimeMs.value.toStringAsFixed(1)}  ANCHOR RESET to ptm');
     }
     _smoothAnchorMs = _playbackTimeMs.value;
     _smoothAnchorElapsedUs = _lastElapsedUs;
@@ -527,17 +693,19 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
   void stopSpeedBoost() {
     if (!hasVideo || !_isSpeedBoostActive) return;
 
-    // ✅ P6修复：速率变化前重设锚点，防止 smoothMs 增速骤降导致 drift
-    // 根因：2x→1x时 smoothMs = anchorMs + elapsedDelta*1.0（之前*2.0），
-    // playbackTimeMs几乎不推进 → playerMs以1x继续推进 → 大drift → FORWARD SNAP
+    //  P6修复：速率变化前重设锚点，防止 smoothMs 增速骤降导致 drift
+    // 根因：2x1x时 smoothMs = anchorMs + elapsedDelta*1.0（之前*2.0），
+    // playbackTimeMs几乎不推进  playerMs以1x继续推进  大drift  FORWARD SNAP
     if (!kReleaseMode) {
       final elapsedDeltaMs = (_lastElapsedUs - _smoothAnchorElapsedUs) / 1000.0;
-      final predictedDriftMs = elapsedDeltaMs * (_speedBoostRate - _normalPlaybackRate);
-      debugPrint('[RATE-CHANGE-DIAG] STOP BOOST: ${_speedBoostRate}x → ${_normalPlaybackRate}x '
+      final predictedDriftMs =
+          elapsedDeltaMs * (_speedBoostRate - _normalPlaybackRate);
+      debugPrint(
+          '[RATE-CHANGE-DIAG] STOP BOOST: ${_speedBoostRate}x  ${_normalPlaybackRate}x '
           'anchorMs=${_smoothAnchorMs.toStringAsFixed(1)} '
           'elapsedDelta=${elapsedDeltaMs.toStringAsFixed(1)}ms '
           'PREDICTED_DRIFT=${predictedDriftMs.toStringAsFixed(1)}ms '
-          'ptm=${_playbackTimeMs.value.toStringAsFixed(1)} ← ANCHOR RESET to ptm');
+          'ptm=${_playbackTimeMs.value.toStringAsFixed(1)}  ANCHOR RESET to ptm');
     }
     _smoothAnchorMs = _playbackTimeMs.value;
     _smoothAnchorElapsedUs = _lastElapsedUs;
@@ -736,6 +904,94 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
       await applyAnime4KProfileToCurrentPlayer();
     }
     _notifyListeners();
+  }
+
+  Future<void> _loadErikaUpscalerMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    _erikaUpscalerModelPath = prefs.getString('erika_upscaler_model_path') ?? '';
+    final stored = prefs.getInt(_erikaUpscalerModeKey);
+    final resolved = stored != null &&
+            stored >= 0 &&
+            stored < PlayerUpscalerMode.values.length
+        ? PlayerUpscalerMode.values[stored]
+        : PlayerUpscalerMode.off;
+    if (_erikaUpscalerMode != resolved) {
+      _erikaUpscalerMode = resolved;
+      _notifyListeners();
+    } else {
+      _erikaUpscalerMode = resolved;
+    }
+    await applyErikaUpscalerModeToCurrentPlayer();
+  }
+
+  Future<void> setErikaUpscalerMode(PlayerUpscalerMode mode) async {
+    if (mode == PlayerUpscalerMode.erikaCustom && _erikaUpscalerModelPath.isEmpty) {
+      throw StateError('请先导入 Erika 自定义超分模型');
+    }
+    if (_erikaUpscalerMode == mode) {
+      await applyErikaUpscalerModeToCurrentPlayer();
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await _persistIntWithRetry(
+      prefs,
+      _erikaUpscalerModeKey,
+      mode.index,
+      settingName: 'Erika 超分辨率',
+    );
+    _erikaUpscalerMode = mode;
+    await applyErikaUpscalerModeToCurrentPlayer();
+    _notifyListeners();
+  }
+
+  Future<void> applyErikaUpscalerModeToCurrentPlayer() async {
+    if (_isDisposed || !player.supportsUpscaler) {
+      return;
+    }
+    if (_erikaUpscalerMode == PlayerUpscalerMode.erikaCustom) {
+      if (_erikaUpscalerModelPath.isEmpty) {
+        throw StateError('请先导入 Erika 自定义超分模型');
+      }
+      await player.loadUpscalerModelFile(_erikaUpscalerModelPath);
+    }
+    await player.setUpscaler(_erikaUpscalerMode);
+  }
+
+  Future<void> setErikaUpscalerModelPath(String path) async {
+    var stored = '';
+    if (path.isNotEmpty) {
+      // Own the imported bytes so picker permissions and temporary files do
+      // not make the setting disappear after relaunch (including iOS).
+      final bytes = await File(path).readAsBytes();
+      if (bytes.isEmpty) throw ArgumentError('超分模型文件为空');
+      final root = await StorageService.getAppStorageDirectory();
+      final target = File(p.join(root.path, 'erika_models',
+          '${sha256.convert(bytes)}${p.extension(path)}'));
+      await target.parent.create(recursive: true);
+      if (!await target.exists()) await target.writeAsBytes(bytes, flush: true);
+      stored = target.path;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('erika_upscaler_model_path', stored);
+    _erikaUpscalerModelPath = stored;
+    if (stored.isEmpty && _erikaUpscalerMode == PlayerUpscalerMode.erikaCustom) {
+      await setErikaUpscalerMode(PlayerUpscalerMode.off);
+      if (player.supportsUpscaler) await player.clearUpscalerModel();
+    } else {
+      await applyErikaUpscalerModeToCurrentPlayer();
+    }
+    _notifyListeners();
+  }
+
+  bool _supportsErikaUpscalerForCurrentPlayer() {
+    if (kIsWeb) {
+      return false;
+    }
+    try {
+      return player.supportsUpscaler;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<void> _loadAnime4KProfile() async {
@@ -1217,8 +1473,39 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
   // 加载弹幕字体大小
   Future<void> _loadDanmakuFontSize() async {
     final prefs = await SharedPreferences.getInstance();
-    _danmakuFontSize = prefs.getDouble(_danmakuFontSizeKey) ?? 0.0;
+    _danmakuFontSize = prefs.getDouble(SettingsKeys.danmakuFontSize) ?? 0.0;
     _notifyListeners();
+  }
+
+  Future<void> _loadTitanDanmakuSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    final encoded = prefs.getString(SettingsKeys.titanDanmakuSettings);
+    if (encoded == null || encoded.isEmpty) {
+      if (globals.isPhone) {
+        _titanDanmakuSettings =
+            _titanDanmakuSettings.copyWith(trackGap: 0.15);
+        _notifyListeners();
+      }
+      return;
+    }
+    try {
+      final decoded = jsonDecode(encoded);
+      if (decoded is Map) {
+        final json = Map<String, dynamic>.from(decoded);
+        // 旧版本未持久化轨道间距时，按设备类型补齐默认值（手机 0.15，其他 0）。
+        json.putIfAbsent('trackGap', () => globals.isPhone ? 0.15 : 0.0);
+        _titanDanmakuSettings = TitanDanmakuSettings.fromJson(json);
+        _notifyListeners();
+      }
+    } catch (error) {
+      debugPrint('[VideoPlayerState] 读取 Titan 弹幕设置失败: $error');
+    }
+  }
+
+  void setTitanDanmakuSettings(TitanDanmakuSettings settings) {
+    _titanDanmakuSettings = settings;
+    _notifyListeners();
+    _scheduleTitanDanmakuSettingsPersistence();
   }
 
   // 设置弹幕字体大小
@@ -1229,18 +1516,15 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     if (_danmakuFontSize != fontSize) {
       _danmakuFontSize = fontSize;
       _scheduleDanmakuFontSizePersistence(immediate: commit);
-      _syncErikaDanmakuConfig();
+      _syncErikaDanmakuFontSize();
       _notifyListeners();
     } else if (commit) {
       _scheduleDanmakuFontSizePersistence(immediate: true);
-      _syncErikaDanmakuConfig();
     }
   }
 
   DanmakuOutlineStyle _resolveDanmakuOutlineStyle(int? index) {
-    final DanmakuOutlineStyle fallback = globals.isMobilePlatform
-        ? DanmakuOutlineStyle.stroke
-        : DanmakuOutlineStyle.uniform;
+    final fallback = _defaultDanmakuOutlineStyle;
     if (index == null ||
         index < 0 ||
         index >= DanmakuOutlineStyle.values.length) {
@@ -1248,6 +1532,11 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     }
     return DanmakuOutlineStyle.values[index];
   }
+
+  DanmakuOutlineStyle get _defaultDanmakuOutlineStyle =>
+      globals.isMobilePlatform
+          ? DanmakuOutlineStyle.stroke
+          : DanmakuOutlineStyle.uniform;
 
   DanmakuShadowStyle _resolveDanmakuShadowStyle(int? index) {
     if (index == null ||
@@ -1261,10 +1550,12 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
   }
 
   double _sanitizeNext2DanmakuOutlineWidth(double? value) {
-    if (value == null || !value.isFinite) {
-      return 1.0;
-    }
-    return value <= 0.0 ? 0.0 : 1.0;
+    return normalizeDanmakuOutlineWidthLevel(
+      value,
+      fallback: globals.isTvOS
+          ? defaultTvOSErikaDanmakuOutlineWidthLevel
+          : defaultDanmakuOutlineWidthLevel,
+    );
   }
 
   bool _isSupportedDanmakuFontExtension(String path) {
@@ -1321,17 +1612,17 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
       final bytes = await sourceFile.readAsBytes();
       if (bytes.isEmpty) return null;
 
-      final supportDir = await path_provider.getApplicationSupportDirectory();
-      final fontsDir = Directory(p.join(supportDir.path, 'danmaku_fonts'));
+      // 与字幕字体共用一个字体库目录（subtitle_fonts）：弹幕/字幕/外挂
+      // 字幕三处设置导入的字体集中于此，各选择器都能看到同一份字体库。
+      final baseDir = await StorageService.getAppStorageDirectory();
+      final fontsDir = Directory(p.join(baseDir.path, 'subtitle_fonts'));
       await fontsDir.create(recursive: true);
 
-      final ext = p.extension(sourcePath).toLowerCase();
-      final baseName = p.basenameWithoutExtension(sourcePath);
-      final hash = sha1.convert(bytes).toString().substring(0, 12);
-      final fileName = '${baseName}_$hash$ext';
+      final fileName = p.basename(sourcePath);
       final destPath = p.join(fontsDir.path, fileName);
       final destFile = File(destPath);
-      if (!await destFile.exists()) {
+      if (!await destFile.exists() ||
+          await destFile.length() != bytes.length) {
         await destFile.writeAsBytes(bytes, flush: true);
       }
       return destPath;
@@ -1343,19 +1634,26 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
 
   Future<void> _loadDanmakuDisplayEffectSettings() async {
     final prefs = await SharedPreferences.getInstance();
+    final migrateTvOSErikaOutlineDefault = globals.isTvOS &&
+        !(prefs.getBool(
+              SettingsKeys.tvOSErikaDanmakuOutlineDefaultMigrated,
+            ) ??
+            false);
     final loadedFontFilePath =
-        (prefs.getString(_danmakuFontFilePathKey) ?? '').trim();
+        (prefs.getString(SettingsKeys.danmakuFontFilePath) ?? '').trim();
     var loadedFontFamily =
-        (prefs.getString(_danmakuFontFamilyKey) ?? '').trim();
+        (prefs.getString(SettingsKeys.danmakuFontFamily) ?? '').trim();
     final loadedOutlineStyle = _resolveDanmakuOutlineStyle(
-      prefs.getInt(_danmakuOutlineStyleKey),
+      prefs.getInt(SettingsKeys.danmakuOutlineStyle),
     );
     final loadedShadowStyle = _resolveDanmakuShadowStyle(
-      prefs.getInt(_danmakuShadowStyleKey),
+      prefs.getInt(SettingsKeys.danmakuShadowStyle),
     );
-    final loadedNext2OutlineWidth = _sanitizeNext2DanmakuOutlineWidth(
-      prefs.getDouble(_next2DanmakuOutlineWidthKey),
-    );
+    final loadedNext2OutlineWidth = migrateTvOSErikaOutlineDefault
+        ? defaultTvOSErikaDanmakuOutlineWidthLevel
+        : _sanitizeNext2DanmakuOutlineWidth(
+            prefs.getDouble(SettingsKeys.next2DanmakuOutlineWidth),
+          );
 
     var effectiveFontPath = loadedFontFilePath;
     if (effectiveFontPath.isNotEmpty) {
@@ -1388,17 +1686,24 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _next2DanmakuOutlineWidth = loadedNext2OutlineWidth;
 
     if (loadedFontFilePath != effectiveFontPath) {
-      await prefs.setString(_danmakuFontFilePathKey, effectiveFontPath);
+      await prefs.setString(
+          SettingsKeys.danmakuFontFilePath, effectiveFontPath);
     }
-    if ((prefs.getString(_danmakuFontFamilyKey) ?? '').trim() !=
+    if ((prefs.getString(SettingsKeys.danmakuFontFamily) ?? '').trim() !=
         loadedFontFamily) {
-      await prefs.setString(_danmakuFontFamilyKey, loadedFontFamily);
+      await prefs.setString(SettingsKeys.danmakuFontFamily, loadedFontFamily);
     }
-    if ((prefs.getDouble(_next2DanmakuOutlineWidthKey) ?? -1.0) !=
+    if ((prefs.getDouble(SettingsKeys.next2DanmakuOutlineWidth) ?? -1.0) !=
         loadedNext2OutlineWidth) {
       await prefs.setDouble(
-        _next2DanmakuOutlineWidthKey,
+        SettingsKeys.next2DanmakuOutlineWidth,
         loadedNext2OutlineWidth,
+      );
+    }
+    if (migrateTvOSErikaOutlineDefault) {
+      await prefs.setBool(
+        SettingsKeys.tvOSErikaDanmakuOutlineDefaultMigrated,
+        true,
       );
     }
 
@@ -1415,8 +1720,9 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _danmakuFontFilePath = '';
     _danmakuFontFamily = normalized;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_danmakuFontFilePathKey, '');
-    await prefs.setString(_danmakuFontFamilyKey, normalized);
+    await prefs.setString(SettingsKeys.danmakuFontFilePath, '');
+    await prefs.setString(SettingsKeys.danmakuFontFamily, normalized);
+    _syncErikaDanmakuConfig();
     _notifyListeners();
   }
 
@@ -1440,8 +1746,9 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _danmakuFontFilePath = persistedPath;
     _danmakuFontFamily = runtimeFamily;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_danmakuFontFilePathKey, persistedPath);
-    await prefs.setString(_danmakuFontFamilyKey, runtimeFamily);
+    await prefs.setString(SettingsKeys.danmakuFontFilePath, persistedPath);
+    await prefs.setString(SettingsKeys.danmakuFontFamily, runtimeFamily);
+    _syncErikaDanmakuConfig();
     _notifyListeners();
     return true;
   }
@@ -1453,19 +1760,57 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _danmakuFontFilePath = '';
     _danmakuFontFamily = '';
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_danmakuFontFilePathKey, '');
-    await prefs.setString(_danmakuFontFamilyKey, '');
+    await prefs.setString(SettingsKeys.danmakuFontFilePath, '');
+    await prefs.setString(SettingsKeys.danmakuFontFamily, '');
+    _syncErikaDanmakuConfig();
     _notifyListeners();
   }
 
-  Future<void> setDanmakuOutlineStyle(DanmakuOutlineStyle style) async {
-    if (_danmakuOutlineStyle == style) {
+  /// 设置弹幕描边样式和宽度
+  Future<void> _setDanmakuOutlineConfiguration(
+    DanmakuOutlineStyle style,
+    double outlineWidth,
+  ) async {
+    final sanitizedWidth = _sanitizeNext2DanmakuOutlineWidth(outlineWidth);
+    if (_danmakuOutlineStyle == style &&
+        (_next2DanmakuOutlineWidth - sanitizedWidth).abs() < 0.0001) {
       return;
     }
     _danmakuOutlineStyle = style;
+    _next2DanmakuOutlineWidth = sanitizedWidth;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt(_danmakuOutlineStyleKey, style.index);
+    await prefs.setInt(SettingsKeys.danmakuOutlineStyle, style.index);
+    await prefs.setDouble(
+      SettingsKeys.next2DanmakuOutlineWidth,
+      sanitizedWidth,
+    );
+    _syncErikaDanmakuConfig();
     _notifyListeners();
+  }
+
+  /// 设置是否启用弹幕描边
+  Future<void> setDanmakuOutlineEnabled(bool enabled) async {
+    final style = enabled
+        ? (_danmakuOutlineStyle == DanmakuOutlineStyle.none
+            ? _defaultDanmakuOutlineStyle
+            : _danmakuOutlineStyle)
+        : DanmakuOutlineStyle.none;
+    await _setDanmakuOutlineConfiguration(
+      style,
+      enabled ? defaultDanmakuOutlineWidthLevel : 0.0,
+    );
+  }
+
+  /// 设置弹幕描边样式
+  Future<void> setDanmakuOutlineStyle(DanmakuOutlineStyle style) async {
+    await _setDanmakuOutlineConfiguration(
+      style,
+      style == DanmakuOutlineStyle.none
+          ? 0.0
+          : (_next2DanmakuOutlineWidth > 0.0
+              ? _next2DanmakuOutlineWidth
+              : defaultDanmakuOutlineWidthLevel),
+    );
   }
 
   Future<void> setDanmakuShadowStyle(DanmakuShadowStyle style) async {
@@ -1474,28 +1819,29 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     }
     _danmakuShadowStyle = style;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt(_danmakuShadowStyleKey, style.index);
+    await prefs.setInt(SettingsKeys.danmakuShadowStyle, style.index);
+    _syncErikaDanmakuConfig();
     _notifyListeners();
   }
 
+  /// 设置下一条弹幕的描边宽度
   Future<void> setNext2DanmakuOutlineWidth(double value) async {
     final sanitized = _sanitizeNext2DanmakuOutlineWidth(value);
-    if ((_next2DanmakuOutlineWidth - sanitized).abs() < 0.0001) {
-      return;
-    }
-    _next2DanmakuOutlineWidth = sanitized;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble(_next2DanmakuOutlineWidthKey, sanitized);
-    _notifyListeners();
+    final style = sanitized > 0.0
+        ? (_danmakuOutlineStyle == DanmakuOutlineStyle.none
+            ? _defaultDanmakuOutlineStyle
+            : _danmakuOutlineStyle)
+        : DanmakuOutlineStyle.none;
+    await _setDanmakuOutlineConfiguration(style, sanitized);
   }
 
   // 获取实际使用的弹幕字体大小
   double get actualDanmakuFontSize {
-    if (_danmakuFontSize <= 0) {
+    if (danmakuFontSize <= 0) {
       // 使用默认值
       return globals.isPhone ? 20.0 : 30.0;
     }
-    return _danmakuFontSize;
+    return danmakuFontSize;
   }
 
   double _clampSubtitleScale(double value) {
@@ -1574,12 +1920,12 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
   }
 
   String _defaultSubtitleFontNameForPlatform() {
-    if (defaultTargetPlatform == TargetPlatform.android ||
-        defaultTargetPlatform == TargetPlatform.iOS) {
-      return 'Droid Sans Fallback';
+      // 返回空 = 让内核/libass 用内置默认字体。
+      // 旧值 'Droid Sans Fallback' 在 iOS/Android 系统里并不存在，显式设置
+      // 这个无效字体名会让 libass 加载失败——切换自动/自定义样式后内嵌轨道
+      // 字幕消失（切回自动也不恢复）。
+      return '';
     }
-    return 'subfont';
-  }
 
   Future<void> _loadSubtitleSettings() async {
     final prefs = await SharedPreferences.getInstance();
@@ -1587,6 +1933,12 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
       prefs.getDouble(_subtitleScaleKey) ??
           VideoPlayerState.defaultSubtitleScale,
     );
+    _srtSubtitleScale = _clampSubtitleScale(
+        prefs.getDouble(_srtSubtitleScaleKey) ??
+            VideoPlayerState.defaultSubtitleScale);
+    _srtSubtitleDelaySeconds = prefs.getDouble(_srtSubtitleDelayKey) ??
+        VideoPlayerState.defaultSubtitleDelaySeconds;
+    _subtitleManager.srtDelaySeconds = _srtSubtitleDelaySeconds;
     _subtitleDelaySeconds = prefs.getDouble(_subtitleDelayKey) ??
         VideoPlayerState.defaultSubtitleDelaySeconds;
     _subtitlePosition = _clampSubtitlePosition(
@@ -1603,6 +1955,9 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
         VideoPlayerState.defaultSubtitleMarginX;
     _subtitleMarginY = prefs.getDouble(_subtitleMarginYKey) ??
         VideoPlayerState.defaultSubtitleMarginY;
+    // 内嵌字幕整块移动模式（双语不重叠）：跨会话记忆。
+    _embeddedSubtitleOverlayMode =
+        prefs.getBool(_embeddedSubtitleOverlayModeKey) ?? false;
     _subtitleOpacity = _clampSubtitleOpacity(
       prefs.getDouble(_subtitleOpacityKey) ??
           VideoPlayerState.defaultSubtitleOpacity,
@@ -1622,14 +1977,21 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _subtitleBorderColorValue = prefs.getInt(_subtitleBorderColorKey) ??
         VideoPlayerState.defaultSubtitleBorderColorValue;
     _subtitleShadowColorValue = prefs.getInt(_subtitleShadowColorKey) ??
-        VideoPlayerState.defaultSubtitleShadowColorValue;
-    _subtitleFontName = prefs.getString(_subtitleFontNameKey) ?? '';
+            VideoPlayerState.defaultSubtitleShadowColorValue;
+        _externalSubtitleColorValue =
+                prefs.getInt(_externalSubtitleColorKey) ?? 0xFFFFFFFF;
+            _externalSubtitleFontName =
+                prefs.getString(_externalSubtitleFontNameKey) ?? '';
+        _subtitleFontName = prefs.getString(_subtitleFontNameKey) ?? '';
     _subtitleFontDir = prefs.getString(_subtitleFontDirKey) ?? '';
     _subtitleOverrideMode = SubtitleStyleOverrideMode.values[(prefs.getInt(
-              _subtitleOverrideModeKey,
-            ) ??
-            VideoPlayerState.defaultSubtitleOverrideMode.index)
-        .clamp(0, SubtitleStyleOverrideMode.values.length - 1)];
+            _subtitleOverrideModeKey,
+          ) ??
+          VideoPlayerState.defaultSubtitleOverrideMode.index)
+      .clamp(0, SubtitleStyleOverrideMode.values.length - 1)];
+    // 跨会话恢复的已选字体必须在启动时注册进引擎，否则叠层 fontFamily
+    // 静默回退默认字体（用户感知：选了字体但没生效）。
+    await ensureSelectedSubtitleFontsRegistered();
     await applySubtitleStylePreference();
     _notifyListeners();
   }
@@ -1646,6 +2008,27 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _notifyListeners();
   }
 
+    /// 设置 SRT 独立字号（不碰内核/内嵌字号）
+    Future<void> setSrtSubtitleScale(double scale) async {
+      final resolved = _clampSubtitleScale(scale);
+      if ((_srtSubtitleScale - resolved).abs() < 0.0001) return;
+      _srtSubtitleScale = resolved;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(_srtSubtitleScaleKey, resolved);
+      _notifyListeners();
+    }
+
+  /// 设置 SRT 独立时轴偏移（秒）
+  Future<void> setSrtSubtitleDelaySeconds(double seconds) async {
+    final clamped = _resolveSubtitleDelaySecondsForCurrentVideo(seconds);
+    if (_srtSubtitleDelaySeconds == clamped) return;
+    _srtSubtitleDelaySeconds = clamped;
+    _subtitleManager.srtDelaySeconds = clamped;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_srtSubtitleDelayKey, clamped);
+    _notifyListeners();
+  }
+
   Future<void> setSubtitleDelaySeconds(double seconds) async {
     if ((_subtitleDelaySeconds - seconds).abs() < 0.0001) {
       return;
@@ -1657,15 +2040,44 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _notifyListeners();
   }
 
-  Future<void> setSubtitlePosition(double position) async {
-    final resolved = _clampSubtitlePosition(position);
-    if ((_subtitlePosition - resolved).abs() < 0.0001) {
-      return;
-    }
-    _subtitlePosition = resolved;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble(_subtitlePositionKey, resolved);
+
+  /// 位置/边距/对齐改动后强制 libass 重新排版（mpv 需 seek 触发字幕重渲染，否则要重载视频才生效）
+    void _refreshSubtitleLayout() {
+      if (kIsWeb || _isDisposed) return;
+      // App 内叠层字幕（SRT/VTT/ASS）的位置是 Flutter UI 层，不占内核轨：
+      // 拖动/调整时无需 seek 内核，seek 反而造成卡顿跳帧（libmpv 实测拖不动）。
+      final extPath = getActiveExternalSubtitlePath();
+      if (extPath != null && extPath.isNotEmpty) {
+        final ext = extPath.toLowerCase();
+        if (ext.endsWith('.srt') || ext.endsWith('.vtt') ||
+            ext.endsWith('.ass') || ext.endsWith('.ssa')) {
+          return;
+        }
+      }
+      // 内嵌轨（简日双语 mkv 等）：同样不 seek。mdk/libass 的 sub-pos/边距
+            // 属性走 setProperty 热更新即可生效，seek 会打断解码/渲染队列导致
+            // 拖滑块画面冻结（音频继续走）。仅内核不支持热更新时才需要 seek。
+            return;
+          }
+
+        Future<void> setSubtitlePosition(double position) async {
+      final resolved = _clampSubtitlePosition(position);
+      if ((_subtitlePosition - resolved).abs() < 0.0001) {
+        return;
+      }
+      _subtitlePosition = resolved;
+      debugPrint('[SubtitlePos] 设置 sub-pos=$resolved kernel=${player.getPlayerKernelName()}');
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(_subtitlePositionKey, resolved);
+    // 滑块只管内嵌轨（含 libmpv 内核轨 sub-pos）；外挂叠层字幕块由
+    // 长按拖动逐条定位，滑块不再同步覆盖各 path 的位置。
+    _subtitleManager.globalPositionSeed = resolved;
+    // 叠层字幕位置在 Flutter UI 层，不碰内核 sub-margin/sub-pos（MediaKit 限制0~300且报错）
+    if (!shouldRenderCurrentExternalSubtitleInApp()) {
     await applySubtitleStylePreference();
+
+    }
+    _refreshSubtitleLayout();
     _notifyListeners();
   }
 
@@ -1675,6 +2087,7 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(_subtitleAlignXKey, align.index);
     await applySubtitleStylePreference();
+    _refreshSubtitleLayout();
     _notifyListeners();
   }
 
@@ -1684,6 +2097,7 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(_subtitleAlignYKey, align.index);
     await applySubtitleStylePreference();
+    _refreshSubtitleLayout();
     _notifyListeners();
   }
 
@@ -1692,7 +2106,14 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _subtitleMarginX = value;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_subtitleMarginXKey, value);
+    _subtitleManager.globalMarginSeed = value;
+    // 水平边距滑块同样只管内嵌轨，不覆盖外挂叠层块的独立摆位。
+    // 叠层字幕位置在 Flutter UI 层，不碰内核 sub-margin/sub-pos（MediaKit 限制0~300且报错）
+    if (!shouldRenderCurrentExternalSubtitleInApp()) {
     await applySubtitleStylePreference();
+
+    }
+    _refreshSubtitleLayout();
     _notifyListeners();
   }
 
@@ -1701,7 +2122,12 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _subtitleMarginY = value;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_subtitleMarginYKey, value);
+    // 叠层字幕位置在 Flutter UI 层，不碰内核 sub-margin/sub-pos（MediaKit 限制0~300且报错）
+    if (!shouldRenderCurrentExternalSubtitleInApp()) {
     await applySubtitleStylePreference();
+
+    }
+    _refreshSubtitleLayout();
     _notifyListeners();
   }
 
@@ -1753,6 +2179,30 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _notifyListeners();
   }
 
+  /// 外挂叠层独立颜色（长按外挂调色板设这里；不影响内嵌/字幕设置面板）
+  Color get externalSubtitleColor => Color(_externalSubtitleColorValue);
+
+  Future<void> setExternalSubtitleColor(Color color) async {
+    if (_externalSubtitleColorValue == color.value) return;
+    _externalSubtitleColorValue = color.value;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_externalSubtitleColorKey, color.value);
+    _notifyListeners();
+  }
+
+  /// 外挂叠层独立字体（长按外挂面板设这里；不影响播放器设置/内嵌 sub-font）
+  String get externalSubtitleFontName => _externalSubtitleFontName;
+
+  Future<void> setExternalSubtitleFontName(String value) async {
+    final normalized = value.trim();
+    if (_externalSubtitleFontName == normalized) return;
+    _externalSubtitleFontName = normalized;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_externalSubtitleFontNameKey, normalized);
+    await ensureSelectedSubtitleFontsRegistered();
+    _notifyListeners();
+  }
+
   Future<void> setSubtitleColor(Color color) async {
     if (_subtitleColorValue == color.value) return;
     _subtitleColorValue = color.value;
@@ -1786,6 +2236,8 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _subtitleFontName = trimmed;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_subtitleFontNameKey, trimmed);
+    // 多选字体在叠层渲染前必须已注册进引擎，否则 fontFamily 静默回退。
+    unawaited(ensureSelectedSubtitleFontsRegistered());
     await applySubtitleStylePreference();
     _notifyListeners();
   }
@@ -1799,7 +2251,153 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     _notifyListeners();
   }
 
-  Future<void> importSubtitleFontFile(String sourcePath) async {
+  /// 列出 subtitle_fonts 字体库中的字体文件名（不含扩展名），用于选择字体样式。
+  Future<List<String>> listSubtitleFonts() async {
+    try {
+      final baseDir = await StorageService.getAppStorageDirectory();
+      final fontsDir = Directory(p.join(baseDir.path, 'subtitle_fonts'));
+      if (!await fontsDir.exists()) return const [];
+      final names = <String>[];
+      await for (final entity in fontsDir.list()) {
+        if (entity is File) {
+          final ext = p.extension(entity.path).toLowerCase();
+          if (ext == '.ttf' || ext == '.otf' || ext == '.ttc') {
+            names.add(p.basenameWithoutExtension(entity.path));
+          }
+        }
+      }
+      names.sort();
+      return names;
+    } catch (e) {
+      debugPrint('[VideoPlayerState] 列出字体库失败: $e');
+      return const [];
+    }
+  }
+
+  /// 清空 subtitle_fonts 字体缓存目录并重置字体设置（导入/远程下载的字体全删）。
+  Future<void> clearSubtitleFontCache() async {
+    try {
+      final baseDir = await StorageService.getAppStorageDirectory();
+      final fontsDir = Directory(p.join(baseDir.path, 'subtitle_fonts'));
+      if (await fontsDir.exists()) {
+        await fontsDir.delete(recursive: true);
+      }
+      VideoPlayerState._registeredSubtitleRuntimeFontPaths
+          .removeWhere((path) => p.isWithin(fontsDir.path, path));
+      _subtitleFontDir = '';
+      _subtitleFontName = '';
+      _externalSubtitleFontName = '';
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_subtitleFontDirKey, '');
+      await prefs.setString(_subtitleFontNameKey, '');
+      await prefs.setString(_externalSubtitleFontNameKey, '');
+      await applySubtitleStylePreference();
+      _notifyListeners();
+    } catch (e) {
+      debugPrint('[VideoPlayerState] 清除字幕字体缓存失败: $e');
+    }
+  }
+
+  /// 将字幕字体注册到 Flutter（overlay 的 fontFamily 才能生效，否则 Text 不渲染）
+  Future<String?> _registerSubtitleRuntimeFont(String filePath) async {
+    if (kIsWeb) return null;
+    if (VideoPlayerState._registeredSubtitleRuntimeFontPaths
+        .contains(filePath)) {
+      return p.basenameWithoutExtension(filePath);
+    }
+    try {
+      final file = File(filePath);
+      if (!await file.exists()) return null;
+      final family = p.basenameWithoutExtension(filePath);
+      final bytes = await file.readAsBytes();
+      if (bytes.isEmpty) return null;
+      final loader = FontLoader(family);
+      loader.addFont(
+        Future<ByteData>.value(ByteData.sublistView(Uint8List.fromList(bytes))),
+      );
+      await loader.load();
+      VideoPlayerState._registeredSubtitleRuntimeFontPaths.add(filePath);
+      return family;
+    } catch (e) {
+      debugPrint('[VideoPlayerState] 注册字幕字体失败: $e');
+      return null;
+    }
+  }
+
+  /// 确保当前多选的字幕字体已注册进 Flutter 引擎。
+  ///
+  /// 远程下载/历史缓存的字体文件从未走过 import 流程时，overlay 的
+  /// fontFamily 会静默回退到默认字体——用户感知就是“选了字体没生效”。
+  /// 在设置面板打开与字体选择变更时调用。
+  Future<void> ensureSelectedSubtitleFontsRegistered() async {
+    if (kIsWeb) return;
+    List<String> selectedNames(String value) => value
+        .split(',')
+        .map((name) => name.trim())
+        .where((name) => name.isNotEmpty)
+        .toList();
+
+    final internalNames = selectedNames(_subtitleFontName);
+    final externalNames = selectedNames(_externalSubtitleFontName);
+    if (internalNames.isEmpty && externalNames.isEmpty) return;
+
+    var missing = 0;
+    final checkedPaths = <String>{};
+    Future<void> registerNames(String dir, List<String> names) async {
+      for (final family in names) {
+        File? match;
+        for (final extension in const <String>['.ttf', '.otf', '.ttc']) {
+          final file = File(p.join(dir, '$family$extension'));
+          if (file.existsSync()) {
+            match = file;
+            break;
+          }
+        }
+        if (match == null) {
+          missing++;
+          continue;
+        }
+        if (!checkedPaths.add(match.path)) {
+          continue;
+        }
+        if (VideoPlayerState._registeredSubtitleRuntimeFontPaths
+            .contains(match.path)) {
+          continue;
+        }
+        final registered = await _registerSubtitleRuntimeFont(match.path);
+        if (registered == null) {
+          missing++;
+        }
+      }
+    }
+
+    final internalDir = _subtitleFontDir.trim();
+    if (internalDir.isNotEmpty && internalNames.isNotEmpty) {
+      await registerNames(internalDir, internalNames);
+    }
+    if (externalNames.isNotEmpty) {
+      try {
+        final baseDir = await StorageService.getAppStorageDirectory();
+        await registerNames(
+          p.join(baseDir.path, 'subtitle_fonts'),
+          externalNames,
+        );
+      } catch (e) {
+        missing += externalNames.length;
+        debugPrint('[VideoPlayerState] 外挂字幕字体目录不可用: $e');
+      }
+    }
+    if (missing > 0 && !VideoPlayerState._subtitleFontRegistrationWarned) {
+      VideoPlayerState._subtitleFontRegistrationWarned = true;
+      debugPrint(
+        '[VideoPlayerState] 有 $missing 个已选字幕字体未能注册（文件缺失或解析失败），'
+        '渲染将回退默认字体',
+      );
+    }
+  }
+
+  Future<void> importSubtitleFontFile(String sourcePath,
+      {bool applyName = true}) async {
     if (sourcePath.isEmpty) return;
     try {
       final baseDir = await StorageService.getAppStorageDirectory();
@@ -1808,11 +2406,16 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
       final fileName = p.basename(sourcePath);
       final destPath = p.join(fontsDir.path, fileName);
       await File(sourcePath).copy(destPath);
+      await _registerSubtitleRuntimeFont(destPath);
       _subtitleFontDir = fontsDir.path;
-      _subtitleFontName = p.basenameWithoutExtension(destPath);
+      if (applyName) {
+        _subtitleFontName = p.basenameWithoutExtension(destPath);
+      }
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_subtitleFontDirKey, _subtitleFontDir);
-      await prefs.setString(_subtitleFontNameKey, _subtitleFontName);
+      if (applyName) {
+        await prefs.setString(_subtitleFontNameKey, _subtitleFontName);
+      }
       await applySubtitleStylePreference();
       _notifyListeners();
     } catch (e) {
@@ -1855,6 +2458,7 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
         final fileName = p.basename(file.path);
         final destPath = p.join(fontsDir.path, fileName);
         await file.copy(destPath);
+        await _registerSubtitleRuntimeFont(destPath);
         copiedCount++;
       }
 
@@ -1961,11 +2565,36 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
 
   Future<void> applySubtitleStylePreference() async {
     if (kIsWeb || _isDisposed) return;
+    // 叠层字幕(SRT/VTT)样式在 Flutter UI 层，不设内核属性（sub-margin-x 限制0~300，拖拽负值报错/卡热切换）；
+        // 但混挂内核轨 ASS 时仍需继续设置 sub-pos/sub-delay 等，否则位置滑块/延迟对内核字幕不生效。
+        // 内嵌轨（含 mdk 字号 subtitle.font.size）也必须走内核属性——只按"外挂走叠层"就 return 会漏掉内嵌轨。
+        final hasKernelExternalSubtitle = activeExternalSubtitlePaths
+            .any((p) => !externalSubtitleRenderedInApp(p));
+        final hasEmbeddedSubtitleActive = player.activeSubtitleTracks.isNotEmpty;
+        if (!hasKernelExternalSubtitle &&
+            !hasEmbeddedSubtitleActive) {
+          return;
+        }
     try {
-      if (player.getPlayerKernelName() != 'Media Kit') {
-        return;
-      }
-      player.setProperty('sub-scale', _subtitleScale.toStringAsFixed(2));
+      final playerKernelName = player.getPlayerKernelName();
+      // Erika 取同一组 mpv 字幕属性，由它的适配器合成一次 setSubtitleStyle。
+      if (playerKernelName != 'Media Kit' &&
+          playerKernelName != 'MDK' &&
+          playerKernelName != 'Erika') {
+              return;
+            }
+            // mdk 属性名是 subtitle.scale（sub-scale 是 mpv 的）——之前用错
+                  // 导致 mdk 内嵌轨字号设置不生效（默认 22 小字号，对比 libmpv 明显小）
+                  player.setProperty(
+                    playerKernelName == 'MDK' ? 'subtitle.scale' : 'sub-scale',
+                    _subtitleScale.toStringAsFixed(2),
+                  );
+                  // mdk 内嵌轨（srt/text）字号基准调大（默认 22 太小，对齐 libmpv 视觉）
+                  if (playerKernelName == 'MDK') {
+                    try {
+                      player.setProperty('subtitle.font.size', '45');
+                    } catch (_) {}
+                  }
       player.setProperty('sub-delay', subtitleDelaySeconds.toStringAsFixed(2));
       player.setProperty('sub-pos', _subtitlePosition.toStringAsFixed(0));
       player.setProperty('sub-align-x', _subtitleAlignXToMpv(_subtitleAlignX));
@@ -1984,21 +2613,44 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
         'sub-shadow-offset',
         _subtitleShadowOffset.toStringAsFixed(1),
       );
-      player.setProperty('sub-color', _colorToMpvHex(subtitleColor));
-      player.setProperty(
-        'sub-border-color',
-        _colorToMpvHex(subtitleBorderColor),
-      );
-      player.setProperty(
-        'sub-shadow-color',
-        _colorToMpvHex(subtitleShadowColor),
-      );
+      // 内嵌轨道颜色：字幕设置面板（subtitleColor 系）应用 sub-color——
+            // 面板颜色只渲染内嵌/内核轨；外挂 SRT 叠层用独立 externalSubtitleColor
+            // （长按外挂调色板），互不污染。
+            player.setProperty('sub-color', _colorToMpvHex(subtitleColor));
+            player.setProperty(
+              'sub-border-color',
+              _colorToMpvHex(subtitleBorderColor),
+            );
+            player.setProperty(
+              'sub-shadow-color',
+              _colorToMpvHex(subtitleShadowColor),
+            );
       player.setProperty('sub-bold', _subtitleBold ? 'yes' : 'no');
       player.setProperty('sub-italic', _subtitleItalic ? 'yes' : 'no');
 
       String? effectiveFontDir;
       String? localFontsFolder;
       final hadPreviousFontDir = _subtitleFontDir.isNotEmpty;
+
+      // 字体仅在“自定义样式”(force) 模式下生效；其他模式清空自定义字体
+      final fontOverrideActive =
+          _subtitleOverrideMode == SubtitleStyleOverrideMode.force;
+      if (!fontOverrideActive) {
+        if (hadPreviousFontDir) {
+          player.setProperty('sub-fonts-dir', '');
+          if (defaultTargetPlatform == TargetPlatform.iOS) {
+            player.setProperty('sub-file-paths', '');
+          }
+          _subtitleFontDir = '';
+        }
+        final resolvedDefaultFont = _defaultSubtitleFontNameForPlatform();
+        player.setProperty('sub-font', resolvedDefaultFont);
+        player.setProperty(
+          'sub-ass-override',
+          _subtitleOverrideModeToMpv(_subtitleOverrideMode),
+        );
+        return;
+      }
 
       if (_currentVideoPath != null &&
           !_currentVideoPath!.startsWith('http') &&
@@ -2095,7 +2747,8 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
   // 加载弹幕轨道显示区域
   Future<void> _loadDanmakuDisplayArea() async {
     final prefs = await SharedPreferences.getInstance();
-    _danmakuDisplayArea = prefs.getDouble(_danmakuDisplayAreaKey) ?? 1.0;
+    _danmakuDisplayArea =
+        prefs.getDouble(SettingsKeys.danmakuDisplayArea) ?? 1.0;
     _notifyListeners();
   }
 
@@ -2104,7 +2757,7 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     if (_danmakuDisplayArea != area) {
       _danmakuDisplayArea = area;
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setDouble(_danmakuDisplayAreaKey, area);
+      await prefs.setDouble(SettingsKeys.danmakuDisplayArea, area);
       _syncErikaDanmakuConfig();
       _notifyListeners();
     }
@@ -2122,14 +2775,14 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
 
   Future<void> _loadDanmakuSpeedMultiplier() async {
     final prefs = await SharedPreferences.getInstance();
-    final stored = prefs.getDouble(_danmakuSpeedMultiplierKey);
+    final stored = prefs.getDouble(SettingsKeys.danmakuSpeedMultiplier);
     _danmakuSpeedMultiplier = _normalizeDanmakuSpeed(stored ?? 1.0);
     _notifyListeners();
   }
 
   Future<void> _loadRememberDanmakuOffset() async {
     final prefs = await SharedPreferences.getInstance();
-    final resolved = prefs.getBool(_rememberDanmakuOffsetKey) ?? false;
+    final resolved = prefs.getBool(SettingsKeys.rememberDanmakuOffset) ?? false;
     if (_rememberDanmakuOffset != resolved) {
       _rememberDanmakuOffset = resolved;
       _notifyListeners();
@@ -2143,7 +2796,7 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
       return;
     }
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_rememberDanmakuOffsetKey, remember);
+    await prefs.setBool(SettingsKeys.rememberDanmakuOffset, remember);
     _rememberDanmakuOffset = remember;
     _notifyListeners();
   }
@@ -2155,14 +2808,15 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     }
     _danmakuSpeedMultiplier = normalized;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble(_danmakuSpeedMultiplierKey, normalized);
+    await prefs.setDouble(SettingsKeys.danmakuSpeedMultiplier, normalized);
+    _syncErikaDanmakuConfig();
     _notifyListeners();
   }
 
   Future<void> _loadDanmakuDfmPlusTrackGap() async {
     final prefs = await SharedPreferences.getInstance();
     _danmakuDfmPlusTrackGap =
-        prefs.getDouble(_danmakuDfmPlusTrackGapKey) ?? 0.15;
+        prefs.getDouble(SettingsKeys.danmakuDfmPlusTrackGap) ?? 0.15;
     _notifyListeners();
   }
 
@@ -2173,7 +2827,8 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     }
     _danmakuDfmPlusTrackGap = normalized;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble(_danmakuDfmPlusTrackGapKey, normalized);
+    await prefs.setDouble(SettingsKeys.danmakuDfmPlusTrackGap, normalized);
+    _syncErikaDanmakuConfig();
     _notifyListeners();
   }
 
@@ -2223,6 +2878,28 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
       final prefs = await SharedPreferences.getInstance();
       final stored = prefs.getInt(_screenshotSaveTargetKey);
       _screenshotSaveTarget = ScreenshotSaveTargetDisplay.fromPrefs(stored);
+    _screenshotQuality =
+        ScreenshotQualityDisplay.fromPrefs(prefs.getInt(_screenshotQualityKey));
+    _screenshotFormat =
+        ScreenshotFormat.fromPreference(prefs.getString(_screenshotFormatKey));
+    _screenshotCaptureIncludesDanmaku =
+        prefs.getBool(_screenshotIncludeDanmakuKey) ?? true;
+    _screenshotCaptureIncludesSubtitles =
+        prefs.getBool(_screenshotIncludeSubtitlesKey) ?? true;
+    _screenshotCropLetterbox =
+        prefs.getBool(_screenshotCropLetterboxKey) ?? true;
+    final aspectModeName = prefs.getString(_videoAspectModeKey);
+    _videoAspectMode = VideoAspectMode.values.firstWhere(
+      (m) => m.name == aspectModeName,
+      orElse: () => VideoAspectMode.contain,
+    );
+    _softDecodePixelFormat =
+            prefs.getString(_softDecodePixelFormatKey) ?? '';
+        final hwdecName = prefs.getString(_hwdecModeKey);
+        _hwdecMode = HwDecType.values.firstWhere(
+          (h) => h.name == hwdecName,
+          orElse: () => HwDecType.auto,
+        );
       _notifyListeners();
     } catch (e) {
       debugPrint('加载截图默认保存位置失败: $e');
@@ -2239,6 +2916,139 @@ extension VideoPlayerStatePreferences on VideoPlayerState {
     } catch (e) {
       debugPrint('保存截图默认保存位置失败: $e');
     }
+    _notifyListeners();
+  }
+
+  Future<void> setScreenshotFormat(ScreenshotFormat format) async {
+    if (_screenshotFormat == format) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_screenshotFormatKey, format.name);
+    _screenshotFormat = format;
+    _notifyListeners();
+  }
+
+  Future<void> setScreenshotQuality(ScreenshotQuality quality) async {
+    if (_screenshotQuality == quality) return;
+    _screenshotQuality = quality;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_screenshotQualityKey, quality.prefsValue);
+    logPlayerEvent(
+      'Player',
+      '截图质量已设置为 ${quality.label}（JPEG ${quality.jpegQuality}）',
+    );
+    _notifyListeners();
+  }
+
+  /// 硬解模式（mpv hwdec 值，照搬 PiliPlus）
+  HwDecType get hwdecMode => _hwdecMode;
+
+  Future<void> setHwdecMode(HwDecType mode) async {
+    if (_hwdecMode == mode) return;
+    _hwdecMode = mode;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_hwdecModeKey, mode.name);
+    await applyHardwareDecoderPreference();
+    // 硬解模式切换后自动重载当前视频使其生效（保留播放位置，保持暂停）
+    final path = currentVideoPath;
+    if (path != null && path.isNotEmpty && hasVideo) {
+      final posMs = _position.inMilliseconds;
+      final history = WatchHistoryItem(
+        filePath: path,
+        animeName: animeTitle ?? '',
+        episodeTitle: episodeTitle,
+        episodeId: episodeId,
+        animeId: animeId,
+        lastPosition: posMs,
+        duration: duration.inMilliseconds,
+        watchProgress: progress,
+        lastWatchTime: DateTime.now(),
+      );
+      await initializePlayer(
+        path,
+        historyItem: history,
+        mediaLibraryScope: _playbackDetailContext?.mediaLibraryScope,
+        resetManualDanmakuOffset: false,
+        episodeFileSelectionHandled: true,
+      );
+      // 重载后保持暂停（沿用原 autoPlay:false 语义），用户手动继续播放
+      if (hasVideo) {
+        pause();
+      }
+      debugPrint('[Decoder] 硬解模式切换，已重载视频以应用 hwdec=${mode.hwdec}');
+    }
+    _notifyListeners();
+  }
+
+  Future<void> setScreenshotCaptureIncludesDanmaku(bool value) async {
+    if (_screenshotCaptureIncludesDanmaku == value) return;
+    _screenshotCaptureIncludesDanmaku = value;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_screenshotIncludeDanmakuKey, value);
+    _notifyListeners();
+  }
+
+  Future<void> setScreenshotCropLetterbox(bool value) async {
+    if (_screenshotCropLetterbox == value) return;
+    _screenshotCropLetterbox = value;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_screenshotCropLetterboxKey, value);
+    _notifyListeners();
+  }
+
+  Future<void> setVideoAspectMode(VideoAspectMode mode) async {
+    if (_videoAspectMode == mode) return;
+    _videoAspectMode = mode;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_videoAspectModeKey, mode.name);
+    _notifyListeners();
+  }
+
+  /// 软解输出颜色格式（空=内核默认；mdk 走 video.decoder 属性）
+    String get softDecodePixelFormat => _softDecodePixelFormat;
+
+    Future<void> setSoftDecodePixelFormat(String value) async {
+      final normalized = value.trim();
+      if (_softDecodePixelFormat == normalized) return;
+      _softDecodePixelFormat = normalized;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_softDecodePixelFormatKey, normalized);
+      await applyHardwareDecoderPreference();
+      // 颜色格式切换后自动重载当前视频使其生效（保留播放位置，保持暂停）
+      final path = currentVideoPath;
+      if (path != null && path.isNotEmpty && hasVideo) {
+        final posMs = _position.inMilliseconds;
+        final history = WatchHistoryItem(
+          filePath: path,
+          animeName: animeTitle ?? '',
+          episodeTitle: episodeTitle,
+          episodeId: episodeId,
+          animeId: animeId,
+          lastPosition: posMs,
+          duration: duration.inMilliseconds,
+          watchProgress: progress,
+          lastWatchTime: DateTime.now(),
+        );
+        await initializePlayer(
+          path,
+          historyItem: history,
+          mediaLibraryScope: _playbackDetailContext?.mediaLibraryScope,
+          resetManualDanmakuOffset: false,
+          episodeFileSelectionHandled: true,
+        );
+        // 重载后保持暂停（沿用原 autoPlay:false 语义），用户手动继续播放
+        if (hasVideo) {
+          pause();
+        }
+        debugPrint('[Decoder] 颜色格式切换，已重载视频以应用 pixel_format=$normalized');
+      }
+      _notifyListeners();
+    }
+
+  Future<void> setScreenshotCaptureIncludesSubtitles(bool value) async {
+    if (_screenshotCaptureIncludesSubtitles == value) return;
+    _screenshotCaptureIncludesSubtitles = value;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_screenshotIncludeSubtitlesKey, value);
     _notifyListeners();
   }
 

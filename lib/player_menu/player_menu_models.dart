@@ -13,7 +13,6 @@ enum PlayerMenuPaneId {
   danmakuTracks,
   danmakuList,
   danmakuOffset,
-  controlBarSettings,
   playbackRate,
   playlist,
   jellyfinQuality,
@@ -43,7 +42,6 @@ enum PlayerMenuIconToken {
   danmakuTracks,
   danmakuList,
   danmakuOffset,
-  controlBarSettings,
   playbackRate,
   playlist,
   jellyfinQuality,
@@ -51,7 +49,8 @@ enum PlayerMenuIconToken {
   seekStep,
 }
 
-typedef PlayerMenuVisibilityPredicate = bool Function(PlayerMenuContext context);
+typedef PlayerMenuVisibilityPredicate = bool Function(
+    PlayerMenuContext context);
 
 /// 用于描述单个菜单项的逻辑信息
 class PlayerMenuItemDefinition {
@@ -83,10 +82,24 @@ class PlayerMenuContext {
     required this.kernelType,
   });
 
-  bool get supportsAdvancedTracks =>
-      kernelType != PlayerKernelType.videoPlayer;
+  bool get supportsAdvancedTracks => kernelType != PlayerKernelType.videoPlayer;
+
+  bool get supportsSubtitleSettings =>
+      kernelType == PlayerKernelType.mediaKit ||
+      kernelType == PlayerKernelType.erika;
 
   bool get hasVideo => videoState.hasVideo;
+
+  bool get hasSubtitleTracks {
+    final embeddedSubtitleTracks = videoState.player.mediaInfo.subtitle;
+    if (embeddedSubtitleTracks != null && embeddedSubtitleTracks.isNotEmpty) {
+      return true;
+    }
+
+    final currentExternalSubtitlePath = videoState.currentExternalSubtitlePath;
+    return currentExternalSubtitlePath != null &&
+        currentExternalSubtitlePath.isNotEmpty;
+  }
 
   bool get hasVideoPath => videoState.currentVideoPath != null;
 

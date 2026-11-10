@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:nipaplay/services/remote_proxy_diagnostics.dart';
+
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -21,6 +23,7 @@ class SMBProxyService {
 
   static final SMBProxyService instance = SMBProxyService._();
 
+  final _diagnostics = RemoteProxyDiagnostics('SMB');
   HttpServer? _server;
   int _port = 0;
   bool _isRunning = false;
@@ -28,7 +31,24 @@ class SMBProxyService {
   bool get isRunning => _isRunning;
   int get port => _port;
 
+  Future<void>? _initializing;
+
   Future<void> initialize() async {
+    _diagnostics
+        .log('initialize running=$_isRunning pending=${_initializing != null}');
+    if (_isRunning || kIsWeb) {
+      if (_isRunning) unawaited(_diagnostics.probe('initialize-reuse'));
+      return;
+    }
+    final pending = _initializing ??= _initialize();
+    try {
+      await pending;
+    } finally {
+      if (identical(_initializing, pending)) _initializing = null;
+    }
+  }
+
+  Future<void> _initialize() async {
     if (kIsWeb) {
       return;
     }
@@ -43,7 +63,7 @@ class SMBProxyService {
       ..add('HEAD', '/smb/stream', _handleStreamHead)
       ..get('/smb/health', (Request request) => Response.ok('ok'));
 
-    final handler = const Pipeline().addHandler(router.call);
+    final handler = _diagnostics.wrap(const Pipeline().addHandler(router.call));
 
     final prefs = await SharedPreferences.getInstance();
     final savedPort = prefs.getInt(_portKey);
@@ -62,25 +82,46 @@ class SMBProxyService {
     Object? lastError;
     for (final candidatePort in portsToTry) {
       try {
-        _server = await shelf_io.serve(
-          handler,
+        _diagnostics.log('bind-attempt candidatePort=$candidatePort');
+        _server = await HttpServer.bind(
           InternetAddress.loopbackIPv4,
           candidatePort,
         );
+        shelf_io.serveRequests(_diagnostics.observe(_server!), handler);
         _port = _server!.port;
         _isRunning = true;
-        await prefs.setInt(_portKey, _port);
+        try {
+          await prefs.setInt(_portKey, _port);
+        } catch (error) {
+          debugPrint('SMB proxy port preference could not be saved: $error');
+        }
         return;
       } catch (e) {
+        _diagnostics.log(
+            'bind-failed candidatePort=$candidatePort ${RemoteProxyDiagnostics.errorSummary(e)}');
         lastError = e;
       }
     }
 
-    debugPrint('SMBProxyService failed to start: $lastError');
+    throw StateError('SMBProxyService failed to start: $lastError');
+  }
+
+  Future<void> stop() async {
+    _diagnostics.log('stop-request running=$_isRunning');
+    await _initializing;
+    await _server?.close(force: true);
+    _server = null;
+    _port = 0;
+    _isRunning = false;
+    _diagnostics.log('stop-complete');
   }
 
   String buildStreamUrl(SMBConnection connection, String smbPath) {
-    final normalizedConnection = SMBService.instance.getConnection(connection.name) ?? connection;
+    if (!_isRunning)
+      throw StateError(
+          'SMB proxy must be initialized before building a stream URL');
+    final normalizedConnection =
+        SMBService.instance.getConnection(connection.name) ?? connection;
     final connName = normalizedConnection.name.trim();
     final normalizedPath = _normalizeSmbPath(smbPath);
 
@@ -111,14 +152,18 @@ class SMBProxyService {
   }) async {
     final connName = request.url.queryParameters['conn']?.trim();
     final rawPath = request.url.queryParameters['path']?.trim();
-    if (connName == null || connName.isEmpty || rawPath == null || rawPath.isEmpty) {
+    if (connName == null ||
+        connName.isEmpty ||
+        rawPath == null ||
+        rawPath.isEmpty) {
       return Response(HttpStatus.badRequest, body: 'Missing conn or path');
     }
 
-    final connection = SMBService.instance.getConnection(connName);
-    if (connection == null) {
+    final resolved = SMBService.instance.getConnection(connName);
+    if (resolved == null) {
       return Response(HttpStatus.notFound, body: 'SMB connection not found');
     }
+    final connection = SMBService.instance.effectiveConnection(resolved);
 
     final smbPath = _stripTrailingSlash(_normalizeSmbPath(rawPath));
 
@@ -198,6 +243,8 @@ class SMBProxyService {
           headers: headers,
         );
       } catch (e) {
+        _diagnostics
+            .log('upstream-error ${RemoteProxyDiagnostics.errorSummary(e)}');
         return Response.internalServerError(body: 'SMB stream error: $e');
       }
     }
@@ -288,6 +335,8 @@ class SMBProxyService {
         headers: headers,
       );
     } catch (e) {
+      _diagnostics
+          .log('upstream-error ${RemoteProxyDiagnostics.errorSummary(e)}');
       return Response.internalServerError(body: 'SMB stream error: $e');
     } finally {
       if (client != null) {

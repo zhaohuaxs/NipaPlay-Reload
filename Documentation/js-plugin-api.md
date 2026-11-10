@@ -2,6 +2,14 @@
 
 本文档说明当前版本 NipaPlay 的 JS 插件可用接口与约定（基于现有实现）。
 
+## API 版本、兼容性与安全边界
+
+- `pluginManifest.minHostVersion` 是宿主兼容性下限。插件作者应在新增依赖时提高该值，并在发布说明中列出兼容的 NipaPlay 版本。
+- 当前文档描述的是宿主实际暴露的 API，不保证未来版本永久兼容；新增、弃用或改变行为时应在 Release Notes 中记录。
+- `permissions` 是宿主对已暴露桥接 API 的能力检查依据：例如播放器控制、弹幕修改、UI、存储和系统覆盖会在对应桥接调用时检查声明。声明权限不等于获得操作系统级权限。
+- 插件代码和其依赖文本均应视为不受信任内容。只从可信来源导入；插件可处理媒体标题、弹幕和设置，作者不应把这些数据上传到未明确告知用户的服务。
+- Web 平台当前不支持 JS 插件运行时。不同原生平台的文件选择、路径、存储和 UI 行为可能不同，插件应对失败返回值进行处理。
+
 ## 1. 放置位置与加载范围
 
 - 插件文件必须是 `.js`。
@@ -846,3 +854,63 @@ function pluginHandleUIAction(actionId) {
 - 通过 `pluginUIEntries` 提供可配置的参数
 - 使用 `settings.getText()` 读取用户配置
 - 通过 `priority` 控制处理顺序：低值先执行（如基础过滤 `priority: 30`），高值后执行（如精选 `priority: 80`）
+
+## 15. 通用链接解析
+
+声明 `url.resolve` 权限并实现同步函数 `pluginResolveUrl(input)`，可在链接播放入口解析网页媒体源。该权限允许请求 HTTP/HTTPS 数据、提供分集列表及播放地址。只有已启用、已加载且声明该权限的插件参与，按 `priority` 升序执行；首次返回 `null` 表示不处理，宿主继续下一个插件，全部不处理则按普通直链播放。已接管后的异常会显示错误，不会把网页地址交给播放器。
+
+宿主驱动以下步骤，不要求 JS 运行时支持 `fetch`、Promise 或异步桥接：
+
+```js
+function pluginResolveUrl(input) {
+  // input.url 始终是本次输入；input.state 是上一轮返回的 JSON 数据。
+  if (!input.state) {
+    if (!/^https:\/\/example\.com\/watch\//.test(input.url)) return null;
+    return {
+      type: 'request',
+      request: { url: 'https://example.com/api/media', headers: {} },
+      state: { step: 'metadata' }
+    };
+  }
+  if (input.state.step === 'metadata') {
+    // input.response: { url, status, headers, body }；headers 的键为小写。
+    const data = JSON.parse(input.response.body);
+    return {
+      type: 'select', title: data.title,
+      items: data.items.map(item => ({ id: item.id, title: item.title })),
+      preferredId: data.items[0].id,
+      state: { step: 'selected', data: data }
+    };
+  }
+  const item = input.state.data.items.find(item => item.id === input.selectedId);
+  return {
+    type: 'play', url: item.url, sourceUrl: item.pageUrl,
+    title: item.title, searchTitle: input.state.data.title,
+    headers: { Referer: 'https://example.com/' }
+  };
+}
+```
+
+- `request`：仅 GET；HTTP 重定向不会自动跟随，插件根据 `response.status` / `response.headers.location` 决定下一步。每次请求超时 20 秒，响应上限 4 MiB，每次解析最多 16 轮。
+- `select`：`title` 必填；`items` 为 1–2000 项，`id` 和 `title` 必须为非空字符串，ID 唯一。单项直接继续，多项显示选择弹窗，取消终止解析。`preferredId` 用于初始定位；历史重播时可直接采用该 ID。
+- `play`：`url` 是实际媒体地址；`sourceUrl` 是可再次解析且包含所选条目标识的稳定页面地址，历史记录保存此值；`title` 是显示标题。可选 `searchTitle` 会在首次输入链接时预填手动弹幕匹配窗口并执行搜索；关闭匹配窗口后仍可播放，且不会重复自动匹配。现有“跳过弹幕匹配”设置仍生效。
+- `headers`：可选字符串映射。宿主在本机回环地址转发媒体请求，携带指定请求头并支持 Range/HEAD，内外部播放器使用同一路径。此入口面向单一、包含完整音视频的 HTTP 文件；不改写 HLS/DASH 清单中的子资源地址。
+- `error`：返回 `{ type: 'error', message: '可读的错误信息' }`，也可直接抛出 JS 异常。
+- 地址只允许 HTTP/HTTPS，不能包含用户名密码；请求头禁止换行、Host、Content-Length 等传输控制字段。媒体跨源重定向时移除 Cookie/Authorization。
+- 禁用或重载插件、关闭输入窗口后，正在处理的结果不会继续触发播放。Web 平台仍不支持 JS 插件。
+
+解析脚本由插件仓库单独维护，不包含在应用资产中。需要使用包含本节接口的宿主构建；旧构建不会调用该入口。
+
+
+## 16. 启动装载与客户端通知
+
+桌面端支持 `--load-js <文件路径>` 和 `--load-js=<文件路径>`。脚本会导入、启用，并通过 NipaPlay 弹窗反馈结果；移动端收到客户端通知时使用现有自适应弹窗或上拉菜单。
+
+```sh
+flutter build macos --release
+"$(pwd)/build/macos/Build/Products/Release/NipaPlay.app/Contents/MacOS/NipaPlay" --load-js "/绝对路径/source.js"
+```
+
+启动命令位于 `rust/src/api/startup_commands.rs`。同版本脚本可通过该命令重新装载，便于开发测试；常规手动导入仍要求更高版本。已有实例运行时，参数通过单实例通道转交给主实例，转发进程退出。已导入脚本的启用状态会保留。
+
+命令模块通过 `rust/src/api/client_notifications.rs` 的 `notify_client(ClientNotification { title, message })` 通知客户端。Flutter 订阅 `subscribeClientNotifications()` 后调用应用现有的 `BlurDialog` 和 `HoverScaleTextButton`；订阅就绪前最多保留 16 条通知。

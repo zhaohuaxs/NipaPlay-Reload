@@ -317,8 +317,8 @@ impl Next2Renderer {
             mapped_at_creation: false,
         });
 
-        let shadow_width = width.max(1).saturating_mul(SHADOW_RENDER_SCALE);
-        let shadow_height = height.max(1).saturating_mul(SHADOW_RENDER_SCALE);
+        let shadow_width = ((width.max(1) as f32) * SHADOW_RENDER_SCALE).max(1.0) as u32;
+        let shadow_height = ((height.max(1) as f32) * SHADOW_RENDER_SCALE).max(1.0) as u32;
         let shadow_mask_texture = create_render_texture_with_usage(
             ctx.device.as_ref(),
             shadow_width,
@@ -385,14 +385,20 @@ impl Next2Renderer {
             surface_format: None,
             #[cfg(target_os = "android")]
             surface_screen_pipeline: None,
+            submit_instant: std::time::Instant::now(),
+            interp_dt: 0.0,
+            last_submit_instant: None,
+            submit_interval_ema: 0.0,
+            motion_mode: MotionMode::LegacyInterpolation,
+            motion_clock: motion::MotionClock::new(std::time::Instant::now()),
         })
     }
 
     fn resize(&mut self, width: u32, height: u32) -> bool {
         self.width = width.max(1);
         self.height = height.max(1);
-        self.shadow_width = self.width.saturating_mul(SHADOW_RENDER_SCALE);
-        self.shadow_height = self.height.saturating_mul(SHADOW_RENDER_SCALE);
+        self.shadow_width = ((self.width as f32) * SHADOW_RENDER_SCALE).max(1.0) as u32;
+        self.shadow_height = ((self.height as f32) * SHADOW_RENDER_SCALE).max(1.0) as u32;
         self.shadow_mask_texture = create_render_texture_with_usage(
             self.ctx.device.as_ref(),
             self.shadow_width,
@@ -428,11 +434,27 @@ impl Next2Renderer {
         self.emoji_atlas.clear();
     }
 
+    /// Drain completed async prefetch results and upload to the atlas. Called
+    /// at the top of each engine loop iteration so prefetched glyphs land in
+    /// the atlas before the next draw.
+    pub(crate) fn drain_prefetch(&mut self, queue: &wgpu::Queue) {
+        self.atlas.drain_prefetch(queue);
+    }
+
+    pub(crate) fn pending_prefetch_count(&self) -> usize {
+        self.atlas.pending_prefetch_count()
+    }
+
     fn update_frame(&mut self, input: RenderFrameInput, custom_font: Option<FontSource>) -> bool {
         let parsed = match serde_json::from_str::<FramePayload>(&input.frame_json) {
             Ok(parsed) => parsed,
             Err(_) => return false,
         };
+        if parsed.motion_mode == MotionMode::ContinuousAnchor
+            && parsed.motion_clock.as_ref().is_none_or(|clock|
+                !clock.media_s.is_finite() || !clock.valid_until_s.is_finite()) {
+            return false;
+        }
 
         let font_key = custom_font_key(custom_font.as_ref());
         if self.atlas.font_key != font_key {
@@ -461,6 +483,12 @@ impl Next2Renderer {
         let shadow_style = input.shadow_style;
         let font_size = input.font_size.max(1.0);
 
+        self.motion_mode = parsed.motion_mode;
+        if let Some(clock) = parsed.motion_clock.filter(|_| self.motion_mode == MotionMode::ContinuousAnchor) {
+            self.motion_clock.anchor(std::time::Instant::now(), clock.epoch,
+                clock.media_s, clock.age_s, clock.rate, clock.playing,
+                clock.refresh_hz, clock.valid_until_s);
+        }
         for item in parsed.items {
             let tokens =
                 normalize_tokens(item.tokens, item.text.as_str(), item.count_text.as_deref());
@@ -473,8 +501,39 @@ impl Next2Renderer {
                 outline_width,
                 shadow_style,
                 opacity,
+                scroll_speed: item.scroll_speed as f32,
+                start_media_s: item.start_media_s,
+                end_media_s: item.end_media_s,
+                is_me: item.is_me,
+                width: item.width.max(0.0) as f32,
             });
         }
+
+        // Prefetch-rasterize lookahead chars asynchronously. Workers run the
+        // full pipeline off the render thread; results drain into the atlas
+        // at the top of the next loop iteration. Deduplicated by `pending`.
+        if let Some(chars) = &parsed.prefetch_chars {
+            let qz = font_size.round().clamp(8.0, 256.0) as u32;
+            for ch in chars.chars() {
+                self.atlas.request_rasterize(ch, qz);
+            }
+        }
+
+        // Re-baseline the interpolation clock to this submission. The render
+        // thread's idle-tick re-renders will advance scroll items from this
+        // instant until the next setFrame arrives (~16-33ms later at 60/30fps
+        // Dart submission). The 50ms cap in build_vertices freezes motion if
+        // no new frame arrives (pause / upstream stall).
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last_submit_instant {
+            let interval = now.duration_since(prev).as_secs_f32();
+            // Clamp outlier intervals (seek / pause-resume) so they don't
+            // poison the EMA — only steady-state cadence drives the gate.
+            let clamped = interval.min(0.200);
+            self.submit_interval_ema = 0.2 * clamped + 0.8 * self.submit_interval_ema;
+        }
+        self.last_submit_instant = Some(now);
+        self.submit_instant = now;
 
         true
     }
@@ -515,7 +574,11 @@ impl Next2Renderer {
             });
     }
 
-    fn draw_to_present(&mut self, present: &mut PresentTarget) {
+    fn draw_to_present(
+        &mut self,
+        present: &mut PresentTarget,
+        presentation_time: Option<std::time::Instant>,
+    ) {
         match present {
             #[cfg(target_os = "android")]
             PresentTarget::Surface(surface) => {
@@ -553,7 +616,13 @@ impl Next2Renderer {
                     .create_view(&wgpu::TextureViewDescriptor::default());
                 let glyph_pipeline = self.surface_pipeline.as_ref().unwrap().clone();
                 let screen_pipeline = self.surface_screen_pipeline.as_ref().unwrap().clone();
-                self.draw_to_view(&view, &glyph_pipeline, &screen_pipeline, surface_format);
+                self.draw_to_view(
+                    &view,
+                    &glyph_pipeline,
+                    &screen_pipeline,
+                    surface_format,
+                    presentation_time,
+                );
                 frame.present();
             }
             PresentTarget::Texture(texture_target) => {
@@ -593,7 +662,13 @@ impl Next2Renderer {
                         ..Default::default()
                     },
                 );
-                self.draw_to_view(&view, &glyph_pipeline, &screen_pipeline, target_format);
+                self.draw_to_view(
+                    &view,
+                    &glyph_pipeline,
+                    &screen_pipeline,
+                    target_format,
+                    presentation_time,
+                );
             }
         }
     }

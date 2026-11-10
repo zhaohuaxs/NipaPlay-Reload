@@ -77,17 +77,6 @@ extension VideoPlayerStateStreaming on VideoPlayerState {
         );
       }
 
-      // 云同步异步执行，不阻塞退出流程
-      // 云同步不依赖播放器状态，独立读取 WatchHistoryManager 数据
-      // dispose() 中有备份调用，双重保险
-      if (_currentVideoPath != null) {
-        unawaited(
-          AutoSyncService.instance.syncOnPlaybackEnd().catchError((e) {
-            debugPrint('退出云同步失败: $e');
-          }),
-        );
-      }
-
       _logMacOSHdrExitTrace(
         'handleBackButton done path=$_currentVideoPath status=$_status hasVideo=$hasVideo playerState=${player.state}',
       );
@@ -108,13 +97,22 @@ extension VideoPlayerStateStreaming on VideoPlayerState {
     final capturedVideoPath = _currentVideoPath;
 
     _isCapturingFrame = true;
-    _screenshotCompleter = Completer<void>();
+    final screenshotCompleter = Completer<void>();
+    _screenshotCompleter = screenshotCompleter;
     _logMacOSHdrExitTrace(
       'capture start trigger=$triggerEvent path=$_currentVideoPath status=$_status playerState=${player.state}',
     );
     try {
       String? newThumbnailPath = await _captureVideoFrameWithoutPausing();
-      if (newThumbnailPath == null && player.state == PlaybackState.paused) {
+      if (_currentVideoPath != capturedVideoPath ||
+          !identical(_screenshotCompleter, screenshotCompleter)) {
+        return;
+      }
+      // Windows+MediaKit 暂停态对 mpv 渲染管线取帧会冻死 platform 线程
+      // （本地大文件 MFT 硬解必现），跳过暂停态补拍。
+      if (newThumbnailPath == null &&
+          player.state == PlaybackState.paused &&
+          !_isWindowsMediaKitKernel) {
         newThumbnailPath = await captureVideoFrame();
       }
       if (newThumbnailPath != null) {
@@ -141,9 +139,13 @@ extension VideoPlayerStateStreaming on VideoPlayerState {
         'capture error trigger=$triggerEvent error=$e status=$_status playerState=${player.state}',
       );
     } finally {
-      _isCapturingFrame = false;
-      _screenshotCompleter?.complete();
-      _screenshotCompleter = null;
+      // A timed-out exit capture may finish after a new video's capture starts.
+      // Complete only this request; do not clear or finish the new one's state.
+      if (identical(_screenshotCompleter, screenshotCompleter)) {
+        _isCapturingFrame = false;
+        _screenshotCompleter = null;
+      }
+      if (!screenshotCompleter.isCompleted) screenshotCompleter.complete();
     }
   }
 
@@ -209,32 +211,151 @@ extension VideoPlayerStateStreaming on VideoPlayerState {
   }
 
   /// 加载Emby外挂字幕
-  Future<void> _loadEmbyExternalSubtitles(String videoPath) async {
+  Future<void> _loadEmbyExternalSubtitles(
+    String videoPath,
+    EmbyExternalSubtitleAction action,
+  ) async {
+    final generation = _playbackGeneration;
+    bool isCurrentPlayback() =>
+        !_isDisposed &&
+        generation == _playbackGeneration &&
+        _currentVideoPath == videoPath;
+    if (!isCurrentPlayback()) return;
+
+    final itemId = embyItemIdFromVideoPath(videoPath);
+    final mediaSourceId = _currentPlaybackSession?.mediaSourceId;
+    if (action.kind == EmbyExternalSubtitleActionKind.select &&
+        (mediaSourceId == null || mediaSourceId.isEmpty)) {
+      throw StateError('The selected Emby media source is unavailable.');
+    }
+
+    await applyEmbyExternalSubtitleAction(
+      action: action,
+      videoPath: videoPath,
+      itemId: itemId,
+      mediaSourceId: mediaSourceId ?? '',
+      download: (
+        selectedItemId,
+        selectedMediaSourceId,
+        streamIndex,
+        codec,
+      ) async {
+        if (!isCurrentPlayback()) return null;
+        final path = await EmbyService.instance.downloadSubtitleFile(
+          selectedItemId,
+          streamIndex,
+          codec,
+          mediaSourceId: selectedMediaSourceId,
+        );
+        return isCurrentPlayback() ? path : null;
+      },
+      cache: (path, subtitlePath, streamIndex, codec) async {
+        if (!isCurrentPlayback()) return false;
+        final fingerprint = action.fingerprint!;
+        final subtitleInfo = <String, dynamic>{
+          'path': subtitlePath,
+          'name': _buildStreamingSubtitleName(
+            <String, dynamic>{
+              'title': fingerprint.normalizedTitle,
+              'language': fingerprint.language,
+              'codec': codec,
+            },
+            subtitlePath,
+          ),
+          'type': codec,
+          'addTime': DateTime.now().millisecondsSinceEpoch,
+          'isActive': true,
+          'remoteSource': 'Emby',
+          'serverSubtitleIndex': streamIndex,
+          'language': fingerprint.language,
+          'title': fingerprint.normalizedTitle,
+          'isDefault': false,
+          'isForced': false,
+        };
+        return SubtitleService().addExternalSubtitles(
+          path,
+          <Map<String, dynamic>>[subtitleInfo],
+          activePath: subtitlePath,
+        );
+      },
+      activate: (subtitlePath, _) async {
+        if (!isCurrentPlayback()) {
+          throw StateError(
+              'The Emby playback changed while loading subtitles.');
+        }
+        await _subtitleManager.activateEmbyExternalSubtitle(
+          subtitlePath,
+          isManualSetting: false,
+        );
+        // Emby activation can change which kernel track owns the sid;
+        // re-sync the whole-block kernel render switch.
+        if (isCurrentPlayback()) {
+          applyEmbeddedSubtitleOverlayKernelState();
+          _notifyListeners();
+        }
+      },
+      followDefault: () async {
+        if (isCurrentPlayback()) {
+          await _loadDefaultEmbyExternalSubtitles(videoPath);
+        }
+      },
+    );
+  }
+
+  Future<void> _loadDefaultEmbyExternalSubtitles(String videoPath) async {
+    final generation = _playbackGeneration;
+    bool isCurrentPlayback() =>
+        !_isDisposed &&
+        generation == _playbackGeneration &&
+        _currentVideoPath == videoPath;
     try {
-      final itemId = videoPath.replaceFirst('emby://', '');
+      final itemId = embyItemIdFromVideoPath(videoPath);
+      final mediaSourceId = _currentPlaybackSession?.mediaSourceId;
       debugPrint('[Emby字幕] 开始加载外挂字幕，itemId: $itemId');
-      final subtitleTracks =
-          await EmbyService.instance.getSubtitleTracks(itemId);
-      if (subtitleTracks.isEmpty) {
-        debugPrint('[Emby字幕] 未找到字幕轨道');
-        return;
-      }
-      final externalSubtitles = subtitleTracks
-          .where((track) => track['type'] == 'external')
-          .map((track) => Map<String, dynamic>.from(track))
-          .toList();
-      if (externalSubtitles.isEmpty) {
-        debugPrint('[Emby字幕] 未找到外挂字幕轨道');
-        return;
-      }
-      await _loadStreamingExternalSubtitles(
-        videoPath: videoPath,
-        sourceLabel: 'Emby字幕',
-        itemId: itemId,
-        externalSubtitles: externalSubtitles,
-        subtitleDownloader: (subtitleIndex, subtitleCodec) => EmbyService
-            .instance
-            .downloadSubtitleFile(itemId, subtitleIndex, subtitleCodec),
+      await loadDefaultEmbyExternalSubtitles(
+        getTracks: () => EmbyService.instance.getSubtitleTracks(
+          itemId,
+          mediaSourceId: mediaSourceId,
+        ),
+        download: (subtitleIndex, subtitleCodec) =>
+            EmbyService.instance.downloadSubtitleFile(
+          itemId,
+          subtitleIndex,
+          subtitleCodec,
+          mediaSourceId: mediaSourceId,
+        ),
+        cache: (downloaded, activePath) async {
+          final subtitleInfos = downloaded.map((track) {
+            final subtitlePath = track['path'] as String;
+            return <String, dynamic>{
+              ...track,
+              'name': _buildStreamingSubtitleName(track, subtitlePath),
+              'addTime': DateTime.now().millisecondsSinceEpoch,
+              'isActive': subtitlePath == activePath,
+              'remoteSource': 'Emby字幕',
+              'isDefault': track['isDefault'] == true,
+              'isForced': track['isForced'] == true,
+            };
+          }).toList();
+          return SubtitleService().addExternalSubtitles(
+            videoPath,
+            subtitleInfos,
+            activePath: activePath,
+          );
+        },
+        activate: (subtitlePath, _) async {
+          await _subtitleManager.activateEmbyExternalSubtitle(
+            subtitlePath,
+            isManualSetting: false,
+          );
+          // Re-sync the whole-block kernel render switch (sid ownership
+          // may have changed).
+          if (isCurrentPlayback()) {
+            applyEmbeddedSubtitleOverlayKernelState();
+            _notifyListeners();
+          }
+        },
+        isCurrent: isCurrentPlayback,
       );
     } catch (e) {
       debugPrint('[Emby字幕] 加载外挂字幕时出错: $e');
@@ -326,10 +447,6 @@ extension VideoPlayerStateStreaming on VideoPlayerState {
       return;
     }
 
-    // TODO: [技术债] 此处使用固定延迟等待播放器初始化，非常不可靠。
-    // 在网络或设备性能较差时可能导致字幕加载失败。
-    // 后续应重构为监听播放器的 isInitialized 状态。
-    await Future.delayed(const Duration(milliseconds: 1000));
     _subtitleManager.setExternalSubtitle(
       activeSubtitlePath,
       isManualSetting: false,
@@ -402,12 +519,19 @@ extension VideoPlayerStateStreaming on VideoPlayerState {
   // 检查是否是流媒体视频并使用现有的IDs直接加载弹幕
   Future<bool> _checkAndLoadStreamingDanmaku(
       String videoPath, WatchHistoryItem? historyItem) async {
+    if (_isDisposed || _currentVideoPath != videoPath) return false;
+    final targetGeneration = _playbackGeneration;
+    bool canContinue() =>
+        !_isDisposed &&
+        _currentVideoPath == videoPath &&
+        _playbackGeneration == targetGeneration;
+
     // 检查是否是Jellyfin视频URL (多种可能格式)
     bool isJellyfinStream = videoPath.startsWith('jellyfin://') ||
         (videoPath.contains('jellyfin') && videoPath.startsWith('http')) ||
         (videoPath.contains('/Videos/') && videoPath.contains('/stream')) ||
         (videoPath.contains('MediaSourceId=') &&
-            videoPath.contains('api_key='));
+            (videoPath.contains('api_key=') || videoPath.contains('ApiKey=')));
 
     // 检查是否是Emby视频URL (多种可能格式)
     bool isEmbyStream = videoPath.startsWith('emby://') ||
@@ -431,6 +555,7 @@ extension VideoPlayerStateStreaming on VideoPlayerState {
               message: '正在为Jellyfin流媒体加载弹幕...');
           await loadDanmaku(
               historyItem.episodeId.toString(), historyItem.animeId.toString());
+          if (!canContinue()) return true;
 
           // 更新当前实例的弹幕ID
           _episodeId = historyItem.episodeId;
@@ -445,10 +570,12 @@ extension VideoPlayerStateStreaming on VideoPlayerState {
 
             // 立即更新历史记录，确保UI显示正确的信息
             await _updateHistoryWithNewTitles();
+            if (!canContinue()) return true;
           }
 
           return true; // 表示已处理
         } catch (e) {
+          if (!canContinue()) return true;
           debugPrint('Jellyfin流媒体弹幕加载失败: $e');
           _danmakuList = [];
           _danmakuListVersion++;
@@ -586,7 +713,9 @@ extension JellyfinQualitySwitch on VideoPlayerState {
         currentPath,
         historyItem: historyItem,
         playbackSession: newSession,
+        playbackDetailContext: _playbackDetailContext,
         resetManualDanmakuOffset: false,
+        episodeFileSelectionHandled: true,
       );
 
       // 恢复播放状态（等待状态稳定后再操作）
@@ -616,41 +745,157 @@ extension JellyfinQualitySwitch on VideoPlayerState {
 
 // ==== Emby 清晰度切换：平滑重载当前流 ====
 extension EmbyQualitySwitch on VideoPlayerState {
+  EmbySelectionContext? get currentEmbySelectionContext {
+    final path = _currentVideoPath;
+    if (path == null || !path.startsWith('emby://')) return null;
+    final seriesId = embySeriesIdFromSourceKey(
+      _playbackDetailContext?.sourceKey,
+    );
+    if (seriesId == null) return null;
+    final episodeId = path.replaceFirst('emby://', '').split('/').last.trim();
+    final accountKey = _currentEmbyAccountKey;
+    if (episodeId.isEmpty ||
+        accountKey == null ||
+        _currentPlaybackSession?.itemId != episodeId) {
+      return null;
+    }
+    return EmbySelectionContext(
+      accountKey: accountKey,
+      seriesId: seriesId,
+      episodeId: episodeId,
+    );
+  }
+
+  EmbyMediaSourceDescriptor? embyMediaSourceDescriptor([String? sourceId]) {
+    final session = _currentPlaybackSession;
+    if (session == null) return null;
+    final targetId = sourceId ?? session.mediaSourceId;
+    for (final entry in session.mediaSources.asMap().entries) {
+      if (entry.value.id == targetId) {
+        return describeEmbyMediaSource(entry.value, ordinal: entry.key);
+      }
+    }
+    if (sourceId != null) return null;
+    final selected = session.selectedSource;
+    if (selected == null) return null;
+    final ordinal = session.mediaSources.indexOf(selected);
+    return describeEmbyMediaSource(
+      selected,
+      ordinal: ordinal < 0 ? 0 : ordinal,
+    );
+  }
+
+  Future<EmbyPlayerMenuSelectionService>
+      _embyPlayerMenuSelectionService() async {
+    final preferences = await SharedPreferences.getInstance();
+    return EmbyPlayerMenuSelectionService(
+      store: EmbyMediaPreferenceStore(preferences),
+      resolver: DefaultEmbyMediaSelectionResolver(),
+    );
+  }
+
+  Future<EmbyResolvedTrackBundle> resolveCurrentEmbyTracksForSource(
+    EmbyMediaSourceDescriptor source,
+  ) async {
+    final context = currentEmbySelectionContext;
+    if (context == null) {
+      return DefaultEmbyMediaSelectionResolver()
+          .resolve(
+            sources: <EmbyMediaSourceDescriptor>[source],
+            preferences: const EmbyPreferenceLayers(),
+          )
+          .candidates
+          .first
+          .tracks;
+    }
+    final service = await _embyPlayerMenuSelectionService();
+    return service.resolveTracksForSource(
+      context: context,
+      currentSource: source,
+    );
+  }
+
+  Future<bool> persistCurrentEmbyManualPatch(
+    EmbyManualSelectionPatch patch, {
+    EmbyMediaSourceDescriptor? currentSource,
+  }) async {
+    final source = currentSource ?? embyMediaSourceDescriptor();
+    if (source == null) return false;
+    final context = currentEmbySelectionContext;
+    if (context == null) return false;
+    final service = await _embyPlayerMenuSelectionService();
+    return service.persistCurrentManualPatch(
+      context: context,
+      currentSource: source,
+      patch: patch,
+    );
+  }
+
   Future<void> reloadCurrentEmbyStream({
     required JellyfinVideoQuality quality,
     int? serverSubtitleIndex,
     bool burnInSubtitle = false,
     int? audioStreamIndex,
+    String? mediaSourceId,
+    EmbyResolvedTrackBundle? embyTrackSelection,
   }) async {
-    try {
-      if (_currentVideoPath == null ||
-          !_currentVideoPath!.startsWith('emby://')) {
-        return;
+    final previousSession = _currentPlaybackSession;
+    final previousTrackSelection = _currentEmbyTrackSelection;
+    final previousAccountKey = _currentEmbyAccountKey;
+    if (_currentVideoPath == null ||
+        !_currentVideoPath!.startsWith('emby://')) {
+      return;
+    }
+
+    final currentPath = _currentVideoPath!;
+    final currentPosition = _position;
+    final currentDuration = _duration;
+    final currentProgress = _progress;
+    final currentVolume = player.volume;
+    final currentPlaybackRate = _playbackRate;
+    final wasPlaying = _status == PlayerStatus.playing;
+    final currentDetailContext = _playbackDetailContext;
+
+    final historyItem = WatchHistoryItem(
+      filePath: currentPath,
+      animeName: _animeTitle ?? '',
+      episodeTitle: _episodeTitle,
+      episodeId: _episodeId,
+      animeId: _animeId,
+      lastPosition: currentPosition.inMilliseconds,
+      duration: currentDuration.inMilliseconds,
+      watchProgress: currentProgress,
+      lastWatchTime: DateTime.now(),
+    );
+
+    Future<void> restorePlaybackState() async {
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      if (_useSystemVolume) {
+        _ensurePlayerVolumeMatchesPlatformPolicy();
+      } else {
+        player.volume = currentVolume;
       }
+      if (currentPlaybackRate != 1.0) {
+        player.setPlaybackRate(currentPlaybackRate);
+      }
+      seekTo(currentPosition);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      if (wasPlaying) {
+        play();
+      } else {
+        pause();
+      }
+    }
 
-      final currentPath = _currentVideoPath!;
-      final currentPosition = _position;
-      final currentDuration = _duration;
-      final currentProgress = _progress;
-      final currentVolume = player.volume;
-      final currentPlaybackRate = _playbackRate;
-      final wasPlaying = _status == PlayerStatus.playing;
-
-      final historyItem = WatchHistoryItem(
-        filePath: currentPath,
-        animeName: _animeTitle ?? '',
-        episodeTitle: _episodeTitle,
-        episodeId: _episodeId,
-        animeId: _animeId,
-        lastPosition: currentPosition.inMilliseconds,
-        duration: currentDuration.inMilliseconds,
-        watchProgress: currentProgress,
-        lastWatchTime: DateTime.now(),
-      );
-
+    try {
       final embyPath = currentPath.replaceFirst('emby://', '');
       final parts = embyPath.split('/');
       final itemId = parts.isNotEmpty ? parts.last : embyPath;
+      final sourceChanged = mediaSourceId != null &&
+          mediaSourceId != previousSession?.mediaSourceId;
+      final nextTrackSelection = sourceChanged
+          ? embyTrackSelection
+          : embyTrackSelection ?? previousTrackSelection;
       final newSession = await EmbyService.instance.createPlaybackSession(
         itemId: itemId,
         quality: quality,
@@ -659,38 +904,60 @@ extension EmbyQualitySwitch on VideoPlayerState {
         subtitleStreamIndex: serverSubtitleIndex,
         burnInSubtitle: burnInSubtitle,
         playSessionId: _currentPlaybackSession?.playSessionId,
-        mediaSourceId: _currentPlaybackSession?.mediaSourceId,
+        mediaSourceId: mediaSourceId ?? _currentPlaybackSession?.mediaSourceId,
       );
-      _currentPlaybackSession = newSession;
-      EmbyPlaybackSyncService().updatePlaybackSession(newSession);
-
-      await initializePlayer(
-        currentPath,
-        historyItem: historyItem,
-        playbackSession: newSession,
-        resetManualDanmakuOffset: false,
+      const defaultTrackSelection = EmbyResolvedTrackBundle(
+        audio: EmbyResolvedTrackSelection.followDefault(),
+        subtitle: EmbyResolvedTrackSelection.followDefault(),
       );
-
-      if (hasVideo) {
-        await Future.delayed(const Duration(milliseconds: 150));
-        if (_useSystemVolume) {
-          _ensurePlayerVolumeMatchesPlatformPolicy();
-        } else {
-          player.volume = currentVolume;
-        }
-        if (currentPlaybackRate != 1.0) {
-          player.setPlaybackRate(currentPlaybackRate);
-        }
-        seekTo(currentPosition);
-        await Future.delayed(const Duration(milliseconds: 100));
-        if (wasPlaying) {
-          play();
-        } else {
-          pause();
-        }
-      }
+      final coordinator = EmbyPlaybackStateCoordinator(
+        currentPlayback: previousSession == null
+            ? null
+            : EmbyResolvedPlayback(
+                session: previousSession,
+                reason: EmbySelectionReason.embyDefault,
+                didFallback: false,
+                tracks: previousTrackSelection ?? defaultTrackSelection,
+              ),
+        restorePlaybackState: restorePlaybackState,
+        initializePlayer: (session, tracks) async {
+          await initializePlayer(
+            currentPath,
+            historyItem: historyItem,
+            playbackSession: session,
+            embyTrackSelection: tracks,
+            playbackDetailContext: currentDetailContext,
+            resetManualDanmakuOffset: false,
+            preserveEmbyAccountKey: true,
+            episodeFileSelectionHandled: true,
+          );
+          ensureEmbyPlayerOpened(_error, hasVideo);
+          EmbyPlaybackSyncService().updatePlaybackSession(session);
+        },
+      );
+      await coordinator.reload(
+        EmbyResolvedPlayback(
+          session: newSession,
+          reason: EmbySelectionReason.embyDefault,
+          didFallback: false,
+          tracks: nextTrackSelection ?? defaultTrackSelection,
+        ),
+      );
     } catch (e) {
+      _currentPlaybackSession = previousSession;
+      _currentEmbyTrackSelection = previousTrackSelection;
+      _currentEmbyAccountKey = previousAccountKey;
+      if (previousSession != null) {
+        EmbyPlaybackSyncService().updatePlaybackSession(previousSession);
+      }
       debugPrint('Emby 清晰度切换失败: $e');
+      rethrow;
+    }
+
+    try {
+      await restorePlaybackState();
+    } catch (e) {
+      debugPrint('Emby 切源后恢复播放状态失败: $e');
     }
   }
 }

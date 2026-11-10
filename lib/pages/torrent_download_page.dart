@@ -1,10 +1,16 @@
+library torrent_download_page;
+
+import 'package:nipaplay/widgets/page_activity_mixin.dart';
 import 'dart:async';
 
 import 'package:file_selector/file_selector.dart';
+import 'package:flutter/cupertino.dart' as cupertino;
 import 'package:flutter/material.dart';
 import 'package:kmbal_ionicons/kmbal_ionicons.dart';
 import 'package:nipaplay/models/torrent_magnet_preview.dart';
 import 'package:nipaplay/models/torrent_task.dart';
+import 'package:nipaplay/models/torrent_add_result.dart';
+import 'package:nipaplay/downloads/torrent_task_controller.dart';
 import 'package:nipaplay/models/playable_item.dart';
 import 'package:nipaplay/models/torrent_task_scan_summary.dart';
 import 'package:nipaplay/providers/downloader_settings_provider.dart';
@@ -13,28 +19,28 @@ import 'package:nipaplay/services/file_picker_service.dart';
 import 'package:nipaplay/services/folder_opener.dart';
 import 'package:nipaplay/services/playback_service.dart';
 import 'package:nipaplay/services/torrent_download_service.dart';
-import 'package:nipaplay/themes/nipaplay/widgets/blur_dialog.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_dropdown.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/fluent_settings_switch.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/hover_scale_text_button.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_focusable_action.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_page_scaffold.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/library_management_layout.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/nipaplay_window.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
 import 'package:nipaplay/utils/app_theme.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
+import 'package:nipaplay/downloads/unified_torrent_page_model.dart';
+import 'package:nipaplay/downloads/adaptive_torrent_download_dialogs.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
+import 'package:nipaplay/themes/cupertino/cupertino_adaptive_platform_ui.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_app_page_header.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_page_actions_scope.dart';
 
-enum _TorrentTaskViewMode { cards, list }
-
-enum _TorrentTaskSort { latest, name, progress, status }
-
-const Map<_TorrentTaskSort, String> _torrentTaskSortLabels = {
-  _TorrentTaskSort.latest: '最近添加',
-  _TorrentTaskSort.name: '名称排序',
-  _TorrentTaskSort.progress: '进度排序',
-  _TorrentTaskSort.status: '状态排序',
-};
+part '../themes/cupertino/widgets/cupertino_torrent_download_controls.dart';
 
 class TorrentDownloadPage extends StatefulWidget {
   const TorrentDownloadPage({super.key});
@@ -44,12 +50,15 @@ class TorrentDownloadPage extends StatefulWidget {
 }
 
 class _TorrentDownloadPageState extends State<TorrentDownloadPage>
-    with WidgetsBindingObserver {
+    with PageActivityMixin {
   final TorrentDownloadService _service = TorrentDownloadService.instance;
   final TextEditingController _searchController = TextEditingController();
-  final GlobalKey _sortDropdownKey = GlobalKey();
   Timer? _refreshTimer;
-  List<TorrentTask> _tasks = const <TorrentTask>[];
+  late final TorrentTaskController _taskController;
+  List<TorrentTask> get _tasks => _taskController.tasks;
+  List<TorrentTask>? _lastScannedSnapshot;
+  bool _isPlaying = false;
+  final Map<String, DateTime> _autoScanRetryAfter = {};
   final Set<String> _autoScannedCompletedTaskKeys = <String>{};
   final Set<String> _autoScanningTaskKeys = <String>{};
   Future<void> _autoScanChain = Future<void>.value();
@@ -63,38 +72,56 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
   bool _isLoading = true;
   bool _isBusy = false;
   bool _autoScanRegistryLoaded = false;
-  _TorrentTaskViewMode _viewMode = _TorrentTaskViewMode.cards;
-  _TorrentTaskSort _sort = _TorrentTaskSort.latest;
+  UnifiedTorrentTaskViewMode _viewMode = UnifiedTorrentTaskViewMode.cards;
+  UnifiedTorrentTaskSort _sort = UnifiedTorrentTaskSort.latest;
   String _searchQuery = '';
+
+  bool get _isPhoneSurface =>
+      AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone;
+
+  void _showTorrentMessage(String message) {
+    if (!mounted) return;
+    if (_isPhoneSurface) {
+      AdaptiveSnackBar.show(
+        context,
+        message: message,
+        type: AdaptiveSnackBarType.info,
+      );
+      return;
+    }
+    BlurSnackBar.show(context, message);
+  }
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
+    _taskController = TorrentTaskController(loadTasks: _service.listTasks);
+    _taskController.addListener(_onTasksChanged);
     _initialize();
-    _startRefreshTimer();
   }
 
   @override
   void dispose() {
     _refreshTimer?.cancel();
-    WidgetsBinding.instance.removeObserver(this);
+    _taskController.removeListener(_onTasksChanged);
+    _taskController.dispose();
     _searchController.dispose();
     super.dispose();
   }
 
   @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Stop refreshing when app is backgrounded, resume when foregrounded.
-    if (state == AppLifecycleState.resumed) {
+  void onPageActivityChanged(bool active) {
+    if (active && !_isLoading) {
       _startRefreshTimer();
-    } else if (state == AppLifecycleState.paused) {
+      unawaited(_refreshTasks(silent: true));
+    } else {
       _refreshTimer?.cancel();
     }
   }
 
   void _startRefreshTimer() {
     _refreshTimer?.cancel();
+    if (!mounted || !isPageActive || _isLoading) return;
     _refreshTimer = Timer.periodic(
       const Duration(seconds: 5),
       (_) => _refreshTasks(silent: true),
@@ -105,37 +132,44 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
     try {
       final directory = await _service.getDownloadDirectory();
       await _service.initialize();
-      final tasks = await _service.listTasks();
+      await _taskController.refresh();
       if (!mounted) return;
       setState(() {
         _downloadDirectory = directory;
-        _tasks = tasks;
         _isLoading = false;
       });
-      unawaited(_loadScanSummariesForTasks(tasks));
-      unawaited(_handleAutoScanCompletedTasks(tasks, silent: true));
-    } catch (e) {
+    } catch (e, stackTrace) {
+      debugPrint('初始化种子下载失败: $e\n$stackTrace');
       if (!mounted) return;
       setState(() {
         _isLoading = false;
       });
-      BlurSnackBar.show(context, '初始化种子下载失败: $e');
+      _showTorrentMessage('初始化种子下载失败: $e');
+    } finally {
+      if (mounted) _startRefreshTimer();
     }
   }
 
+  void _onTasksChanged() {
+    if (!mounted) return;
+    setState(() {});
+    if (identical(_lastScannedSnapshot, _tasks)) return;
+    _lastScannedSnapshot = _tasks;
+    unawaited(_loadScanSummariesForTasks(_tasks).catchError((Object error) {
+      debugPrint('读取下载任务入库结果失败: $error');
+    }));
+    unawaited(_handleAutoScanCompletedTasks(_tasks, silent: true)
+        .catchError((Object error) {
+      debugPrint('检查下载任务自动入库失败: $error');
+    }));
+  }
+
   Future<void> _refreshTasks({bool silent = false}) async {
-    if (_isBusy && silent) return;
     try {
-      final tasks = await _service.listTasks();
-      if (!mounted) return;
-      setState(() {
-        _tasks = tasks;
-      });
-      unawaited(_loadScanSummariesForTasks(tasks));
-      unawaited(_handleAutoScanCompletedTasks(tasks, silent: silent));
+      await _taskController.refresh();
     } catch (e) {
       if (!mounted || silent) return;
-      BlurSnackBar.show(context, '刷新下载列表失败: $e');
+      _showTorrentMessage('刷新下载列表失败: $e');
     }
   }
 
@@ -146,18 +180,23 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
         : _downloadDirectory;
     final recentDirectories = await _service.loadRecentDownloadDirectories();
     if (!mounted) return;
-    final result = await NipaplayWindow.show<_AddMagnetDialogResult>(
-      context: context,
-      barrierDismissible: false,
-      child: _AddMagnetDialog(
-        service: _service,
-        initialDirectory: initialDirectory,
-        initialRecentDirectories: recentDirectories,
-        initialCreateFolderForTask: downloaderSettings.createFolderForTask,
-      ),
+    final dialog = _AddMagnetDialog(
+      service: _service,
+      initialDirectory: initialDirectory,
+      initialRecentDirectories: recentDirectories,
+      initialCreateFolderForTask: downloaderSettings.createFolderForTask,
+    );
+    final result = await AdaptiveTorrentDownloadDialogs.showAddTorrent(
+      context,
+      content: dialog,
     );
     if (result == null) return;
+    if (!mounted) {
+      result.previewRequest.cancel();
+      return;
+    }
 
+    TorrentAddResult? addResult;
     await _runBusyAction(
       action: () async {
         await _service.setDownloadDirectory(result.downloadDirectory);
@@ -167,13 +206,18 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
             result.createFolderForTask,
           );
         }
-        await _service.addMagnet(
-          result.magnetUri,
-          downloadDirectory: result.downloadDirectory,
-          createFolderForTask: result.createFolderForTask,
-        );
+        try {
+          addResult = await _service.addMagnet(
+            result.magnetUri,
+            previewId: result.preview.requestId,
+            downloadDirectory: result.downloadDirectory,
+            createFolderForTask: result.createFolderForTask,
+          );
+        } finally {
+          result.previewRequest.cancel();
+        }
       },
-      successMessage: '已添加下载任务',
+      successMessage: () => addResult?.message ?? '已添加下载任务',
       afterSuccess: () {
         if (mounted) {
           setState(() {
@@ -182,6 +226,7 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
         }
       },
     );
+    result.previewRequest.cancel();
   }
 
   void _updateSearchQuery(String value) {
@@ -190,43 +235,19 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
     });
   }
 
-  void _applySort(_TorrentTaskSort sort) {
+  void _applySort(UnifiedTorrentTaskSort sort) {
     if (_sort == sort) return;
     setState(() {
       _sort = sort;
     });
   }
 
-  List<TorrentTask> get _visibleTasks {
-    final query = _searchQuery.toLowerCase();
-    final filtered = query.isEmpty
-        ? List<TorrentTask>.from(_tasks)
-        : _tasks.where((task) {
-            final scanText =
-                _scanSummaries[task.autoScanKey]?.displayText ?? '';
-            final haystack = [
-              task.name,
-              task.outputFolder,
-              task.displayState,
-              scanText,
-            ].join('\n').toLowerCase();
-            return haystack.contains(query);
-          }).toList();
-
-    filtered.sort((a, b) {
-      switch (_sort) {
-        case _TorrentTaskSort.latest:
-          return b.id.compareTo(a.id);
-        case _TorrentTaskSort.name:
-          return a.name.toLowerCase().compareTo(b.name.toLowerCase());
-        case _TorrentTaskSort.progress:
-          return b.progress.compareTo(a.progress);
-        case _TorrentTaskSort.status:
-          return a.displayState.compareTo(b.displayState);
-      }
-    });
-    return filtered;
-  }
+  List<TorrentTask> get _visibleTasks => buildUnifiedTorrentVisibleTasks(
+        tasks: _tasks,
+        scanSummaries: _scanSummaries,
+        query: _searchQuery,
+        sort: _sort,
+      );
 
   Future<void> _pickTorrentFile() async {
     final file = await openFile(
@@ -252,16 +273,18 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
 
     final downloadDirectory = selectedDirectory.trim();
     final downloaderSettings = context.read<DownloaderSettingsProvider>();
+    TorrentAddResult? addResult;
     await _runBusyAction(
       action: () async {
         await _service.setDownloadDirectory(downloadDirectory);
-        await _service.addTorrentFile(
+        addResult = await _service.addTorrentFile(
           file.path,
           downloadDirectory: downloadDirectory,
           createFolderForTask: downloaderSettings.createFolderForTask,
         );
       },
-      successMessage: '已添加 ${p.basename(file.path)}',
+      successMessage: () =>
+          addResult?.message ?? '已添加 ${p.basename(file.path)}',
       afterSuccess: () {
         if (!mounted) return;
         setState(() {
@@ -273,88 +296,79 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
 
   Future<void> _runBusyAction({
     required Future<void> Function() action,
-    required String successMessage,
+    required String Function() successMessage,
     VoidCallback? afterSuccess,
+    int? taskId,
   }) async {
-    if (_isBusy) return;
-    setState(() {
-      _isBusy = true;
-    });
+    if (!mounted || (taskId == null && _isBusy)) return;
+    if (taskId == null) setState(() => _isBusy = true);
     try {
-      await action();
-      afterSuccess?.call();
-      await _refreshTasks(silent: true);
-      if (!mounted) return;
-      BlurSnackBar.show(context, successMessage);
-    } catch (e) {
-      if (!mounted) return;
-      BlurSnackBar.show(context, '操作失败: $e');
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isBusy = false;
-        });
+      Future<void> perform() async {
+        await action();
+        afterSuccess?.call();
       }
+
+      if (taskId == null) {
+        await perform();
+        await _taskController.refresh();
+      } else if (!await _taskController.run(taskId, perform)) {
+        return;
+      }
+      if (mounted) _showTorrentMessage(successMessage());
+    } catch (e) {
+      if (mounted) _showTorrentMessage('操作失败: $e');
+    } finally {
+      if (mounted && taskId == null) setState(() => _isBusy = false);
     }
   }
 
   Future<void> _toggleTask(TorrentTask task) async {
     await _runBusyAction(
       action: () =>
-          task.isPaused ? _service.resume(task.id) : _service.pause(task.id),
-      successMessage: task.isPaused ? '已继续下载' : '已暂停下载',
+          task.canResume ? _service.resume(task.id) : _service.pause(task.id),
+      taskId: task.id,
+      successMessage: () => task.canResume ? '已恢复任务' : '已暂停任务',
     );
   }
 
   Future<void> _forgetTask(TorrentTask task) async {
     await _runBusyAction(
       action: () => _service.forget(task.id),
-      successMessage: '已移除下载任务',
+      taskId: task.id,
+      successMessage: () => '已移除下载任务',
     );
   }
 
   Future<void> _deleteTask(TorrentTask task) async {
-    final colorScheme = Theme.of(context).colorScheme;
-    final confirm = await BlurDialog.show<bool>(
-      context: context,
-      title: '删除任务和文件',
-      content: '将从列表移除“${task.name}”，并删除已下载文件。此操作不可撤销。',
-      actions: [
-        HoverScaleTextButton(
-          child: Text(
-            '取消',
-            style: TextStyle(color: colorScheme.onSurface.withOpacity(0.7)),
-          ),
-          onPressed: () => Navigator.of(context).pop(false),
-        ),
-        HoverScaleTextButton(
-          child: const Text('删除'),
-          idleColor: colorScheme.error,
-          hoverColor: colorScheme.error,
-          onPressed: () => Navigator.of(context).pop(true),
-        ),
-      ],
+    final confirm = await AdaptiveTorrentDownloadDialogs.confirmDelete(
+      context,
+      TorrentDeleteDialogViewModel(task: task),
     );
-    if (confirm != true) return;
+    if (!confirm) return;
     await _runBusyAction(
       action: () => _service.delete(task.id),
-      successMessage: '已删除任务和文件',
+      taskId: task.id,
+      successMessage: () => '已删除任务和文件',
     );
   }
 
   Future<void> _openTaskFolder(TorrentTask task) async {
+    if (_isPhoneSurface) {
+      _showTorrentMessage('文件夹: ${task.outputFolder}');
+      return;
+    }
     final ok = await FolderOpener.open(task.outputFolder);
     if (!mounted) return;
     if (!ok) {
-      BlurSnackBar.show(context, '打开文件夹失败');
+      _showTorrentMessage('打开文件夹失败');
     }
   }
 
   void _toggleViewMode() {
     setState(() {
-      _viewMode = _viewMode == _TorrentTaskViewMode.cards
-          ? _TorrentTaskViewMode.list
-          : _TorrentTaskViewMode.cards;
+      _viewMode = _viewMode == UnifiedTorrentTaskViewMode.cards
+          ? UnifiedTorrentTaskViewMode.list
+          : UnifiedTorrentTaskViewMode.cards;
     });
   }
 
@@ -459,6 +473,8 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
     for (final task in tasks) {
       if (!task.finished || task.outputFolder.trim().isEmpty) continue;
       final key = task.autoScanKey;
+      final retryAfter = _autoScanRetryAfter[key];
+      if (retryAfter != null && DateTime.now().isBefore(retryAfter)) continue;
       if (_autoScannedCompletedTaskKeys.contains(key) ||
           _autoScanningTaskKeys.contains(key)) {
         continue;
@@ -478,17 +494,23 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
     required bool silent,
   }) async {
     try {
-      final scanService = ServiceProvider.scanService;
-      await scanService.addScannedFolder(task.outputFolder);
-      while (mounted && scanService.isScanning) {
-        await Future<void>.delayed(const Duration(seconds: 2));
+      if (!mounted ||
+          !_tasks.any(
+              (current) => current.autoScanKey == key && current.finished)) {
+        return;
       }
+      final scanService = ServiceProvider.scanService;
+      if (scanService.isScanning) return;
+      final paths = await _service.listCompletedVideoPaths(task);
       if (!mounted) return;
-
-      await scanService.startDirectoryScan(
-        task.outputFolder,
-        skipPreviouslyMatchedUnwatched: true,
-      );
+      final succeeded = await scanService.scanCompletedFiles(paths,
+          folderPath: task.outputFolder);
+      if (!succeeded) {
+        _autoScanRetryAfter[key] =
+            DateTime.now().add(const Duration(minutes: 1));
+        return;
+      }
+      _autoScanRetryAfter.remove(key);
       await ServiceProvider.watchHistoryProvider.refresh();
       await _service.markAutoScannedCompletedTask(key);
       _autoScannedCompletedTaskKeys.add(key);
@@ -501,26 +523,26 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
       }
 
       if (!mounted || silent) return;
-      BlurSnackBar.show(context, '已自动扫描并加入媒体库: ${task.name}');
+      _showTorrentMessage('已自动扫描并加入媒体库: ${task.name}');
     } catch (e) {
+      _autoScanRetryAfter[key] = DateTime.now().add(const Duration(minutes: 1));
+      debugPrint('自动扫描下载任务失败: $e');
       if (!mounted || silent) return;
-      BlurSnackBar.show(context, '自动扫描下载任务失败: $e');
+      _showTorrentMessage('自动扫描下载任务失败: $e');
     } finally {
       _autoScanningTaskKeys.remove(key);
     }
   }
 
   Future<void> _playTask(TorrentTask task) async {
-    if (_isBusy) return;
-    setState(() {
-      _isBusy = true;
-    });
+    if (_isPlaying) return;
+    _isPlaying = true;
 
     try {
       final files = await _service.listPlayableFiles(task);
       if (!mounted) return;
       if (files.isEmpty) {
-        BlurSnackBar.show(context, '尚未获取到可播放的视频文件，请稍后再试');
+        _showTorrentMessage('尚未获取到可播放的视频文件，请稍后再试');
         return;
       }
 
@@ -528,6 +550,13 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
           ? files.first
           : await _showPlayableFilesDialog(files);
       if (selected == null || !mounted) return;
+      if (!task.finished && task.isPaused) {
+        if (!await _taskController.run(
+            task.id, () => _service.resume(task.id))) {
+          return;
+        }
+        if (!mounted) return;
+      }
 
       final source = await _service.getPlaybackSource(task, selected);
       if (!mounted) return;
@@ -542,63 +571,92 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
       );
     } catch (e) {
       if (!mounted) return;
-      BlurSnackBar.show(context, '播放下载任务失败: $e');
+      _showTorrentMessage('播放下载任务失败: $e');
     } finally {
-      if (mounted) {
-        setState(() {
-          _isBusy = false;
-        });
-      }
+      _isPlaying = false;
     }
   }
 
   Future<TorrentTaskFile?> _showPlayableFilesDialog(
     List<TorrentTaskFile> files,
   ) {
-    final colorScheme = Theme.of(context).colorScheme;
-    return BlurDialog.show<TorrentTaskFile>(
-      context: context,
-      title: '选择要播放的文件',
-      contentWidget: ConstrainedBox(
-        constraints: const BoxConstraints(maxHeight: 360),
-        child: ListView.separated(
-          shrinkWrap: true,
-          itemCount: files.length,
-          separatorBuilder: (_, __) => Divider(
-            color: colorScheme.onSurface.withOpacity(0.08),
-            height: 1,
-          ),
-          itemBuilder: (dialogContext, index) {
-            final file = files[index];
-            return ListTile(
-              dense: true,
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(
-                Ionicons.play_circle_outline,
-                color: AppAccentColors.current,
-              ),
-              title: Text(
-                file.displayName,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: colorScheme.onSurface),
-              ),
-              subtitle: Text(
-                _TorrentTaskCard.formatBytes(file.length),
-                style: TextStyle(color: colorScheme.onSurface.withOpacity(0.6)),
-              ),
-              onTap: () => Navigator.of(dialogContext).pop(file),
-            );
-          },
-        ),
-      ),
+    return AdaptiveTorrentDownloadDialogs.selectPlayableFile(
+      context,
+      TorrentPlayableFilesDialogViewModel(files: files),
+    );
+  }
+
+  UnifiedTorrentPageViewModel _buildPageViewModel() {
+    final visibleTasks = _visibleTasks;
+    return UnifiedTorrentPageViewModel(
+      isLoading: _isLoading,
+      isBusy: _isBusy,
+      tasks: List<TorrentTask>.unmodifiable(_tasks),
+      visibleTasks:
+          visibleTasks.map(_buildTaskViewModel).toList(growable: false),
+      searchController: _searchController,
+      sort: _sort,
+      viewMode: _viewMode,
+      onSearchChanged: _updateSearchQuery,
+      onClearSearch: () => _updateSearchQuery(''),
+      onSortChanged: _applySort,
+      onToggleViewMode: _toggleViewMode,
+      onRefresh: () => unawaited(_refreshTasks()),
+      onAddMagnet: () => unawaited(_showAddMagnetDialog()),
+      onPickTorrent: () => unawaited(_pickTorrentFile()),
+    );
+  }
+
+  UnifiedTorrentTaskItemViewModel _buildTaskViewModel(TorrentTask task) {
+    UnifiedTorrentTaskActionViewModel action(
+      UnifiedTorrentTaskAction id,
+      String label,
+      Future<void> Function() callback, {
+      bool destructive = false,
+    }) {
+      return UnifiedTorrentTaskActionViewModel(
+        action: id,
+        label: label,
+        onPressed: id != UnifiedTorrentTaskAction.openFolder &&
+                _taskController.isBusy(task.id)
+            ? null
+            : () => unawaited(callback()),
+        destructive: destructive,
+      );
+    }
+
+    return UnifiedTorrentTaskItemViewModel(
+      task: task,
+      scanSummary: _scanSummaries[task.autoScanKey],
+      isAutoScanning: _autoScanningTaskKeys.contains(task.autoScanKey),
+      isAutoScanned: _autoScannedCompletedTaskKeys.contains(task.autoScanKey),
       actions: [
-        HoverScaleTextButton(
-          child: Text(
-            '取消',
-            style: TextStyle(color: colorScheme.onSurface.withOpacity(0.7)),
+        if (task.canPlay)
+          action(
+            UnifiedTorrentTaskAction.play,
+            '播放',
+            () => _playTask(task),
           ),
-          onPressed: () => Navigator.of(context).pop(),
+        action(
+          UnifiedTorrentTaskAction.toggle,
+          task.toggleLabel,
+          () => _toggleTask(task),
+        ),
+        action(
+          UnifiedTorrentTaskAction.openFolder,
+          '查看文件夹',
+          () => _openTaskFolder(task),
+        ),
+        action(
+          UnifiedTorrentTaskAction.forget,
+          '移除任务',
+          () => _forgetTask(task),
+        ),
+        action(
+          UnifiedTorrentTaskAction.delete,
+          '删除任务和文件',
+          () => _deleteTask(task),
+          destructive: true,
         ),
       ],
     );
@@ -606,10 +664,47 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    final visibleTasks = _visibleTasks;
+    final data = _buildPageViewModel();
+    final surface = AppDisplaySurfaceScope.of(context);
+    final Widget view;
+    if (surface == AppDisplaySurface.phone) {
+      view = CupertinoTorrentDownloadView(data: data);
+    } else if (surface == AppDisplaySurface.television) {
+      view = TelevisionTorrentDownloadView(data: data);
+    } else {
+      view = DesktopTorrentDownloadView(data: data);
+    }
+    return Column(children: [
+      if (_isBusy) ...[
+        const LinearProgressIndicator(minHeight: 2),
+        const Padding(padding: EdgeInsets.all(8), child: Text('正在添加下载任务…')),
+      ],
+      Expanded(child: view),
+    ]);
+  }
+}
 
-    if (_isLoading) {
+class DesktopTorrentDownloadView extends StatefulWidget {
+  const DesktopTorrentDownloadView({super.key, required this.data});
+
+  final UnifiedTorrentPageViewModel data;
+
+  @override
+  State<DesktopTorrentDownloadView> createState() =>
+      _DesktopTorrentDownloadViewState();
+}
+
+class _DesktopTorrentDownloadViewState
+    extends State<DesktopTorrentDownloadView> {
+  final GlobalKey _sortDropdownKey = GlobalKey();
+
+  UnifiedTorrentPageViewModel get data => widget.data;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    if (data.isLoading) {
       return Center(
         child: CircularProgressIndicator(color: AppAccentColors.current),
       );
@@ -618,22 +713,224 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
     return Column(
       children: [
         _buildTopBar(colorScheme),
-        Divider(color: colorScheme.onSurface.withOpacity(0.10), height: 1),
+        Divider(
+            color: colorScheme.onSurface.withValues(alpha: 0.10), height: 1),
         Expanded(
-          child: visibleTasks.isEmpty
+          child: data.visibleTasks.isEmpty
               ? LibraryManagementEmptyState(
                   icon: Ionicons.cloud_download_outline,
-                  title: _tasks.isEmpty ? '暂无下载任务' : '没有匹配的下载任务',
-                  subtitle: _tasks.isEmpty
-                      ? '添加 magnet 链接或 .torrent 文件后，任务会显示在这里。'
-                      : '换一个关键词或清空搜索后再查看。',
+                  title: data.emptyTitle,
+                  subtitle: data.emptyDescription,
                 )
-              : _buildTaskList(visibleTasks),
+              : _buildTaskList(),
         ),
       ],
     );
   }
+}
 
+class TelevisionTorrentDownloadView extends StatelessWidget {
+  const TelevisionTorrentDownloadView({super.key, required this.data});
+
+  final UnifiedTorrentPageViewModel data;
+
+  VoidCallback? _onAction(
+    UnifiedTorrentTaskItemViewModel item,
+    UnifiedTorrentTaskAction action,
+  ) {
+    return item.action(action)?.onPressed;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (data.isLoading) {
+      return const NipaplayLargeScreenPageScaffold(
+        title: UnifiedTorrentPageViewModel.title,
+        subtitle: '正在读取种子任务',
+        icon: Ionicons.cloud_download_outline,
+        child: Center(child: CircularProgressIndicator()),
+      );
+    }
+    return _buildLargeScreenTorrentPage(Theme.of(context).colorScheme);
+  }
+
+  Widget _buildLargeScreenTorrentPage(
+    ColorScheme colorScheme,
+  ) {
+    final subtitle =
+        '${data.tasks.length} 个任务 / ${data.activeTaskCount} 个下载中 / '
+        '${data.finishedTaskCount} 个已完成';
+
+    return NipaplayLargeScreenPageScaffold(
+      title: '下载',
+      subtitle: subtitle,
+      icon: Ionicons.cloud_download_outline,
+      actions: [
+        NipaplayLargeScreenActionButton(
+          icon: Ionicons.refresh_outline,
+          label: '刷新',
+          onPressed: data.onRefresh,
+        ),
+        NipaplayLargeScreenActionButton(
+          icon: data.viewMode == UnifiedTorrentTaskViewMode.cards
+              ? Ionicons.list_outline
+              : Ionicons.grid_outline,
+          label:
+              data.viewMode == UnifiedTorrentTaskViewMode.cards ? '列表' : '网格',
+          onPressed: data.onToggleViewMode,
+        ),
+        NipaplayLargeScreenActionButton(
+          icon: Ionicons.add_circle_outline,
+          label: '添加链接',
+          onPressed: data.isBusy ? null : data.onAddMagnet,
+        ),
+        NipaplayLargeScreenActionButton(
+          icon: Ionicons.document_attach_outline,
+          label: '选择种子',
+          onPressed: data.isBusy ? null : data.onPickTorrent,
+        ),
+      ],
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Expanded(
+                flex: 2,
+                child: NipaplayLargeScreenTextInput(
+                  controller: data.searchController,
+                  hintText: UnifiedTorrentPageViewModel.searchPlaceholder,
+                  onChanged: data.onSearchChanged,
+                  suffix: data.searchController.text.isEmpty
+                      ? null
+                      : _TorrentHoverAction(
+                          icon: Icons.clear_rounded,
+                          tooltip: '清空搜索',
+                          onPressed: () {
+                            data.searchController.clear();
+                            data.onClearSearch();
+                          },
+                        ),
+                ),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                flex: 3,
+                child: _buildLargeScreenSortRail(colorScheme),
+              ),
+              const SizedBox(width: 14),
+              _LargeScreenTorrentStat(
+                label: '下载速度',
+                value:
+                    '${formatTorrentBytes(data.downloadSpeedBytesPerSecond)}/s',
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+          Expanded(
+            child: data.visibleTasks.isEmpty
+                ? NipaplayLargeScreenEmptyState(
+                    icon: Ionicons.cloud_download_outline,
+                    title: data.emptyTitle,
+                    subtitle: data.emptyDescription,
+                    action: data.tasks.isEmpty
+                        ? NipaplayLargeScreenActionButton(
+                            icon: Ionicons.add_circle_outline,
+                            label: '添加链接',
+                            onPressed: data.isBusy ? null : data.onAddMagnet,
+                            autofocus: true,
+                          )
+                        : null,
+                  )
+                : data.viewMode == UnifiedTorrentTaskViewMode.list
+                    ? _buildLargeScreenTorrentList(colorScheme)
+                    : _buildLargeScreenTorrentGrid(colorScheme),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenSortRail(ColorScheme colorScheme) {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(
+        children: [
+          for (final entry in unifiedTorrentTaskSortLabels.entries) ...[
+            _LargeScreenTorrentSortButton(
+              label: entry.value,
+              selected: entry.key == data.sort,
+              onPressed: () => data.onSortChanged(entry.key),
+            ),
+            const SizedBox(width: 8),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenTorrentGrid(
+    ColorScheme colorScheme,
+  ) {
+    return GridView.builder(
+      padding: const EdgeInsets.only(bottom: 24),
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 460,
+        mainAxisExtent: 286,
+        mainAxisSpacing: 16,
+        crossAxisSpacing: 16,
+      ),
+      itemCount: data.visibleTasks.length,
+      itemBuilder: (context, index) {
+        final item = data.visibleTasks[index];
+        final task = item.task;
+        return _LargeScreenTorrentTaskCard(
+          task: task,
+          scanSummary: item.scanSummary,
+          isAutoScanning: item.isAutoScanning,
+          isAutoScanned: item.isAutoScanned,
+          autofocus: index == 0,
+          onPrimary: item.primaryAction.onPressed,
+          onPlay: _onAction(item, UnifiedTorrentTaskAction.play),
+          onToggle: _onAction(item, UnifiedTorrentTaskAction.toggle),
+          onOpenFolder: _onAction(item, UnifiedTorrentTaskAction.openFolder)!,
+          onForget: _onAction(item, UnifiedTorrentTaskAction.forget),
+          onDelete: _onAction(item, UnifiedTorrentTaskAction.delete),
+        );
+      },
+    );
+  }
+
+  Widget _buildLargeScreenTorrentList(
+    ColorScheme colorScheme,
+  ) {
+    return ListView.separated(
+      padding: const EdgeInsets.only(bottom: 24),
+      itemCount: data.visibleTasks.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 12),
+      itemBuilder: (context, index) {
+        final item = data.visibleTasks[index];
+        final task = item.task;
+        return _LargeScreenTorrentTaskCard(
+          task: task,
+          scanSummary: item.scanSummary,
+          isAutoScanning: item.isAutoScanning,
+          isAutoScanned: item.isAutoScanned,
+          autofocus: index == 0,
+          compact: true,
+          onPrimary: item.primaryAction.onPressed,
+          onPlay: _onAction(item, UnifiedTorrentTaskAction.play),
+          onToggle: _onAction(item, UnifiedTorrentTaskAction.toggle),
+          onOpenFolder: _onAction(item, UnifiedTorrentTaskAction.openFolder)!,
+          onForget: _onAction(item, UnifiedTorrentTaskAction.forget),
+          onDelete: _onAction(item, UnifiedTorrentTaskAction.delete),
+        );
+      },
+    );
+  }
+}
+
+extension _DesktopTorrentDownloadViewControls
+    on _DesktopTorrentDownloadViewState {
   Widget _buildTopBar(ColorScheme colorScheme) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
@@ -641,21 +938,21 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
         builder: (context, constraints) {
           final compact = constraints.maxWidth < 720;
           final search = _SearchInput(
-            controller: _searchController,
-            onChanged: _updateSearchQuery,
-            onClear: () => _updateSearchQuery(''),
+            controller: data.searchController,
+            onChanged: data.onSearchChanged,
+            onClear: data.onClearSearch,
           );
           final sort = SizedBox(
             width: 142,
-            child: BlurDropdown<_TorrentTaskSort>(
+            child: BlurDropdown<UnifiedTorrentTaskSort>(
               dropdownKey: _sortDropdownKey,
-              onItemSelected: _applySort,
-              items: _torrentTaskSortLabels.entries
+              onItemSelected: data.onSortChanged,
+              items: unifiedTorrentTaskSortLabels.entries
                   .map(
-                    (entry) => DropdownMenuItemData<_TorrentTaskSort>(
+                    (entry) => DropdownMenuItemData<UnifiedTorrentTaskSort>(
                       title: entry.value,
                       value: entry.key,
-                      isSelected: entry.key == _sort,
+                      isSelected: entry.key == data.sort,
                     ),
                   )
                   .toList(),
@@ -665,17 +962,17 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
             _TorrentHoverAction(
               icon: Ionicons.refresh_outline,
               label: '刷新',
-              onPressed: () => _refreshTasks(),
+              onPressed: data.onRefresh,
             ),
             const SizedBox(width: 8),
             _TorrentHoverAction(
-              icon: _viewMode == _TorrentTaskViewMode.cards
+              icon: data.viewMode == UnifiedTorrentTaskViewMode.cards
                   ? Ionicons.list_outline
                   : Ionicons.grid_outline,
-              tooltip: _viewMode == _TorrentTaskViewMode.cards
+              tooltip: data.viewMode == UnifiedTorrentTaskViewMode.cards
                   ? '切换为列表显示'
                   : '切换为三列显示',
-              onPressed: _toggleViewMode,
+              onPressed: data.onToggleViewMode,
               padding: const EdgeInsets.all(8),
               iconSize: 20,
             ),
@@ -683,13 +980,13 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
             _TorrentHoverAction(
               icon: Ionicons.add_circle_outline,
               label: '添加链接',
-              onPressed: _isBusy ? null : _showAddMagnetDialog,
+              onPressed: data.isBusy ? null : data.onAddMagnet,
             ),
             const SizedBox(width: 8),
             _TorrentHoverAction(
               icon: Ionicons.document_attach_outline,
               label: '选择种子',
-              onPressed: _isBusy ? null : _pickTorrentFile,
+              onPressed: data.isBusy ? null : data.onPickTorrent,
             ),
           ];
 
@@ -729,54 +1026,60 @@ class _TorrentDownloadPageState extends State<TorrentDownloadPage>
     );
   }
 
-  Widget _buildTaskList(List<TorrentTask> tasks) {
-    if (_viewMode == _TorrentTaskViewMode.list) {
-      return _buildCompactTaskList(tasks);
+  Widget _buildTaskList() {
+    if (data.viewMode == UnifiedTorrentTaskViewMode.list) {
+      return _buildCompactTaskList();
     }
 
-    return LibraryManagementList<TorrentTask>(
-      items: tasks,
+    return LibraryManagementList<UnifiedTorrentTaskItemViewModel>(
+      items: data.visibleTasks,
       minItemWidth: 420,
       padding: const EdgeInsets.all(16),
-      itemBuilder: (context, task) => _TorrentTaskCard(
-        task: task,
-        scanSummary: _scanSummaries[task.autoScanKey],
-        isAutoScanning: _autoScanningTaskKeys.contains(task.autoScanKey),
-        isAutoScanned: _autoScannedCompletedTaskKeys.contains(task.autoScanKey),
-        onPlay: () => _playTask(task),
-        onToggle: () => _toggleTask(task),
-        onOpenFolder: () => _openTaskFolder(task),
-        onForget: () => _forgetTask(task),
-        onDelete: () => _deleteTask(task),
+      itemBuilder: (context, item) => _TorrentTaskCard(
+        task: item.task,
+        scanSummary: item.scanSummary,
+        isAutoScanning: item.isAutoScanning,
+        isAutoScanned: item.isAutoScanned,
+        onPlay: _onAction(item, UnifiedTorrentTaskAction.play),
+        onToggle: _onAction(item, UnifiedTorrentTaskAction.toggle),
+        onOpenFolder: _onAction(item, UnifiedTorrentTaskAction.openFolder)!,
+        onForget: _onAction(item, UnifiedTorrentTaskAction.forget),
+        onDelete: _onAction(item, UnifiedTorrentTaskAction.delete),
       ),
     );
   }
 
-  Widget _buildCompactTaskList(List<TorrentTask> tasks) {
+  Widget _buildCompactTaskList() {
     return Scrollbar(
       radius: const Radius.circular(2),
       thickness: 4,
       child: ListView.separated(
         padding: const EdgeInsets.all(16),
-        itemCount: tasks.length,
+        itemCount: data.visibleTasks.length,
         separatorBuilder: (_, __) => const SizedBox(height: 10),
         itemBuilder: (context, index) {
-          final task = tasks[index];
+          final item = data.visibleTasks[index];
           return _TorrentTaskListItem(
-            task: task,
-            scanSummary: _scanSummaries[task.autoScanKey],
-            isAutoScanning: _autoScanningTaskKeys.contains(task.autoScanKey),
-            isAutoScanned:
-                _autoScannedCompletedTaskKeys.contains(task.autoScanKey),
-            onPlay: () => _playTask(task),
-            onToggle: () => _toggleTask(task),
-            onOpenFolder: () => _openTaskFolder(task),
-            onForget: () => _forgetTask(task),
-            onDelete: () => _deleteTask(task),
+            task: item.task,
+            scanSummary: item.scanSummary,
+            isAutoScanning: item.isAutoScanning,
+            isAutoScanned: item.isAutoScanned,
+            onPlay: _onAction(item, UnifiedTorrentTaskAction.play),
+            onToggle: _onAction(item, UnifiedTorrentTaskAction.toggle),
+            onOpenFolder: _onAction(item, UnifiedTorrentTaskAction.openFolder)!,
+            onForget: _onAction(item, UnifiedTorrentTaskAction.forget),
+            onDelete: _onAction(item, UnifiedTorrentTaskAction.delete),
           );
         },
       ),
     );
+  }
+
+  VoidCallback? _onAction(
+    UnifiedTorrentTaskItemViewModel item,
+    UnifiedTorrentTaskAction action,
+  ) {
+    return item.action(action)?.onPressed;
   }
 }
 
@@ -801,7 +1104,8 @@ class _TorrentHoverAction extends StatelessWidget {
   Widget build(BuildContext context) {
     final enabled = onPressed != null;
     final colorScheme = Theme.of(context).colorScheme;
-    final baseColor = colorScheme.onSurface.withOpacity(enabled ? 0.72 : 0.36);
+    final baseColor =
+        colorScheme.onSurface.withValues(alpha: enabled ? 0.72 : 0.36);
 
     Widget content = HoverScaleTextButton(
       onPressed: onPressed,
@@ -874,11 +1178,13 @@ class _SearchInputState extends State<_SearchInput> {
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final activeColor = AppAccentColors.current;
-    final idleBorderColor =
-        isDark ? Colors.white.withOpacity(0.1) : Colors.black.withOpacity(0.1);
-    final bgColor = isDark ? Colors.white.withOpacity(0.12) : Colors.white;
+    final idleBorderColor = isDark
+        ? Colors.white.withValues(alpha: 0.1)
+        : Colors.black.withValues(alpha: 0.1);
+    final bgColor =
+        isDark ? Colors.white.withValues(alpha: 0.12) : Colors.white;
     final textColor = isDark ? Colors.white : Colors.black;
-    final hintColor = textColor.withOpacity(0.45);
+    final hintColor = textColor.withValues(alpha: 0.45);
 
     return Container(
       height: 40,
@@ -933,18 +1239,6 @@ class _SearchInputState extends State<_SearchInput> {
   }
 }
 
-class _AddMagnetDialogResult {
-  const _AddMagnetDialogResult({
-    required this.magnetUri,
-    required this.downloadDirectory,
-    required this.createFolderForTask,
-  });
-
-  final String magnetUri;
-  final String downloadDirectory;
-  final bool createFolderForTask;
-}
-
 class _AddMagnetDialog extends StatefulWidget {
   const _AddMagnetDialog({
     required this.service,
@@ -971,6 +1265,8 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
   String? _error;
   bool _isPreviewing = false;
   int _previewRequestId = 0;
+  TorrentPreviewRequest? _previewRequest;
+  bool _submitted = false;
 
   @override
   void initState() {
@@ -983,6 +1279,7 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
 
   @override
   void dispose() {
+    if (!_submitted) _previewRequest?.cancel();
     _magnetController.dispose();
     super.dispose();
   }
@@ -994,7 +1291,7 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
     );
     if (selected == null || selected.trim().isEmpty) return;
     await widget.service.rememberRecentDownloadDirectory(selected.trim());
-    _selectDirectory(selected.trim());
+    if (mounted) _selectDirectory(selected.trim());
   }
 
   void _selectDirectory(String directory) {
@@ -1004,7 +1301,6 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
         directory,
         ..._recentDirectories.where((value) => value != directory),
       ].take(8).toList(growable: false);
-      _preview = null;
       _error = null;
     });
   }
@@ -1033,6 +1329,9 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
       return;
     }
 
+    _previewRequest?.cancel();
+    final request = TorrentPreviewRequest();
+    _previewRequest = request;
     final requestId = ++_previewRequestId;
     setState(() {
       _isPreviewing = true;
@@ -1042,10 +1341,11 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
     try {
       final preview = await widget.service.previewMagnet(
         magnet,
+        request: request,
         downloadDirectory: downloadDirectory,
       );
       if (!mounted) return;
-      if (!_isCurrentPreviewRequest(requestId, magnet, downloadDirectory)) {
+      if (!_isCurrentPreviewRequest(requestId, magnet)) {
         return;
       }
       setState(() {
@@ -1053,7 +1353,7 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
       });
     } catch (error) {
       if (!mounted) return;
-      if (!_isCurrentPreviewRequest(requestId, magnet, downloadDirectory)) {
+      if (!_isCurrentPreviewRequest(requestId, magnet)) {
         return;
       }
       setState(() {
@@ -1071,11 +1371,9 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
   bool _isCurrentPreviewRequest(
     int requestId,
     String magnet,
-    String downloadDirectory,
   ) {
     return requestId == _previewRequestId &&
-        _magnetController.text.trim() == magnet &&
-        _downloadDirectory.trim() == downloadDirectory;
+        _magnetController.text.trim() == magnet;
   }
 
   void _confirm() {
@@ -1084,14 +1382,71 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
     if (_preview == null || magnet.isEmpty || downloadDirectory.isEmpty) {
       return;
     }
+    _submitted = true;
     Navigator.of(context).pop(
-      _AddMagnetDialogResult(
+      AddTorrentDialogResult(
+        preview: _preview!,
+        previewRequest: _previewRequest!,
         magnetUri: magnet,
         downloadDirectory: downloadDirectory,
         createFolderForTask: _createFolderForTask,
       ),
     );
   }
+
+  void _invalidatePreview() {
+    _previewRequest?.cancel();
+    ++_previewRequestId;
+    _previewRequest = null;
+    _preview = null;
+    _isPreviewing = false;
+    _error = null;
+  }
+
+  void _onMagnetChanged(String _) {
+    setState(_invalidatePreview);
+  }
+
+  void _onCreateFolderChanged(bool value) {
+    // Folder choice does not change metadata and must not force another lookup.
+    setState(() => _createFolderForTask = value);
+  }
+
+  AddTorrentDialogViewModel _buildViewModel() {
+    return AddTorrentDialogViewModel(
+      magnetController: _magnetController,
+      downloadDirectory: _downloadDirectory,
+      createFolderForTask: _createFolderForTask,
+      recentDirectories: List<String>.unmodifiable(_recentDirectories),
+      preview: _preview,
+      error: _error,
+      isPreviewing: _isPreviewing,
+      onMagnetChanged: _onMagnetChanged,
+      onChooseDirectory: () => unawaited(_chooseDirectory()),
+      onSelectDirectory: _selectDirectory,
+      onRemoveRecentDirectory: (directory) =>
+          unawaited(_removeRecentDirectory(directory)),
+      onCreateFolderChanged: _onCreateFolderChanged,
+      onPreview: () => unawaited(_previewMagnet()),
+      onConfirm: _confirm,
+      onCancel: () => Navigator.of(context).pop(),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final data = _buildViewModel();
+    if (AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone) {
+      return CupertinoAddTorrentView(data: data);
+    }
+    return DesktopAddTorrentView(data: data);
+  }
+}
+
+class DesktopAddTorrentView extends StatelessWidget {
+  const DesktopAddTorrentView({super.key, required this.data});
+
+  final AddTorrentDialogViewModel data;
 
   @override
   Widget build(BuildContext context) {
@@ -1107,7 +1462,7 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              '添加磁力链接',
+              AddTorrentDialogViewModel.title,
               locale: const Locale("zh-Hans", "zh"),
               style: TextStyle(
                 color: colorScheme.onSurface,
@@ -1155,10 +1510,10 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
             const SizedBox(height: 16),
             Row(
               children: [
-                if (_error != null)
+                if (data.error != null)
                   Expanded(
                     child: Text(
-                      _error!,
+                      data.error!,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
@@ -1172,18 +1527,17 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
                 const SizedBox(width: 12),
                 HoverScaleTextButton(
                   text: '取消',
-                  onPressed:
-                      _isPreviewing ? null : () => Navigator.of(context).pop(),
+                  onPressed: data.onCancel,
                   idleColor: colorScheme.onSurface.withValues(alpha: 0.62),
                 ),
                 const SizedBox(width: 8),
                 HoverScaleTextButton(
-                  onPressed: _isPreviewing ? null : _previewMagnet,
+                  onPressed: data.isPreviewing ? null : data.onPreview,
                   idleColor: colorScheme.onSurface.withValues(alpha: 0.78),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      if (_isPreviewing)
+                      if (data.isPreviewing)
                         const SizedBox(
                           width: 14,
                           height: 14,
@@ -1192,14 +1546,13 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
                       else
                         const Icon(Ionicons.search_outline, size: 16),
                       const SizedBox(width: 5),
-                      Text(_preview == null ? '预览' : '重新预览'),
+                      Text(data.previewLabel),
                     ],
                   ),
                 ),
                 const SizedBox(width: 8),
                 HoverScaleTextButton(
-                  onPressed:
-                      _preview == null || _isPreviewing ? null : _confirm,
+                  onPressed: data.canConfirm ? data.onConfirm : null,
                   idleColor: colorScheme.onSurface.withValues(alpha: 0.88),
                   hoverColor: AppAccentColors.current,
                   child: const Row(
@@ -1220,37 +1573,30 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
   }
 
   Widget _buildDialogSettings(ColorScheme colorScheme) {
-    final secondaryColor = colorScheme.onSurface.withOpacity(0.55);
+    final secondaryColor = colorScheme.onSurface.withValues(alpha: 0.55);
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _DialogFieldLabel('磁力链接'),
+          const _DialogFieldLabel(AddTorrentDialogViewModel.magnetLabel),
           const SizedBox(height: 8),
           Container(
             decoration: BoxDecoration(
-              color: colorScheme.onSurface.withOpacity(0.05),
+              color: colorScheme.onSurface.withValues(alpha: 0.05),
               borderRadius: BorderRadius.circular(8),
-              border:
-                  Border.all(color: colorScheme.onSurface.withOpacity(0.12)),
+              border: Border.all(
+                  color: colorScheme.onSurface.withValues(alpha: 0.12)),
             ),
             child: TextField(
-              controller: _magnetController,
+              controller: data.magnetController,
               minLines: 3,
               maxLines: 5,
-              onChanged: (_) {
-                if (_preview != null || _error != null) {
-                  setState(() {
-                    _preview = null;
-                    _error = null;
-                  });
-                }
-              },
-              onSubmitted: (_) => _previewMagnet(),
+              onChanged: data.onMagnetChanged,
+              onSubmitted: (_) => data.onPreview(),
               style: TextStyle(color: colorScheme.onSurface, fontSize: 13),
               cursorColor: AppAccentColors.current,
               decoration: InputDecoration(
-                hintText: 'magnet:?xt=urn:btih:...',
+                hintText: AddTorrentDialogViewModel.magnetPlaceholder,
                 hintStyle: TextStyle(color: secondaryColor),
                 border: InputBorder.none,
                 enabledBorder: InputBorder.none,
@@ -1260,25 +1606,27 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
             ),
           ),
           const SizedBox(height: 18),
-          _DialogFieldLabel('保存到'),
+          const _DialogFieldLabel(AddTorrentDialogViewModel.directoryLabel),
           const SizedBox(height: 8),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             decoration: BoxDecoration(
-              color: colorScheme.onSurface.withOpacity(0.05),
+              color: colorScheme.onSurface.withValues(alpha: 0.05),
               borderRadius: BorderRadius.circular(8),
-              border:
-                  Border.all(color: colorScheme.onSurface.withOpacity(0.12)),
+              border: Border.all(
+                  color: colorScheme.onSurface.withValues(alpha: 0.12)),
             ),
             child: Row(
               children: [
                 Expanded(
                   child: Text(
-                    _downloadDirectory.isEmpty ? '请选择下载位置' : _downloadDirectory,
+                    data.downloadDirectory.isEmpty
+                        ? '请选择下载位置'
+                        : data.downloadDirectory,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                      color: _downloadDirectory.isEmpty
+                      color: data.downloadDirectory.isEmpty
                           ? secondaryColor
                           : colorScheme.onSurface,
                       fontSize: 13,
@@ -1289,7 +1637,7 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
                 Tooltip(
                   message: '选择下载位置',
                   child: HoverScaleTextButton(
-                    onPressed: _chooseDirectory,
+                    onPressed: data.onChooseDirectory,
                     padding: const EdgeInsets.all(6),
                     child: const Icon(Ionicons.folder_open_outline, size: 20),
                   ),
@@ -1297,7 +1645,7 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
               ],
             ),
           ),
-          if (_recentDirectories.isNotEmpty) ...[
+          if (data.recentDirectories.isNotEmpty) ...[
             const SizedBox(height: 14),
             _buildQuickSelect(colorScheme),
           ],
@@ -1306,7 +1654,7 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
             children: [
               Expanded(
                 child: Text(
-                  '为任务创建独立文件夹',
+                  AddTorrentDialogViewModel.createFolderLabel,
                   locale: const Locale("zh-Hans", "zh"),
                   style: TextStyle(
                     color: colorScheme.onSurface,
@@ -1315,24 +1663,21 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
                 ),
               ),
               FluentSettingsSwitch(
-                value: _createFolderForTask,
-                onChanged: (value) {
-                  setState(() {
-                    _createFolderForTask = value;
-                  });
-                },
+                value: data.createFolderForTask,
+                onChanged: data.onCreateFolderChanged,
               ),
             ],
           ),
           const SizedBox(height: 8),
-          if (_preview != null) _buildPreviewSummary(colorScheme, _preview!),
+          if (data.preview != null)
+            _buildPreviewSummary(colorScheme, data.preview!),
         ],
       ),
     );
   }
 
   Widget _buildQuickSelect(ColorScheme colorScheme) {
-    final secondaryColor = colorScheme.onSurface.withOpacity(0.55);
+    final secondaryColor = colorScheme.onSurface.withValues(alpha: 0.55);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1340,19 +1685,22 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
         const SizedBox(height: 8),
         Container(
           decoration: BoxDecoration(
-            color: colorScheme.onSurface.withOpacity(0.04),
+            color: colorScheme.onSurface.withValues(alpha: 0.04),
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: colorScheme.onSurface.withOpacity(0.10)),
+            border: Border.all(
+                color: colorScheme.onSurface.withValues(alpha: 0.10)),
           ),
           child: Column(
             children: [
-              for (var index = 0; index < _recentDirectories.length; index++)
+              for (var index = 0;
+                  index < data.recentDirectories.length;
+                  index++)
                 Column(
                   children: [
                     if (index > 0)
                       Divider(
                         height: 1,
-                        color: colorScheme.onSurface.withOpacity(0.08),
+                        color: colorScheme.onSurface.withValues(alpha: 0.08),
                       ),
                     Padding(
                       padding: const EdgeInsets.only(left: 10, right: 4),
@@ -1360,19 +1708,21 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
                         children: [
                           Expanded(
                             child: HoverScaleTextButton(
-                              onPressed: () =>
-                                  _selectDirectory(_recentDirectories[index]),
+                              onPressed: () => data.onSelectDirectory(
+                                data.recentDirectories[index],
+                              ),
                               padding: const EdgeInsets.symmetric(vertical: 9),
                               hoverScale: 1.0,
-                              idleColor: _downloadDirectory ==
-                                      _recentDirectories[index]
+                              idleColor: data.downloadDirectory ==
+                                      data.recentDirectories[index]
                                   ? AppAccentColors.current
-                                  : colorScheme.onSurface.withOpacity(0.72),
+                                  : colorScheme.onSurface
+                                      .withValues(alpha: 0.72),
                               child: Row(
                                 children: [
                                   Icon(
-                                    _downloadDirectory ==
-                                            _recentDirectories[index]
+                                    data.downloadDirectory ==
+                                            data.recentDirectories[index]
                                         ? Ionicons.checkmark_circle_outline
                                         : Ionicons.folder_open_outline,
                                     size: 16,
@@ -1380,7 +1730,7 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
                                   const SizedBox(width: 8),
                                   Expanded(
                                     child: Text(
-                                      _recentDirectories[index],
+                                      data.recentDirectories[index],
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,
                                       style: const TextStyle(fontSize: 12),
@@ -1393,8 +1743,8 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
                           Tooltip(
                             message: '从快速选择移除',
                             child: HoverScaleTextButton(
-                              onPressed: () => _removeRecentDirectory(
-                                _recentDirectories[index],
+                              onPressed: () => data.onRemoveRecentDirectory(
+                                data.recentDirectories[index],
                               ),
                               padding: const EdgeInsets.all(7),
                               idleColor: secondaryColor,
@@ -1420,14 +1770,15 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
     ColorScheme colorScheme,
     TorrentMagnetPreview preview,
   ) {
-    final secondaryColor = colorScheme.onSurface.withOpacity(0.55);
+    final secondaryColor = colorScheme.onSurface.withValues(alpha: 0.55);
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: colorScheme.onSurface.withOpacity(0.04),
+        color: colorScheme.onSurface.withValues(alpha: 0.04),
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: colorScheme.onSurface.withOpacity(0.10)),
+        border:
+            Border.all(color: colorScheme.onSurface.withValues(alpha: 0.10)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1461,8 +1812,8 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
   }
 
   Widget _buildPreviewPane(ColorScheme colorScheme) {
-    final preview = _preview;
-    if (_isPreviewing) {
+    final preview = data.preview;
+    if (data.isPreviewing) {
       return Center(
         child: CircularProgressIndicator(color: AppAccentColors.current),
       );
@@ -1470,14 +1821,15 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
     if (preview == null) {
       return Container(
         decoration: BoxDecoration(
-          border: Border.all(color: colorScheme.onSurface.withOpacity(0.10)),
+          border:
+              Border.all(color: colorScheme.onSurface.withValues(alpha: 0.10)),
           borderRadius: BorderRadius.circular(8),
         ),
         child: Center(
           child: Text(
             '输入 magnet 链接后预览文件',
             style: TextStyle(
-              color: colorScheme.onSurface.withOpacity(0.55),
+              color: colorScheme.onSurface.withValues(alpha: 0.55),
               fontSize: 13,
             ),
           ),
@@ -1487,7 +1839,8 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
 
     return Container(
       decoration: BoxDecoration(
-        border: Border.all(color: colorScheme.onSurface.withOpacity(0.10)),
+        border:
+            Border.all(color: colorScheme.onSurface.withValues(alpha: 0.10)),
         borderRadius: BorderRadius.circular(8),
       ),
       child: Column(
@@ -1496,7 +1849,7 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
             height: 36,
             padding: const EdgeInsets.symmetric(horizontal: 12),
             decoration: BoxDecoration(
-              color: colorScheme.onSurface.withOpacity(0.05),
+              color: colorScheme.onSurface.withValues(alpha: 0.05),
               borderRadius:
                   const BorderRadius.vertical(top: Radius.circular(8)),
             ),
@@ -1506,7 +1859,7 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
                   child: Text(
                     '名称',
                     style: TextStyle(
-                      color: colorScheme.onSurface.withOpacity(0.7),
+                      color: colorScheme.onSurface.withValues(alpha: 0.7),
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
                     ),
@@ -1519,7 +1872,7 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
                     '大小',
                     textAlign: TextAlign.right,
                     style: TextStyle(
-                      color: colorScheme.onSurface.withOpacity(0.7),
+                      color: colorScheme.onSurface.withValues(alpha: 0.7),
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
                     ),
@@ -1533,7 +1886,7 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
               itemCount: preview.files.length,
               separatorBuilder: (_, __) => Divider(
                 height: 1,
-                color: colorScheme.onSurface.withOpacity(0.08),
+                color: colorScheme.onSurface.withValues(alpha: 0.08),
               ),
               itemBuilder: (context, index) {
                 final file = preview.files[index];
@@ -1562,7 +1915,8 @@ class _AddMagnetDialogState extends State<_AddMagnetDialog> {
                           _TorrentTaskCard.formatBytes(file.length),
                           textAlign: TextAlign.right,
                           style: TextStyle(
-                            color: colorScheme.onSurface.withOpacity(0.55),
+                            color:
+                                colorScheme.onSurface.withValues(alpha: 0.55),
                             fontSize: 12,
                           ),
                         ),
@@ -1590,7 +1944,7 @@ class _DialogFieldLabel extends StatelessWidget {
       text,
       locale: const Locale("zh-Hans", "zh"),
       style: TextStyle(
-        color: Theme.of(context).colorScheme.onSurface.withOpacity(0.75),
+        color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.75),
         fontSize: 13,
         fontWeight: FontWeight.w600,
       ),
@@ -1615,11 +1969,11 @@ class _TorrentTaskCard extends StatelessWidget {
   final TorrentTaskScanSummary? scanSummary;
   final bool isAutoScanning;
   final bool isAutoScanned;
-  final VoidCallback onPlay;
-  final VoidCallback onToggle;
+  final VoidCallback? onPlay;
+  final VoidCallback? onToggle;
   final VoidCallback onOpenFolder;
-  final VoidCallback onForget;
-  final VoidCallback onDelete;
+  final VoidCallback? onForget;
+  final VoidCallback? onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -1662,7 +2016,7 @@ class _TorrentTaskCard extends StatelessWidget {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
-                          color: onSurface.withOpacity(0.55),
+                          color: onSurface.withValues(alpha: 0.55),
                           fontSize: 12,
                         ),
                       ),
@@ -1670,7 +2024,7 @@ class _TorrentTaskCard extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: 8),
-                _StateBadge(task: task),
+                _TorrentStateText(task: task),
               ],
             ),
             const SizedBox(height: 14),
@@ -1681,7 +2035,7 @@ class _TorrentTaskCard extends StatelessWidget {
                 minHeight: 6,
                 color:
                     task.hasError ? colorScheme.error : AppAccentColors.current,
-                backgroundColor: onSurface.withOpacity(0.10),
+                backgroundColor: onSurface.withValues(alpha: 0.10),
               ),
             ),
             const SizedBox(height: 10),
@@ -1725,18 +2079,18 @@ class _TorrentTaskCard extends StatelessWidget {
               spacing: 8,
               runSpacing: 4,
               children: [
-                if (task.finished)
+                if (task.canPlay)
                   _TorrentHoverAction(
                     icon: Ionicons.play_circle_outline,
                     label: '播放',
                     onPressed: onPlay,
                   ),
-                if (!task.finished) ...[
+                ...[
                   _TorrentHoverAction(
-                    icon: task.isPaused
+                    icon: task.canResume
                         ? Ionicons.play_outline
                         : Ionicons.pause_outline,
-                    label: task.isPaused ? '继续' : '暂停',
+                    label: task.toggleLabel,
                     onPressed: onToggle,
                   ),
                 ],
@@ -1802,11 +2156,11 @@ class _TorrentTaskListItem extends StatelessWidget {
   final TorrentTaskScanSummary? scanSummary;
   final bool isAutoScanning;
   final bool isAutoScanned;
-  final VoidCallback onPlay;
-  final VoidCallback onToggle;
+  final VoidCallback? onPlay;
+  final VoidCallback? onToggle;
   final VoidCallback onOpenFolder;
-  final VoidCallback onForget;
-  final VoidCallback onDelete;
+  final VoidCallback? onForget;
+  final VoidCallback? onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -1862,7 +2216,7 @@ class _TorrentTaskListItem extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(width: 10),
-                    _StateBadge(task: task),
+                    _TorrentStateText(task: task),
                     if (!compact) ...[
                       const SizedBox(width: 8),
                       Row(
@@ -1946,7 +2300,7 @@ class _TorrentTaskListItem extends StatelessWidget {
 
   List<Widget> _buildActions() {
     return [
-      if (task.finished)
+      if (task.canPlay)
         _TorrentHoverAction(
           icon: Ionicons.play_circle_outline,
           tooltip: '播放',
@@ -1954,14 +2308,13 @@ class _TorrentTaskListItem extends StatelessWidget {
           padding: const EdgeInsets.all(8),
           iconSize: 18,
         ),
-      if (!task.finished)
-        _TorrentHoverAction(
-          icon: task.isPaused ? Ionicons.play_outline : Ionicons.pause_outline,
-          tooltip: task.isPaused ? '继续' : '暂停',
-          onPressed: onToggle,
-          padding: const EdgeInsets.all(8),
-          iconSize: 18,
-        ),
+      _TorrentHoverAction(
+        icon: task.canResume ? Ionicons.play_outline : Ionicons.pause_outline,
+        tooltip: task.toggleLabel,
+        onPressed: onToggle,
+        padding: const EdgeInsets.all(8),
+        iconSize: 18,
+      ),
       _TorrentHoverAction(
         icon: Ionicons.folder_open_outline,
         tooltip: '打开文件夹',
@@ -2018,8 +2371,8 @@ class _TorrentTaskScanText extends StatelessWidget {
   }
 }
 
-class _StateBadge extends StatelessWidget {
-  const _StateBadge({required this.task});
+class _TorrentStateText extends StatelessWidget {
+  const _TorrentStateText({required this.task});
 
   final TorrentTask task;
 
@@ -2031,22 +2384,369 @@ class _StateBadge extends StatelessWidget {
         : task.finished
             ? Colors.green
             : task.isPaused
-                ? colorScheme.onSurface.withOpacity(0.55)
+                ? colorScheme.onSurface.withValues(alpha: 0.55)
                 : AppAccentColors.current;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.12),
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: color.withOpacity(0.35), width: 0.5),
+    return Text(
+      task.displayState,
+      style: TextStyle(
+        color: color,
+        fontSize: 12,
+        fontWeight: FontWeight.bold,
+      ),
+    );
+  }
+}
+
+class _LargeScreenTorrentTaskCard extends StatelessWidget {
+  const _LargeScreenTorrentTaskCard({
+    required this.task,
+    required this.scanSummary,
+    required this.isAutoScanning,
+    required this.isAutoScanned,
+    required this.onPrimary,
+    required this.onPlay,
+    required this.onToggle,
+    required this.onOpenFolder,
+    required this.onForget,
+    required this.onDelete,
+    this.autofocus = false,
+    this.compact = false,
+  });
+
+  final TorrentTask task;
+  final TorrentTaskScanSummary? scanSummary;
+  final bool isAutoScanning;
+  final bool isAutoScanned;
+  final VoidCallback? onPrimary;
+  final VoidCallback? onPlay;
+  final VoidCallback? onToggle;
+  final VoidCallback onOpenFolder;
+  final VoidCallback? onForget;
+  final VoidCallback? onDelete;
+  final bool autofocus;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    final textColor = Theme.of(context).brightness == Brightness.dark
+        ? Colors.white
+        : const Color(0xFF161922);
+    final mutedColor = textColor.withValues(alpha: 0.62);
+    final accent = AppAccentColors.current;
+    final progress = task.progress;
+    final heightBudget = compact ? null : const Spacer();
+
+    return NipaplayLargeScreenFocusableAction(
+      autofocus: autofocus,
+      onActivate: onPrimary,
+      borderRadius: BorderRadius.circular(8),
+      focusScale: 1.025,
+      padding: EdgeInsets.all(compact ? 16 : 18),
+      style: NipaplayLargeScreenFocusableStyle(
+        idleBackgroundDark: Colors.white.withValues(alpha: 0.08),
+        idleBackgroundLight: Colors.white.withValues(alpha: 0.78),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: compact ? MainAxisSize.min : MainAxisSize.max,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(
+                task.finished
+                    ? Icons.download_done_rounded
+                    : Ionicons.cloud_download_outline,
+                color: task.hasError ? Colors.redAccent : accent,
+                size: compact ? 28 : 34,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      task.name,
+                      maxLines: compact ? 1 : 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: textColor,
+                        fontSize: compact ? 16 : 18,
+                        fontWeight: FontWeight.w900,
+                        height: 1.12,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      task.outputFolder,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: mutedColor,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 10),
+              _LargeScreenTorrentStateText(task: task),
+            ],
+          ),
+          SizedBox(height: compact ? 12 : 16),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(99),
+            child: LinearProgressIndicator(
+              value: progress,
+              minHeight: compact ? 5 : 7,
+              color: task.hasError ? Colors.redAccent : accent,
+              backgroundColor: textColor.withValues(alpha: 0.14),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 14,
+            runSpacing: 6,
+            children: [
+              _LargeScreenTorrentMetric(
+                label: '进度',
+                value: _TorrentTaskCard._formatPercent(progress),
+              ),
+              _LargeScreenTorrentMetric(
+                label: '已下载',
+                value:
+                    '${_TorrentTaskCard.formatBytes(task.progressBytes)} / ${_TorrentTaskCard.formatBytes(task.totalBytes)}',
+              ),
+              _LargeScreenTorrentMetric(
+                label: '下载',
+                value:
+                    '${_TorrentTaskCard.formatBytes(task.downloadSpeedBytesPerSecond)}/s',
+              ),
+              _LargeScreenTorrentMetric(
+                label: '上传',
+                value:
+                    '${_TorrentTaskCard.formatBytes(task.uploadSpeedBytesPerSecond)}/s',
+              ),
+            ],
+          ),
+          if (task.error?.isNotEmpty ?? false) ...[
+            const SizedBox(height: 8),
+            Text(
+              task.error!,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.redAccent,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+          if (isAutoScanning || scanSummary != null || isAutoScanned) ...[
+            const SizedBox(height: 8),
+            _TorrentTaskScanText(
+              summary: scanSummary,
+              isScanning: isAutoScanning,
+              isScanned: isAutoScanned,
+            ),
+          ],
+          if (heightBudget != null) heightBudget,
+          if (!compact) const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              if (task.canPlay)
+                NipaplayLargeScreenActionButton(
+                  icon: Ionicons.play_circle_outline,
+                  label: '播放',
+                  compact: true,
+                  onPressed: onPlay,
+                ),
+              NipaplayLargeScreenActionButton(
+                icon: task.canResume
+                    ? Ionicons.play_outline
+                    : Ionicons.pause_outline,
+                label: task.toggleLabel,
+                compact: true,
+                onPressed: onToggle,
+              ),
+              _TorrentHoverAction(
+                iconSize: 22,
+                padding: const EdgeInsets.all(12),
+                icon: Ionicons.folder_open_outline,
+                tooltip: '打开文件夹',
+                onPressed: onOpenFolder,
+              ),
+              _TorrentHoverAction(
+                iconSize: 22,
+                padding: const EdgeInsets.all(12),
+                icon: Ionicons.remove_circle_outline,
+                tooltip: '移除任务',
+                onPressed: onForget,
+              ),
+              _TorrentHoverAction(
+                iconSize: 22,
+                padding: const EdgeInsets.all(12),
+                icon: Ionicons.trash_outline,
+                tooltip: '删除任务和文件',
+                onPressed: onDelete,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _LargeScreenTorrentStateText extends StatelessWidget {
+  const _LargeScreenTorrentStateText({required this.task});
+
+  final TorrentTask task;
+
+  @override
+  Widget build(BuildContext context) {
+    final Color color = task.hasError
+        ? Colors.redAccent
+        : task.finished
+            ? Colors.greenAccent
+            : task.isPaused
+                ? Colors.orangeAccent
+                : AppAccentColors.current;
+    return Text(
+      task.displayState,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: TextStyle(
+        color: color,
+        fontSize: 12,
+        fontWeight: FontWeight.w900,
+      ),
+    );
+  }
+}
+
+class _LargeScreenTorrentMetric extends StatelessWidget {
+  const _LargeScreenTorrentMetric({
+    required this.label,
+    required this.value,
+  });
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final textColor = Theme.of(context).brightness == Brightness.dark
+        ? Colors.white
+        : const Color(0xFF161922);
+    return RichText(
+      text: TextSpan(
+        children: [
+          TextSpan(
+            text: '$label ',
+            style: TextStyle(
+              color: textColor.withValues(alpha: 0.52),
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          TextSpan(
+            text: value,
+            style: TextStyle(
+              color: textColor.withValues(alpha: 0.88),
+              fontSize: 12,
+              fontWeight: FontWeight.w900,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _LargeScreenTorrentSortButton extends StatelessWidget {
+  const _LargeScreenTorrentSortButton({
+    required this.label,
+    required this.selected,
+    required this.onPressed,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return NipaplayLargeScreenFocusableAction(
+      onActivate: selected ? null : onPressed,
+      borderRadius: BorderRadius.circular(8),
+      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 12),
+      style: NipaplayLargeScreenFocusableStyle(
+        idleBackgroundDark: selected
+            ? AppAccentColors.current.withValues(alpha: 0.24)
+            : Colors.white.withValues(alpha: 0.08),
+        idleBackgroundLight: selected
+            ? AppAccentColors.current.withValues(alpha: 0.18)
+            : Colors.white.withValues(alpha: 0.78),
+        contentColorDark: Colors.white,
+        contentColorLight: const Color(0xFF161922),
       ),
       child: Text(
-        task.displayState,
-        style: TextStyle(
-          color: color,
-          fontSize: 12,
-          fontWeight: FontWeight.bold,
+        label,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(
+          fontSize: 13,
+          fontWeight: FontWeight.w900,
         ),
+      ),
+    );
+  }
+}
+
+class _LargeScreenTorrentStat extends StatelessWidget {
+  const _LargeScreenTorrentStat({
+    required this.label,
+    required this.value,
+  });
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final textColor = Theme.of(context).brightness == Brightness.dark
+        ? Colors.white
+        : const Color(0xFF161922);
+    return NipaplayLargeScreenPanel(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              color: textColor.withValues(alpha: 0.58),
+              fontSize: 11,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: textColor,
+              fontSize: 17,
+              fontWeight: FontWeight.w900,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -2075,13 +2775,13 @@ class _MetricText extends StatelessWidget {
           TextSpan(
             text: '$label ',
             style: baseStyle.copyWith(
-              color: colorScheme.onSurface.withOpacity(0.50),
+              color: colorScheme.onSurface.withValues(alpha: 0.50),
             ),
           ),
           TextSpan(
             text: value,
             style: baseStyle.copyWith(
-              color: colorScheme.onSurface.withOpacity(0.82),
+              color: colorScheme.onSurface.withValues(alpha: 0.82),
             ),
           ),
         ],

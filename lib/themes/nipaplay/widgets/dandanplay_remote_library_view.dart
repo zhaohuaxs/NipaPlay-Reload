@@ -1,4 +1,6 @@
+import 'package:nipaplay/models/media_library_scope.dart';
 import 'dart:async';
+import 'package:flutter/cupertino.dart' as cupertino;
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:kmbal_ionicons/kmbal_ionicons.dart';
@@ -11,12 +13,19 @@ import 'package:nipaplay/models/shared_remote_library.dart';
 import 'package:nipaplay/providers/dandanplay_remote_provider.dart';
 import 'package:nipaplay/providers/appearance_settings_provider.dart';
 import 'package:nipaplay/services/bangumi_service.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/cached_network_image_widget.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/horizontal_anime_card.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_snackbar.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/themed_anime_detail.dart';
-import 'package:nipaplay/themes/nipaplay/widgets/local_library_control_bar.dart';
-import 'package:nipaplay/themes/nipaplay/widgets/search_bar_action_button.dart';
-import 'package:nipaplay/utils/app_accent_color.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_focusable_action.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_mode_scope.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_page_scaffold.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_dandanplay_connection_dialog.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_media_search_toolbar.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/blur_login_dialog.dart';
 
 class DandanplayRemoteLibraryView extends StatefulWidget {
   const DandanplayRemoteLibraryView({
@@ -33,7 +42,6 @@ class DandanplayRemoteLibraryView extends StatefulWidget {
 
 class _DandanplayRemoteLibraryViewState
     extends State<DandanplayRemoteLibraryView> {
-  static Color get _accentColor => AppAccentColors.current;
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
   String _searchQuery = '';
@@ -63,11 +71,14 @@ class _DandanplayRemoteLibraryViewState
   Widget build(BuildContext context) {
     return Consumer<DandanplayRemoteProvider>(
       builder: (context, provider, child) {
+        final isLargeScreen = NipaplayLargeScreenModeScope.isActiveOf(context);
         if (!provider.isInitialized && provider.isLoading) {
-          return Center(
-              child: CircularProgressIndicator(color: _accentColor));
+          return const Center(child: AdaptiveMediaActivityIndicator());
         }
         if (!provider.isConnected) {
+          if (isLargeScreen) {
+            return _buildLargeScreenDisconnectedState(provider);
+          }
           return _buildDisconnectedState(provider);
         }
 
@@ -75,13 +86,20 @@ class _DandanplayRemoteLibraryViewState
             _filterGroups(provider.animeGroups);
 
         if (provider.animeGroups.isEmpty && !provider.isLoading) {
+          if (isLargeScreen) {
+            return _buildLargeScreenEmptyState(provider);
+          }
           return _buildEmptyState(provider);
+        }
+
+        if (isLargeScreen) {
+          return _buildLargeScreenRemoteLibrary(groups, provider);
         }
 
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _buildToolbar(),
+            _buildToolbar(provider),
             if ((provider.errorMessage?.isNotEmpty ?? false) &&
                 !provider.isLoading) ...[
               SizedBox(height: 12),
@@ -97,7 +115,361 @@ class _DandanplayRemoteLibraryViewState
     );
   }
 
-  Widget _buildToolbar() {
+  Widget _buildLargeScreenRemoteLibrary(
+    List<DandanplayRemoteAnimeGroup> groups,
+    DandanplayRemoteProvider provider,
+  ) {
+    return Column(
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: NipaplayLargeScreenTextInput(
+                controller: _searchController,
+                hintText: '搜索弹弹play远程媒体',
+                onChanged: _updateSearchQueryDebounced,
+                onSubmitted: _commitSearchQuery,
+                suffix: _searchQuery.isEmpty
+                    ? null
+                    : AdaptiveMediaIconButton(
+                        tooltip: '清空搜索',
+                        onPressed: _clearSearchQuery,
+                        desktopIcon: Icons.close_rounded,
+                        phoneIcon: cupertino.CupertinoIcons.clear,
+                      ),
+              ),
+            ),
+            const SizedBox(width: 14),
+            NipaplayLargeScreenActionButton(
+              icon: Icons.refresh_rounded,
+              label: provider.isLoading ? '刷新中' : '刷新',
+              onPressed: provider.isLoading
+                  ? null
+                  : () async {
+                      try {
+                        await provider.refresh();
+                      } catch (e) {
+                        if (mounted) {
+                          BlurSnackBar.show(context, '刷新失败: $e');
+                        }
+                      }
+                    },
+            ),
+            const SizedBox(width: 10),
+            NipaplayLargeScreenActionButton(
+              icon: Ionicons.link_outline,
+              label: '连接',
+              onPressed: () => _showConnectDialog(context, provider),
+            ),
+          ],
+        ),
+        if ((provider.errorMessage?.isNotEmpty ?? false) &&
+            !provider.isLoading) ...[
+          const SizedBox(height: 14),
+          _buildLargeScreenDandanErrorBanner(provider.errorMessage!),
+        ],
+        const SizedBox(height: 18),
+        Expanded(
+          child: provider.isLoading && groups.isEmpty
+              ? const Center(child: AdaptiveMediaActivityIndicator())
+              : groups.isEmpty
+                  ? const NipaplayLargeScreenEmptyState(
+                      icon: Icons.search_off_rounded,
+                      title: '没有匹配结果',
+                      subtitle: '换个关键词再试试',
+                    )
+                  : GridView.builder(
+                      controller: _gridScrollController,
+                      padding: const EdgeInsets.only(bottom: 96),
+                      physics: const AlwaysScrollableScrollPhysics(
+                        parent: BouncingScrollPhysics(),
+                      ),
+                      gridDelegate:
+                          const SliverGridDelegateWithMaxCrossAxisExtent(
+                        maxCrossAxisExtent: 244,
+                        mainAxisExtent: 468,
+                        crossAxisSpacing: 18,
+                        mainAxisSpacing: 18,
+                      ),
+                      itemCount: groups.length,
+                      itemBuilder: (context, index) {
+                        return _buildLargeScreenAnimeCard(
+                          groups[index],
+                          provider,
+                          autofocus: index == 0,
+                        );
+                      },
+                    ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLargeScreenAnimeCard(
+    DandanplayRemoteAnimeGroup group,
+    DandanplayRemoteProvider provider, {
+    required bool autofocus,
+  }) {
+    final coverUrl = _resolveCoverUrlForGroup(group, provider);
+    final textColor = Theme.of(context).brightness == Brightness.dark
+        ? Colors.white
+        : const Color(0xFF151820);
+
+    return NipaplayLargeScreenFocusableAction(
+      autofocus: autofocus,
+      onActivate: () => _openAnimeDetail(group, provider),
+      borderRadius: BorderRadius.circular(8),
+      padding: EdgeInsets.zero,
+      focusScale: 1,
+      style: NipaplayLargeScreenFocusableStyle(
+        idleBackgroundDark: Colors.white.withValues(alpha: 0.07),
+        idleBackgroundLight: Colors.white.withValues(alpha: 0.82),
+        focusStrokeWidth: 2.4,
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            AspectRatio(
+              aspectRatio: 2 / 3,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  CachedNetworkImageWidget(
+                    imageUrl: coverUrl,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __) =>
+                        _buildLargeScreenDandanFallbackPoster(textColor),
+                  ),
+                  Positioned.fill(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [
+                            Colors.transparent,
+                            Colors.black.withValues(alpha: 0.74),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  Positioned(
+                    left: 10,
+                    top: 10,
+                    child: _buildLargeScreenDandanBadge('弹弹play'),
+                  ),
+                  Positioned(
+                    right: 10,
+                    bottom: 10,
+                    child: _buildLargeScreenDandanBadge(
+                      '${group.episodeCount} 集',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    group.title,
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: textColor,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w900,
+                      height: 1.15,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _formatLargeScreenDandanSubtitle(group),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: textColor.withValues(alpha: 0.52),
+                      fontSize: 12,
+                      height: 1.26,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenDisconnectedState(
+    DandanplayRemoteProvider provider,
+  ) {
+    return NipaplayLargeScreenEmptyState(
+      icon: Ionicons.cloud_offline_outline,
+      title: '尚未连接弹弹play远程服务',
+      subtitle: '连接后可以在大屏模式中浏览家中弹弹play媒体库',
+      action: NipaplayLargeScreenActionButton(
+        icon: Ionicons.link_outline,
+        label: '连接弹弹play',
+        onPressed: () => _showConnectDialog(context, provider),
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenEmptyState(DandanplayRemoteProvider provider) {
+    return NipaplayLargeScreenEmptyState(
+      icon: Ionicons.tv_outline,
+      title: '远程媒体库为空',
+      subtitle: '请确认弹弹play远程访问已同步媒体，稍候片刻后刷新列表',
+      action: NipaplayLargeScreenActionButton(
+        icon: Icons.refresh_rounded,
+        label: '刷新',
+        onPressed: provider.isLoading
+            ? null
+            : () async {
+                try {
+                  await provider.refresh();
+                } catch (e) {
+                  if (mounted) {
+                    BlurSnackBar.show(context, '刷新失败: $e');
+                  }
+                }
+              },
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenDandanErrorBanner(String message) {
+    return NipaplayLargeScreenPanel(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      child: Row(
+        children: [
+          const Icon(Ionicons.warning_outline,
+              color: Colors.redAccent, size: 22),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              message,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.redAccent,
+                fontSize: 13,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenDandanFallbackPoster(Color textColor) {
+    return Container(
+      color: Colors.white.withValues(alpha: 0.08),
+      child: Center(
+        child: Icon(
+          Icons.movie_creation_outlined,
+          color: textColor.withValues(alpha: 0.46),
+          size: 52,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenDandanBadge(String label) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.58),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+        child: Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 11,
+            fontWeight: FontWeight.w900,
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _formatLargeScreenDandanSubtitle(DandanplayRemoteAnimeGroup group) {
+    final latest = group.latestPlayTime;
+    if (latest == null) {
+      return '共 ${group.episodeCount} 集';
+    }
+    return '共 ${group.episodeCount} 集 · 最近播放 ${latest.year}-${latest.month.toString().padLeft(2, '0')}-${latest.day.toString().padLeft(2, '0')}';
+  }
+
+  void _updateSearchQueryDebounced(String value) {
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 300), () {
+      if (!mounted) return;
+      setState(() {
+        _searchQuery = value.trim();
+      });
+    });
+  }
+
+  void _commitSearchQuery(String value) {
+    _searchDebounce?.cancel();
+    setState(() {
+      _searchQuery = value.trim();
+    });
+  }
+
+  void _clearSearchQuery() {
+    _searchDebounce?.cancel();
+    setState(() {
+      _searchQuery = '';
+      _searchController.clear();
+    });
+  }
+
+  Widget _buildToolbar(DandanplayRemoteProvider provider) {
+    if (AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone) {
+      return CupertinoMediaSearchToolbar(
+        controller: _searchController,
+        focusNode: _searchFocusNode,
+        placeholder: '搜索番剧或剧集…',
+        onChanged: _updateSearchQueryDebounced,
+        onSubmitted: _commitSearchQuery,
+        actions: [
+          CupertinoMediaSearchToolbarAction(
+            label: provider.isLoading ? '刷新中' : '刷新',
+            icon: cupertino.CupertinoIcons.refresh,
+            loading: provider.isLoading,
+            onPressed: provider.isLoading
+                ? null
+                : () async {
+                    try {
+                      await provider.refresh();
+                    } catch (error) {
+                      if (mounted) BlurSnackBar.show(context, '刷新失败: $error');
+                    }
+                  },
+          ),
+          CupertinoMediaSearchToolbarAction(
+            label: '连接',
+            icon: cupertino.CupertinoIcons.link,
+            onPressed: () => _showConnectDialog(context, provider),
+          ),
+        ],
+      );
+    }
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
       child: Column(
@@ -186,10 +558,8 @@ class _DandanplayRemoteLibraryViewState
     final showSummary =
         context.watch<AppearanceSettingsProvider>().showAnimeCardSummary;
     return RepaintBoundary(
-      child: Scrollbar(
+      child: AdaptiveMediaScrollbar(
         controller: _gridScrollController,
-        radius: const Radius.circular(2),
-        thickness: 4,
         child: GridView.builder(
           controller: _gridScrollController,
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 80),
@@ -217,84 +587,16 @@ class _DandanplayRemoteLibraryViewState
   }
 
   Widget _buildSearchField() {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    final primaryTextColor = isDark ? Colors.white : Colors.black;
-    final secondaryTextColor = isDark ? Colors.white70 : Colors.black54;
-    final activeColor = AppAccentColors.current;
-    final idleBorderColor = isDark
-        ? Colors.white.withValues(alpha: 0.25)
-        : Colors.black.withValues(alpha: 0.1);
-    final fieldColor =
-        isDark ? const Color(0xFF262626) : const Color(0xFFF2F2F2);
-
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
-          color: fieldColor,
-          border: Border.all(
-            color: _searchFocusNode.hasFocus ? activeColor : idleBorderColor,
-            width: _searchFocusNode.hasFocus ? 1.5 : 1,
-          ),
-        ),
-        child: Theme(
-          data: Theme.of(context).copyWith(
-            textSelectionTheme: TextSelectionThemeData(
-              selectionColor: activeColor.withValues(alpha: 0.3),
-              selectionHandleColor: activeColor,
-            ),
-          ),
-          child: TextField(
-            controller: _searchController,
-            focusNode: _searchFocusNode,
-            style: TextStyle(color: primaryTextColor, fontSize: 16),
-            cursorColor: activeColor,
-            decoration: InputDecoration(
-              prefixIcon: Icon(
-                Icons.search,
-                color: _searchFocusNode.hasFocus
-                    ? activeColor
-                    : secondaryTextColor,
-                size: 20,
-              ),
-              suffixIcon: _searchQuery.isEmpty
-                  ? null
-                  : SearchBarActionButton(
-                      icon: Icons.clear,
-                      onPressed: () {
-                        _searchDebounce?.cancel();
-                        setState(() {
-                          _searchQuery = '';
-                          _searchController.clear();
-                        });
-                      },
-                    ),
-              hintText: '搜索番剧或剧集…',
-              hintStyle:
-                  TextStyle(color: secondaryTextColor.withValues(alpha: 0.6)),
-              border: InputBorder.none,
-              contentPadding:
-                  const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            ),
-            onChanged: (value) {
-              _searchDebounce?.cancel();
-              _searchDebounce = Timer(const Duration(milliseconds: 300), () {
-                if (!mounted) return;
-                setState(() {
-                  _searchQuery = value.trim();
-                });
-              });
-            },
-            onSubmitted: (value) {
-              _searchDebounce?.cancel();
-              setState(() {
-                _searchQuery = value.trim();
-              });
-            },
-          ),
-        ),
-      ),
+    return AdaptiveMediaSearchField(
+      controller: _searchController,
+      focusNode: _searchFocusNode,
+      placeholder: '搜索番剧或剧集…',
+      onChanged: _updateSearchQueryDebounced,
+      onSubmitted: _commitSearchQuery,
+      onClear: () {
+        _searchDebounce?.cancel();
+        if (mounted) setState(() => _searchQuery = '');
+      },
     );
   }
 
@@ -586,6 +888,8 @@ class _DandanplayRemoteLibraryViewState
           summary: summary,
           episode: episode,
         ),
+        mediaLibraryScope: MediaLibraryScope(MediaLibraryScopeKind.dandanplay,
+            hostOrigin: provider.serverUrl),
         sharedSourceLabel: sourceLabel,
       );
 
@@ -604,23 +908,6 @@ class _DandanplayRemoteLibraryViewState
     final textColor = colorScheme.onSurface;
     final subTextColor = textColor.withOpacity(0.7);
     final mutedTextColor = textColor.withOpacity(0.5);
-    final accentColor = AppAccentColors.current;
-    final ButtonStyle actionButtonStyle = ButtonStyle(
-      foregroundColor: MaterialStateProperty.resolveWith((states) {
-        if (states.contains(MaterialState.disabled)) {
-          return mutedTextColor;
-        }
-        if (states.contains(MaterialState.hovered)) {
-          return accentColor;
-        }
-        return accentColor;
-      }),
-      overlayColor: MaterialStateProperty.all(Colors.transparent),
-      splashFactory: NoSplash.splashFactory,
-      padding: MaterialStateProperty.all(
-        const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-      ),
-    );
 
     return Center(
       child: Padding(
@@ -642,11 +929,12 @@ class _DandanplayRemoteLibraryViewState
               style: TextStyle(color: subTextColor, fontSize: 14),
             ),
             SizedBox(height: 20),
-            TextButton.icon(
+            AdaptiveMediaActionButton(
               onPressed: () => _showConnectDialog(context, provider),
-              style: actionButtonStyle,
-              icon: Icon(Ionicons.link_outline, size: 18),
-              label: const Text('连接弹弹play'),
+              desktopIcon: Ionicons.link_outline,
+              phoneIcon: cupertino.CupertinoIcons.link,
+              label: '连接弹弹play',
+              emphasis: AdaptiveMediaActionEmphasis.primary,
             ),
           ],
         ),
@@ -695,130 +983,54 @@ class _DandanplayRemoteLibraryViewState
     BuildContext context,
     DandanplayRemoteProvider provider,
   ) async {
-    final result = await showDialog<Map<String, String?>>(
-      context: context,
-      barrierDismissible: true,
-      builder: (dialogContext) {
-        final accentColor = AppAccentColors.current;
-        final colorScheme = Theme.of(dialogContext).colorScheme;
-        final isDark = Theme.of(dialogContext).brightness == Brightness.dark;
-        final textColor = colorScheme.onSurface;
-        final subTextColor = textColor.withOpacity(0.7);
-        final hintColor = textColor.withOpacity(0.5);
-        final borderColor = textColor.withOpacity(isDark ? 0.25 : 0.2);
-        final dialogBackground =
-            isDark ? const Color(0xFF1E1E1E) : const Color(0xFFF2F2F2);
-        final selectionTheme = TextSelectionThemeData(
-          cursorColor: accentColor,
-          selectionColor: accentColor.withOpacity(0.3),
-          selectionHandleColor: accentColor,
-        );
-        final ButtonStyle plainButtonStyle = ButtonStyle(
-          foregroundColor: MaterialStateProperty.resolveWith((states) {
-            if (states.contains(MaterialState.disabled)) {
-              return hintColor;
-            }
-            if (states.contains(MaterialState.hovered)) {
-              return accentColor;
-            }
-            return subTextColor;
-          }),
-          overlayColor: MaterialStateProperty.all(Colors.transparent),
-          splashFactory: NoSplash.splashFactory,
-          padding: MaterialStateProperty.all(
-            const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-          ),
-        );
-        final ButtonStyle accentButtonStyle = plainButtonStyle.copyWith(
-          foregroundColor: MaterialStateProperty.resolveWith((states) {
-            if (states.contains(MaterialState.disabled)) {
-              return hintColor;
-            }
-            return accentColor;
-          }),
-        );
-        final baseController =
-            TextEditingController(text: provider.serverUrl ?? '');
-        final tokenController = TextEditingController();
-        return TextSelectionTheme(
-          data: selectionTheme,
-          child: AlertDialog(
-            backgroundColor: dialogBackground,
-            title: Text(
-              '连接弹弹play远程服务',
-              style: TextStyle(color: textColor),
-            ),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: baseController,
-                  keyboardType: TextInputType.url,
-                  cursorColor: accentColor,
-                  style: TextStyle(color: textColor),
-                  decoration: InputDecoration(
-                    labelText: '服务地址',
-                    hintText: '例如 http://192.168.1.10:23333',
-                    labelStyle: TextStyle(color: subTextColor),
-                    hintStyle: TextStyle(color: hintColor),
-                    enabledBorder: UnderlineInputBorder(
-                      borderSide: BorderSide(color: borderColor),
-                    ),
-                    focusedBorder: UnderlineInputBorder(
-                      borderSide: BorderSide(color: accentColor),
-                    ),
-                  ),
-                ),
-                SizedBox(height: 12),
-                TextField(
-                  controller: tokenController,
-                  obscureText: true,
-                  cursorColor: accentColor,
-                  style: TextStyle(color: textColor),
-                  decoration: InputDecoration(
-                    labelText:
-                        provider.tokenRequired ? 'API密钥 (必填)' : 'API密钥 (可选)',
-                    labelStyle: TextStyle(color: subTextColor),
-                    hintStyle: TextStyle(color: hintColor),
-                    enabledBorder: UnderlineInputBorder(
-                      borderSide: BorderSide(color: borderColor),
-                    ),
-                    focusedBorder: UnderlineInputBorder(
-                      borderSide: BorderSide(color: accentColor),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(dialogContext).pop(),
-                style: plainButtonStyle,
-                child: const Text('取消'),
-              ),
-              TextButton(
-                onPressed: () {
-                  Navigator.of(dialogContext).pop({
-                    'base': baseController.text.trim(),
-                    'token': tokenController.text.trim(),
-                  });
-                },
-                style: accentButtonStyle,
-                child: const Text('连接'),
-              ),
-            ],
-          ),
-        );
+    if (AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone) {
+      final config = await showCupertinoDandanplayConnectionDialog(
+        context: context,
+        provider: provider,
+      );
+      if (config == null) return;
+      await _connectProvider(provider, config.baseUrl, config.apiToken);
+      return;
+    }
+
+    final connected = await BlurLoginDialog.show(
+      context,
+      title: '连接弹弹play远程服务',
+      loginButtonText: '连接',
+      fields: [
+        LoginField(
+          key: 'base',
+          label: '服务地址',
+          hint: '例如 http://192.168.1.10:23333',
+          initialValue: provider.serverUrl ?? '',
+        ),
+        LoginField(
+          key: 'token',
+          label: provider.tokenRequired ? 'API密钥 (必填)' : 'API密钥 (可选)',
+          isPassword: true,
+          required: provider.tokenRequired,
+        ),
+      ],
+      onLogin: (values) async {
+        final baseUrl = values['base']?.trim() ?? '';
+        if (baseUrl.isEmpty) {
+          return const LoginResult(success: false, message: '请输入远程服务地址');
+        }
+        try {
+          final token = values['token'];
+          await provider.connect(
+            baseUrl,
+            token: token?.isNotEmpty == true ? token : null,
+          );
+          return const LoginResult(success: true, message: '连接成功');
+        } catch (error) {
+          return LoginResult(success: false, message: '连接失败: $error');
+        }
       },
     );
-
-    if (result == null) return;
-
-    await _connectProvider(
-      provider,
-      result['base'] ?? '',
-      result['token'],
-    );
+    if (connected == true && mounted) {
+      BlurSnackBar.show(context, '弹弹play远程服务已连接');
+    }
   }
 
   Future<void> _connectProvider(

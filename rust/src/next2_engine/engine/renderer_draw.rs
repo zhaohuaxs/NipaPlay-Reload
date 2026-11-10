@@ -5,6 +5,7 @@ impl Next2Renderer {
         glyph_pipeline: &wgpu::RenderPipeline,
         screen_pipeline: &wgpu::RenderPipeline,
         target_format: wgpu::TextureFormat,
+        presentation_time: Option<std::time::Instant>,
     ) {
         // Ensure frame_texture format matches target_format so that pipeline
         // color target formats align with the attachment view format (required
@@ -29,7 +30,7 @@ impl Next2Renderer {
             let _ = self.resize(self.width, self.height);
         }
 
-        self.build_vertices();
+        self.build_vertices(presentation_time);
 
         if self.vertices.is_empty() {
             self.clear_target_view(target_view);
@@ -415,12 +416,88 @@ impl Next2Renderer {
         self.shadow_vertex_capacity_bytes = next_capacity;
     }
 
-    fn build_vertices(&mut self) {
+    /// Whether the engine loop should re-render on an idle tick to advance
+    /// scroll interpolation. True only when the scene has at least one scroll
+    /// item AND a frame was submitted within the last 50ms — so empty/static
+    /// scenes and paused/stalled playback (no recent submission) incur no
+    /// continuous GPU work. The 50ms window matches the interp_dt cap in
+    /// build_vertices, guaranteeing we stop re-rendering exactly when motion
+    /// would freeze anyway.
+    fn needs_interpolation_render(&self) -> bool {
+        if self.motion_mode == MotionMode::ContinuousAnchor {
+            // Include future/static items: their activation and expiration also
+            // need to proceed while Dart is unavailable. One last draw clears
+            // the scene when the delivered lookahead is exhausted.
+            return self.motion_clock.playing && !self.frame_items.is_empty();
+        }
+        if self.motion_mode == MotionMode::VsyncSnapshot {
+            return false;
+        }
+        // Submit-rate adaptive gate. Only fill between submissions when Dart
+        // feeds slower than our 16ms tick (~30fps submit). When Dart sustains
+        // ~1 submit/tick (ema <= 20ms, healthy 60fps), idle interp is
+        // disabled: it would double-render alongside submit-draws, and the two
+        // streams (drawn at the same ~60Hz but unlocked phase) get sampled
+        // irregularly by the display link, producing non-uniform per-frame
+        // displacement — visible as 时快时慢 (variable speed). Dart's 60fps
+        // absolute positions are already smooth on their own. ema == 0
+        // (startup, not yet converged) skips this gate and falls through to
+        // the conservative 50ms + scroll-item checks below.
+        if self.submit_interval_ema > 0.0
+            && self.submit_interval_ema <= 0.020
+        {
+            return false;
+        }
+        if self.submit_instant.elapsed().as_secs_f32() >= 0.050 {
+            return false;
+        }
+        self.frame_items
+            .iter()
+            .any(|item| item.scroll_speed != 0.0)
+    }
+
+    fn build_vertices(&mut self, presentation_time: Option<std::time::Instant>) {
         self.vertices.clear();
         self.shadow_vertices.clear();
 
-        for item in self.frame_items.clone().iter() {
-            let outline_px = resolve_outline_px(item.font_size, item.outline_width);
+        // Interpolation delta since the last frame submission. Capped at 50ms:
+        // normal 60fps(16ms)/30fps(33ms) Dart submissions keep this <50ms so
+        // scroll items advance smoothly between submits; if no new frame
+        // arrives for >50ms (pause / upstream stall) dt clamps to 0, freezing
+        // motion on the last submission without needing a pause command.
+        let elapsed = self.submit_instant.elapsed().as_secs_f32();
+        self.interp_dt = if self.motion_mode == MotionMode::LegacyInterpolation
+            && elapsed < 0.050
+        {
+            elapsed
+        } else {
+            0.0
+        };
+        let interp_dt = self.interp_dt as f64;
+        let continuous = self.motion_mode == MotionMode::ContinuousAnchor;
+        // Frame position follows the display timestamp even if the worker wakes
+        // late or atlas/command work takes a different amount of time each frame.
+        let motion_now = presentation_time.unwrap_or_else(std::time::Instant::now);
+        let media = self.motion_clock.media_at(motion_now);
+        if continuous && self.motion_clock.playing && !self.motion_clock.active(motion_now) {
+            self.frame_items.clear();
+        }
+
+        // Take `frame_items` out of `self` so the loop body can borrow `self`
+        // mutably (push_quad / push_shadow_quad / atlas.entry_for all need
+        // &mut self) without contending with a shared borrow of self.frame_items.
+        // The Vec move is O(1) (pointer swap); previously this cloned the whole
+        // Vec plus every token's String on every frame.
+        let frame_items = std::mem::take(&mut self.frame_items);
+        for item in &frame_items {
+            let x = if continuous {
+                let Some(x) = motion::sample_x(item.x, item.scroll_speed as f64,
+                    self.motion_clock.snapshot_media, media, item.start_media_s, item.end_media_s)
+                    else { continue; };
+                x
+            } else { item.x + item.scroll_speed as f64 * interp_dt };
+            let outline_px =
+                super::resolve_danmaku_outline_px(item.font_size, item.outline_width);
             let shadow = resolve_shadow(item.font_size, item.shadow_style);
             let fill_color = argb_to_linear(item.color_argb, item.opacity);
             let outline_color = stroke_color(fill_color);
@@ -431,10 +508,12 @@ impl Next2Renderer {
                 shadow.opacity * item.opacity * SHADOW_ALPHA_SCALE,
             ];
 
-            let mut cursor_x = item.x as f32;
+            let mut cursor_x = x as f32;
+            let item_left = cursor_x;
             let quantized_size = item.font_size.round().clamp(8.0, 256.0) as u32;
             let baseline_y = item.y as f32 + self.atlas.line_ascent(quantized_size);
-            let tokens = item.tokens.clone();
+            let tokens = &item.tokens;
+            let mut visual_bounds: Option<RenderBounds> = None;
 
             for token in tokens {
                 match token {
@@ -457,13 +536,27 @@ impl Next2Renderer {
                             let glyph_top = baseline_y + entry.offset_y;
                             let glyph_right = glyph_left + entry.width as f32;
                             let glyph_bottom = glyph_top + entry.height as f32;
+                            if item.is_me {
+                                // The MSDF quad contains `spread` pixels of transparent
+                                // distance-field margin. Exclude that margin (while
+                                // retaining outline + AA coverage) so the self marker
+                                // follows the visible glyph instead of its atlas cell.
+                                let visible_inset = (entry.spread - outline_px - 1.0).max(0.0);
+                                include_render_bounds(
+                                    &mut visual_bounds,
+                                    glyph_left + visible_inset,
+                                    glyph_top + visible_inset,
+                                    glyph_right - visible_inset,
+                                    glyph_bottom - visible_inset,
+                                );
+                            }
 
                             if shadow.opacity > 0.0 {
                                 self.push_shadow_quad(
-                                    (glyph_left + shadow.offset_x) * SHADOW_RENDER_SCALE as f32,
-                                    (glyph_top + shadow.offset_y) * SHADOW_RENDER_SCALE as f32,
-                                    (glyph_right + shadow.offset_x) * SHADOW_RENDER_SCALE as f32,
-                                    (glyph_bottom + shadow.offset_y) * SHADOW_RENDER_SCALE as f32,
+                                    (glyph_left + shadow.offset_x) * SHADOW_RENDER_SCALE,
+                                    (glyph_top + shadow.offset_y) * SHADOW_RENDER_SCALE,
+                                    (glyph_right + shadow.offset_x) * SHADOW_RENDER_SCALE,
+                                    (glyph_bottom + shadow.offset_y) * SHADOW_RENDER_SCALE,
                                     entry.uv_min,
                                     entry.uv_max,
                                     entry.uv_min,
@@ -491,7 +584,7 @@ impl Next2Renderer {
                         }
                     }
                     FrameToken::Emoji(id) => {
-                        let Some(entry) = self.emoji_atlas.entry_for(&id).cloned() else {
+                        let Some(entry) = self.emoji_atlas.entry_for(id).cloned() else {
                             cursor_x += quantized_size as f32;
                             continue;
                         };
@@ -504,12 +597,32 @@ impl Next2Renderer {
                         let glyph_right = glyph_left + entry.width as f32;
                         let glyph_bottom = glyph_top + entry.height as f32;
 
+                        if item.is_me {
+                            // Emoji bitmaps are generated with symmetric transparent
+                            // padding. Recover the painted content box from the stored
+                            // advance/font size, then retain only the outline margin.
+                            let horizontal_padding =
+                                ((entry.width as f32 - entry.advance.max(0.0)) * 0.5).max(0.0);
+                            let vertical_padding =
+                                ((entry.height as f32 - item.font_size) * 0.5).max(0.0);
+                            let emoji_margin = emoji_outline_px + 1.0;
+                            let inset_x = (horizontal_padding - emoji_margin).max(0.0);
+                            let inset_y = (vertical_padding - emoji_margin).max(0.0);
+                            include_render_bounds(
+                                &mut visual_bounds,
+                                glyph_left + inset_x,
+                                glyph_top + inset_y,
+                                glyph_right - inset_x,
+                                glyph_bottom - inset_y,
+                            );
+                        }
+
                         if shadow.opacity > 0.0 {
                             self.push_shadow_quad(
-                                (glyph_left + shadow.offset_x) * SHADOW_RENDER_SCALE as f32,
-                                (glyph_top + shadow.offset_y) * SHADOW_RENDER_SCALE as f32,
-                                (glyph_right + shadow.offset_x) * SHADOW_RENDER_SCALE as f32,
-                                (glyph_bottom + shadow.offset_y) * SHADOW_RENDER_SCALE as f32,
+                                (glyph_left + shadow.offset_x) * SHADOW_RENDER_SCALE,
+                                (glyph_top + shadow.offset_y) * SHADOW_RENDER_SCALE,
+                                (glyph_right + shadow.offset_x) * SHADOW_RENDER_SCALE,
+                                (glyph_bottom + shadow.offset_y) * SHADOW_RENDER_SCALE,
                                 entry.uv_min,
                                 entry.uv_max,
                                 entry.mask_uv_min,
@@ -537,43 +650,93 @@ impl Next2Renderer {
                     }
                 }
             }
+
+            if item.is_me {
+                if let Some(marker) = resolve_self_marker_bounds(
+                    item_left,
+                    cursor_x,
+                    item.width,
+                    item.y as f32,
+                    item.font_size,
+                    visual_bounds,
+                ) {
+                    // Scale in texture pixels so high-DPI/supersampled surfaces
+                    // retain a clearly visible ~2 logical-pixel border.
+                    let stroke = self_marker_stroke(item.font_size);
+                    let left = marker.left;
+                    let top = marker.top;
+                    let right = marker.right;
+                    let bottom = marker.bottom;
+                    // Chroma-key green keeps locally-sent danmaku immediately
+                    // recognizable against both light and dark video frames.
+                    let color = [0.0, 1.0, 0.0, item.opacity];
+                    let params = [1.0, 0.0, GLYPH_MODE_SOLID, 0.0];
+                    let uv = [0.0, 0.0];
+
+                    self.push_quad(
+                        left,
+                        top,
+                        right,
+                        top + stroke,
+                        uv,
+                        uv,
+                        uv,
+                        uv,
+                        color,
+                        color,
+                        params,
+                    );
+                    self.push_quad(
+                        left,
+                        bottom - stroke,
+                        right,
+                        bottom,
+                        uv,
+                        uv,
+                        uv,
+                        uv,
+                        color,
+                        color,
+                        params,
+                    );
+                    self.push_quad(
+                        left,
+                        top + stroke,
+                        left + stroke,
+                        bottom - stroke,
+                        uv,
+                        uv,
+                        uv,
+                        uv,
+                        color,
+                        color,
+                        params,
+                    );
+                    self.push_quad(
+                        right - stroke,
+                        top + stroke,
+                        right,
+                        bottom - stroke,
+                        uv,
+                        uv,
+                        uv,
+                        uv,
+                        color,
+                        color,
+                        params,
+                    );
+                }
+            }
         }
 
-        if !self.frame_items.is_empty() {
-            self.atlas_bind_group = self
-                .ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("next2 atlas bg"),
-                    layout: &self.atlas_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&self.atlas.texture_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.atlas.sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(
-                                &self.emoji_atlas.color_texture_view,
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(
-                                &self.emoji_atlas.mask_texture_view,
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::Sampler(&self.emoji_atlas.sampler),
-                        },
-                    ],
-                });
-        }
+        // Restore the frame_items taken before the loop.
+        self.frame_items = frame_items;
+
+        // atlas_bind_group is created at construction and rebuilt only on font
+        // switch via rebuild_atlas_bind_group (renderer_core.rs). The glyph and
+        // emoji atlases reuse the same texture objects across uploads (clear()
+        // only resets the cursor, never recreates the texture), so the bind
+        // group stays valid between frames — no per-frame rebuild needed.
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -727,6 +890,104 @@ impl Next2Renderer {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RenderBounds {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+fn include_render_bounds(
+    bounds: &mut Option<RenderBounds>,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+) {
+    if !left.is_finite()
+        || !top.is_finite()
+        || !right.is_finite()
+        || !bottom.is_finite()
+        || right <= left
+        || bottom <= top
+    {
+        return;
+    }
+    match bounds {
+        Some(current) => {
+            current.left = current.left.min(left);
+            current.top = current.top.min(top);
+            current.right = current.right.max(right);
+            current.bottom = current.bottom.max(bottom);
+        }
+        None => {
+            *bounds = Some(RenderBounds {
+                left,
+                top,
+                right,
+                bottom,
+            });
+        }
+    }
+}
+
+fn self_marker_padding(font_size: f32) -> f32 {
+    (font_size * 0.12).clamp(4.0, 9.0)
+}
+
+fn self_marker_stroke(font_size: f32) -> f32 {
+    (font_size * 0.08).clamp(2.5, 5.0)
+}
+
+/// Builds a self-send marker from the same glyph/emoji bounds used for GPU
+/// drawing. The collision width is only a fallback: it includes layout-only
+/// outline expansion and using it for a normal rendered item biases the box to
+/// the right. Vertically, center a minimum one-em box on the actual painted
+/// content so Emoji baseline padding cannot pull the marker upward.
+fn resolve_self_marker_bounds(
+    item_left: f32,
+    cursor_x: f32,
+    fallback_width: f32,
+    item_y: f32,
+    font_size: f32,
+    visual: Option<RenderBounds>,
+) -> Option<RenderBounds> {
+    let advance_width = (cursor_x - item_left).max(0.0);
+    let advance_right = item_left
+        + if advance_width > 0.0 {
+            advance_width
+        } else {
+            fallback_width.max(0.0)
+        };
+
+    let (mut left, mut right) = (item_left, advance_right);
+    if let Some(bounds) = visual {
+        left = left.min(bounds.left);
+        right = right.max(bounds.right);
+    }
+    if !left.is_finite() || !right.is_finite() || right <= left {
+        return None;
+    }
+
+    let safe_font_size = font_size.max(1.0);
+    let (content_top, content_bottom) = if let Some(bounds) = visual {
+        let center = (bounds.top + bounds.bottom) * 0.5;
+        let height = (bounds.bottom - bounds.top).max(safe_font_size);
+        (center - height * 0.5, center + height * 0.5)
+    } else {
+        (item_y, item_y + safe_font_size)
+    };
+    let padding = self_marker_padding(safe_font_size);
+
+    Some(RenderBounds {
+        left: left - padding,
+        top: content_top - padding,
+        right: right + padding,
+        bottom: content_bottom + padding,
+    })
+}
+
 fn create_render_texture_with_usage(
     device: &wgpu::Device,
     width: u32,
@@ -755,17 +1016,6 @@ fn to_ndc(x: f32, y: f32, width: f32, height: f32) -> [f32; 2] {
     let nx = (x / width) * 2.0 - 1.0;
     let ny = 1.0 - (y / height) * 2.0;
     [nx, ny]
-}
-
-fn resolve_outline_px(font_size: f32, width_multiplier: f32) -> f32 {
-    if !width_multiplier.is_finite() {
-        return 0.0;
-    }
-    let width_multiplier = width_multiplier.clamp(0.0, 4.0);
-    if width_multiplier <= 0.0 {
-        return 0.0;
-    }
-    (font_size * 0.06).clamp(1.0, 2.6) * width_multiplier
 }
 
 #[derive(Copy, Clone)]
@@ -959,6 +1209,123 @@ fn intersection_1d(f: &[f32], i: usize, j: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_marker_centers_on_visible_content_and_uses_real_advance() {
+        let marker = resolve_self_marker_bounds(
+            10.0,
+            70.0,
+            100.0,
+            0.0,
+            30.0,
+            Some(RenderBounds {
+                left: 12.0,
+                top: 20.0,
+                right: 68.0,
+                bottom: 50.0,
+            }),
+        )
+        .expect("marker bounds");
+
+        // 30px font → 4px padding. The 100px collision fallback must not
+        // stretch a normally rendered 60px item to the right.
+        assert_eq!(marker.left, 6.0);
+        assert_eq!(marker.right, 74.0);
+        assert_eq!((marker.top + marker.bottom) * 0.5, 35.0);
+        assert_eq!(marker.bottom - marker.top, 38.0);
+    }
+
+    #[test]
+    fn self_marker_stroke_scales_for_supersampled_textures() {
+        assert_eq!(self_marker_stroke(24.0), 2.5);
+        assert_eq!(self_marker_stroke(50.0), 4.0);
+        assert_eq!(self_marker_stroke(100.0), 5.0);
+    }
+
+    #[test]
+    fn narrow_latin_glyphs_keep_their_font_advance() {
+        let fonts = load_font_chain(None).expect("load test fonts");
+        let face = fonts
+            .iter()
+            .find_map(|font| font.face.glyph_index('j').map(|id| (&font.face, id)))
+            .expect("test font contains j");
+        let px = 50.0_f32;
+        let expected = scale_metric_to_px(
+            face.0
+                .glyph_hor_advance(face.1)
+                .expect("j has a horizontal advance") as f32,
+            face.0,
+            px,
+        );
+        let actual = glyph_advance_px(face.0, face.1, px);
+
+        assert!((actual - expected).abs() < f32::EPSILON);
+        assert!(
+            actual < px * FALLBACK_GLYPH_ADVANCE_RATIO,
+            "j advance {actual} was expanded to the fallback cell width"
+        );
+    }
+
+    #[test]
+    fn parallel_msdf_generation_matches_serial_generation() {
+        let fonts = std::sync::Arc::new(load_font_chain(None).expect("load test fonts"));
+        let cases = [('医', 50.0_f32), ('院', 50.0_f32), ('弹', 36.0_f32), ('幕', 36.0_f32)];
+
+        let serial: Vec<_> = cases
+            .iter()
+            .map(|&(ch, px)| rasterize_glyph_on_face(fonts.as_slice(), ch, px).unwrap())
+            .collect();
+        let workers: Vec<_> = cases
+            .iter()
+            .map(|&(ch, px)| {
+                let fonts = std::sync::Arc::clone(&fonts);
+                std::thread::spawn(move || {
+                    rasterize_glyph_on_face(fonts.as_slice(), ch, px).unwrap()
+                })
+            })
+            .collect();
+        let parallel: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("MSDF worker panicked"))
+            .collect();
+
+        for (serial, parallel) in serial.iter().zip(parallel.iter()) {
+            assert_eq!(parallel.width, serial.width);
+            assert_eq!(parallel.height, serial.height);
+            assert_eq!(parallel.pixels, serial.pixels);
+        }
+    }
+
+    #[test]
+    fn thick_outline_keeps_the_mtsdf_quad_border_transparent() {
+        let fonts = load_font_chain(None).expect("load test fonts");
+        let glyph = rasterize_glyph_on_face(fonts.as_slice(), '医', 50.0)
+            .expect("rasterize test glyph");
+        let outline_px = crate::next2_engine::resolve_danmaku_outline_px(256.0, 2.0);
+        let antialias_px = 1.0_f32;
+
+        let border_alpha = (0..glyph.width)
+            .flat_map(|x| [(x, 0), (x, glyph.height - 1)])
+            .chain((0..glyph.height).flat_map(|y| [(0, y), (glyph.width - 1, y)]));
+        for (x, y) in border_alpha {
+            let alpha = glyph.pixels[((y * glyph.width + x) * 4 + 3) as usize] as f32 / 255.0;
+            let distance = (alpha - 0.5) * glyph.spread;
+            let coverage = smoothstep_for_test(
+                -outline_px - antialias_px,
+                -outline_px + antialias_px,
+                distance,
+            );
+            assert!(
+                coverage <= 0.0001,
+                "quad border became visible at ({x}, {y}): distance={distance}, coverage={coverage}"
+            );
+        }
+    }
+
+    fn smoothstep_for_test(edge0: f32, edge1: f32, value: f32) -> f32 {
+        let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
 
     #[test]
     fn emoji_sdf_mask_keeps_inside_above_midpoint() {

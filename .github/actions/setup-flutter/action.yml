@@ -5,6 +5,14 @@ inputs:
     description: 'Java 版本'
     required: false
     default: '21'
+  flutter-version:
+    description: 'Optional Flutter version override for a platform-specific build'
+    required: false
+    default: '3.44.6'
+  dependency-profile:
+    description: 'Dependency override profile: mainline or linux'
+    required: false
+    default: 'mainline'
 outputs:
   version:
     description: '从 pubspec.yaml 获取的应用版本'
@@ -20,6 +28,8 @@ runs:
 
     - name: Setup Dart (for FVM)
       uses: dart-lang/setup-dart@v1
+      with:
+        problem-matcher: false
 
     - name: Cache FVM & Pub cache (Linux/macOS)
       if: runner.os != 'Windows'
@@ -27,8 +37,11 @@ runs:
       with:
         path: |
           ~/.fvm
-          ~/.pub-cache
-        key: ${{ runner.os }}-fvm-${{ hashFiles('.fvmrc') }}-${{ hashFiles('**/pubspec.lock') }}-${{ hashFiles('**/gradle-wrapper.properties') }}-v1
+          ~/.pub-cache/bin
+          ~/.pub-cache/git/cache
+          ~/.pub-cache/global_packages
+          ~/.pub-cache/hosted
+        key: ${{ runner.os }}-fvm-${{ inputs.flutter-version }}-${{ inputs.dependency-profile }}-${{ hashFiles('.fvmrc') }}-${{ hashFiles('**/pubspec.lock') }}-${{ hashFiles('**/gradle-wrapper.properties') }}-v2
         restore-keys: |
           ${{ runner.os }}-fvm-
 
@@ -38,8 +51,11 @@ runs:
       with:
         path: |
           ${{ env.USERPROFILE }}\.fvm
-          ${{ env.LOCALAPPDATA }}\Pub\Cache
-        key: ${{ runner.os }}-fvm-${{ hashFiles('.fvmrc') }}-${{ hashFiles('**/pubspec.lock') }}-${{ hashFiles('**/gradle-wrapper.properties') }}-v1
+          ${{ env.LOCALAPPDATA }}\Pub\Cache\bin
+          ${{ env.LOCALAPPDATA }}\Pub\Cache\git\cache
+          ${{ env.LOCALAPPDATA }}\Pub\Cache\global_packages
+          ${{ env.LOCALAPPDATA }}\Pub\Cache\hosted
+        key: ${{ runner.os }}-fvm-${{ inputs.flutter-version }}-${{ inputs.dependency-profile }}-${{ hashFiles('.fvmrc') }}-${{ hashFiles('**/pubspec.lock') }}-${{ hashFiles('**/gradle-wrapper.properties') }}-v2
         restore-keys: |
           ${{ runner.os }}-fvm-
 
@@ -65,15 +81,27 @@ runs:
       if: runner.os != 'Windows'
       shell: bash
       run: |
-        fvm install
-        fvm use --force
+        requested_version='${{ inputs.flutter-version }}'
+        if [ -n "$requested_version" ]; then
+          fvm install "$requested_version"
+          fvm use "$requested_version" --force
+        else
+          fvm install
+          fvm use --force
+        fi
 
     - name: Install Flutter via FVM (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        fvm install
-        fvm use --force
+        $requestedVersion = '${{ inputs.flutter-version }}'
+        if ($requestedVersion) {
+          fvm install $requestedVersion
+          fvm use $requestedVersion --force
+        } else {
+          fvm install
+          fvm use --force
+        }
 
     - name: Add Flutter to PATH (Linux/macOS)
       if: runner.os != 'Windows'
@@ -105,6 +133,11 @@ runs:
           git submodule sync --recursive
           git submodule update --init --recursive
         fi
+
+    - name: Configure platform dependency profile
+      shell: bash
+      run: |
+        dart run tool/configure_flutter_dependencies.dart '${{ inputs.dependency-profile }}'
     
     - name: Get app version
       id: get_version
@@ -118,7 +151,7 @@ runs:
           # Use grep/cut for Linux/macOS
           echo "version=$(grep '^version:' pubspec.yaml | cut -d ' ' -f 2)" >> $GITHUB_OUTPUT
         fi
-    
+
     - name: Flutter Pub Get
       shell: bash
       run: |

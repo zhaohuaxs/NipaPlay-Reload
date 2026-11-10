@@ -6,11 +6,20 @@
 // Static analysis wrongly picks the IO variant, thus ignore this
 // ignore_for_file: argument_type_not_assignable
 
+import 'api/ass_converter.dart';
+import 'api/client_notifications.dart';
+import 'api/danmaku_analytics.dart';
 import 'api/dfm_plus.dart';
 import 'api/file_scan.dart';
+import 'api/incremental_sync.dart';
+import 'api/media_metadata.dart';
+import 'api/media_probe.dart';
 import 'api/next2.dart';
 import 'api/performance.dart';
+import 'api/remote_directory.dart';
+import 'api/startup_commands.dart';
 import 'api/torrent.dart';
+import 'api/webdav_multistatus.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'frb_generated.dart';
@@ -25,10 +34,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   });
 
   @protected
+  AnyhowException dco_decode_AnyhowException(dynamic raw);
+
+  @protected
+  RustStreamSink<ClientNotification>
+      dco_decode_StreamSink_client_notification_Sse(dynamic raw);
+
+  @protected
   String dco_decode_String(dynamic raw);
 
   @protected
   bool dco_decode_bool(dynamic raw);
+
+  @protected
+  ClientNotification dco_decode_box_autoadd_client_notification(dynamic raw);
 
   @protected
   DfmPlusFrameRequest dco_decode_box_autoadd_dfm_plus_frame_request(
@@ -42,6 +61,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   double dco_decode_box_autoadd_f_64(dynamic raw);
 
   @protected
+  int dco_decode_box_autoadd_i_32(dynamic raw);
+
+  @protected
+  PlatformInt64 dco_decode_box_autoadd_i_64(dynamic raw);
+
+  @protected
+  RustAssExportSettings dco_decode_box_autoadd_rust_ass_export_settings(
+      dynamic raw);
+
+  @protected
   RustNext2FrameRequest dco_decode_box_autoadd_rust_next_2_frame_request(
       dynamic raw);
 
@@ -51,6 +80,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int dco_decode_box_autoadd_u_32(dynamic raw);
+
+  @protected
+  ClientNotification dco_decode_client_notification(dynamic raw);
 
   @protected
   DfmPlusDanmakuItem dco_decode_dfm_plus_danmaku_item(dynamic raw);
@@ -92,6 +124,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<String> dco_decode_list_String(dynamic raw);
 
   @protected
+  List<bool> dco_decode_list_bool(dynamic raw);
+
+  @protected
   List<DfmPlusDanmakuItem> dco_decode_list_dfm_plus_danmaku_item(dynamic raw);
 
   @protected
@@ -105,10 +140,34 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       dynamic raw);
 
   @protected
+  List<Uint8List> dco_decode_list_list_prim_u_8_strict(dynamic raw);
+
+  @protected
+  List<double> dco_decode_list_prim_f_64_loose(dynamic raw);
+
+  @protected
   Float64List dco_decode_list_prim_f_64_strict(dynamic raw);
 
   @protected
+  Int64List dco_decode_list_prim_i_64_strict(dynamic raw);
+
+  @protected
+  Uint32List dco_decode_list_prim_u_32_strict(dynamic raw);
+
+  @protected
+  List<int> dco_decode_list_prim_u_8_loose(dynamic raw);
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
+
+  @protected
+  List<RustAssDanmakuInput> dco_decode_list_rust_ass_danmaku_input(dynamic raw);
+
+  @protected
+  List<RustAssEvent> dco_decode_list_rust_ass_event(dynamic raw);
+
+  @protected
+  List<RustDensityPoint> dco_decode_list_rust_density_point(dynamic raw);
 
   @protected
   List<RustFileHashEntry> dco_decode_list_rust_file_hash_entry(dynamic raw);
@@ -128,10 +187,29 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       dynamic raw);
 
   @protected
+  List<RustPeakSegment> dco_decode_list_rust_peak_segment(dynamic raw);
+
+  @protected
+  List<RustPreparedDanmakuInput> dco_decode_list_rust_prepared_danmaku_input(
+      dynamic raw);
+
+  @protected
+  List<RustSyncPatchInput> dco_decode_list_rust_sync_patch_input(dynamic raw);
+
+  @protected
+  List<RustWebDavEntry> dco_decode_list_rust_web_dav_entry(dynamic raw);
+
+  @protected
   String? dco_decode_opt_String(dynamic raw);
 
   @protected
   double? dco_decode_opt_box_autoadd_f_64(dynamic raw);
+
+  @protected
+  int? dco_decode_opt_box_autoadd_i_32(dynamic raw);
+
+  @protected
+  PlatformInt64? dco_decode_opt_box_autoadd_i_64(dynamic raw);
 
   @protected
   int? dco_decode_opt_box_autoadd_u_32(dynamic raw);
@@ -140,7 +218,28 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List? dco_decode_opt_list_prim_u_8_strict(dynamic raw);
 
   @protected
+  RustAssConversionResult dco_decode_rust_ass_conversion_result(dynamic raw);
+
+  @protected
+  RustAssDanmakuInput dco_decode_rust_ass_danmaku_input(dynamic raw);
+
+  @protected
+  RustAssEvent dco_decode_rust_ass_event(dynamic raw);
+
+  @protected
+  RustAssExportSettings dco_decode_rust_ass_export_settings(dynamic raw);
+
+  @protected
+  RustBackupRestorePlan dco_decode_rust_backup_restore_plan(dynamic raw);
+
+  @protected
   RustCpuSample dco_decode_rust_cpu_sample(dynamic raw);
+
+  @protected
+  RustDensityPoint dco_decode_rust_density_point(dynamic raw);
+
+  @protected
+  RustDensityStats dco_decode_rust_density_stats(dynamic raw);
 
   @protected
   RustFileHashEntry dco_decode_rust_file_hash_entry(dynamic raw);
@@ -156,6 +255,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   RustGpuSample dco_decode_rust_gpu_sample(dynamic raw);
+
+  @protected
+  RustMediaProbeResult dco_decode_rust_media_probe_result(dynamic raw);
 
   @protected
   RustNext2DanmakuItem dco_decode_rust_next_2_danmaku_item(dynamic raw);
@@ -179,7 +281,31 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   RustNext2PreparedLayout dco_decode_rust_next_2_prepared_layout(dynamic raw);
 
   @protected
+  RustPeakSegment dco_decode_rust_peak_segment(dynamic raw);
+
+  @protected
   RustPerformanceSample dco_decode_rust_performance_sample(dynamic raw);
+
+  @protected
+  RustPreparedDanmakuInput dco_decode_rust_prepared_danmaku_input(dynamic raw);
+
+  @protected
+  RustSyncBlob dco_decode_rust_sync_blob(dynamic raw);
+
+  @protected
+  RustSyncDecodedSnapshot dco_decode_rust_sync_decoded_snapshot(dynamic raw);
+
+  @protected
+  RustSyncPatchChainResult dco_decode_rust_sync_patch_chain_result(dynamic raw);
+
+  @protected
+  RustSyncPatchInput dco_decode_rust_sync_patch_input(dynamic raw);
+
+  @protected
+  RustWebDavEntry dco_decode_rust_web_dav_entry(dynamic raw);
+
+  @protected
+  StartupCommand dco_decode_startup_command(dynamic raw);
 
   @protected
   int dco_decode_u_32(dynamic raw);
@@ -194,10 +320,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void dco_decode_unit(dynamic raw);
 
   @protected
+  AnyhowException sse_decode_AnyhowException(SseDeserializer deserializer);
+
+  @protected
+  RustStreamSink<ClientNotification>
+      sse_decode_StreamSink_client_notification_Sse(
+          SseDeserializer deserializer);
+
+  @protected
   String sse_decode_String(SseDeserializer deserializer);
 
   @protected
   bool sse_decode_bool(SseDeserializer deserializer);
+
+  @protected
+  ClientNotification sse_decode_box_autoadd_client_notification(
+      SseDeserializer deserializer);
 
   @protected
   DfmPlusFrameRequest sse_decode_box_autoadd_dfm_plus_frame_request(
@@ -211,6 +349,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   double sse_decode_box_autoadd_f_64(SseDeserializer deserializer);
 
   @protected
+  int sse_decode_box_autoadd_i_32(SseDeserializer deserializer);
+
+  @protected
+  PlatformInt64 sse_decode_box_autoadd_i_64(SseDeserializer deserializer);
+
+  @protected
+  RustAssExportSettings sse_decode_box_autoadd_rust_ass_export_settings(
+      SseDeserializer deserializer);
+
+  @protected
   RustNext2FrameRequest sse_decode_box_autoadd_rust_next_2_frame_request(
       SseDeserializer deserializer);
 
@@ -220,6 +368,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int sse_decode_box_autoadd_u_32(SseDeserializer deserializer);
+
+  @protected
+  ClientNotification sse_decode_client_notification(
+      SseDeserializer deserializer);
 
   @protected
   DfmPlusDanmakuItem sse_decode_dfm_plus_danmaku_item(
@@ -269,6 +421,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<String> sse_decode_list_String(SseDeserializer deserializer);
 
   @protected
+  List<bool> sse_decode_list_bool(SseDeserializer deserializer);
+
+  @protected
   List<DfmPlusDanmakuItem> sse_decode_list_dfm_plus_danmaku_item(
       SseDeserializer deserializer);
 
@@ -285,10 +440,38 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       SseDeserializer deserializer);
 
   @protected
+  List<Uint8List> sse_decode_list_list_prim_u_8_strict(
+      SseDeserializer deserializer);
+
+  @protected
+  List<double> sse_decode_list_prim_f_64_loose(SseDeserializer deserializer);
+
+  @protected
   Float64List sse_decode_list_prim_f_64_strict(SseDeserializer deserializer);
 
   @protected
+  Int64List sse_decode_list_prim_i_64_strict(SseDeserializer deserializer);
+
+  @protected
+  Uint32List sse_decode_list_prim_u_32_strict(SseDeserializer deserializer);
+
+  @protected
+  List<int> sse_decode_list_prim_u_8_loose(SseDeserializer deserializer);
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
+
+  @protected
+  List<RustAssDanmakuInput> sse_decode_list_rust_ass_danmaku_input(
+      SseDeserializer deserializer);
+
+  @protected
+  List<RustAssEvent> sse_decode_list_rust_ass_event(
+      SseDeserializer deserializer);
+
+  @protected
+  List<RustDensityPoint> sse_decode_list_rust_density_point(
+      SseDeserializer deserializer);
 
   @protected
   List<RustFileHashEntry> sse_decode_list_rust_file_hash_entry(
@@ -311,10 +494,32 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       SseDeserializer deserializer);
 
   @protected
+  List<RustPeakSegment> sse_decode_list_rust_peak_segment(
+      SseDeserializer deserializer);
+
+  @protected
+  List<RustPreparedDanmakuInput> sse_decode_list_rust_prepared_danmaku_input(
+      SseDeserializer deserializer);
+
+  @protected
+  List<RustSyncPatchInput> sse_decode_list_rust_sync_patch_input(
+      SseDeserializer deserializer);
+
+  @protected
+  List<RustWebDavEntry> sse_decode_list_rust_web_dav_entry(
+      SseDeserializer deserializer);
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
 
   @protected
   double? sse_decode_opt_box_autoadd_f_64(SseDeserializer deserializer);
+
+  @protected
+  int? sse_decode_opt_box_autoadd_i_32(SseDeserializer deserializer);
+
+  @protected
+  PlatformInt64? sse_decode_opt_box_autoadd_i_64(SseDeserializer deserializer);
 
   @protected
   int? sse_decode_opt_box_autoadd_u_32(SseDeserializer deserializer);
@@ -323,7 +528,32 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List? sse_decode_opt_list_prim_u_8_strict(SseDeserializer deserializer);
 
   @protected
+  RustAssConversionResult sse_decode_rust_ass_conversion_result(
+      SseDeserializer deserializer);
+
+  @protected
+  RustAssDanmakuInput sse_decode_rust_ass_danmaku_input(
+      SseDeserializer deserializer);
+
+  @protected
+  RustAssEvent sse_decode_rust_ass_event(SseDeserializer deserializer);
+
+  @protected
+  RustAssExportSettings sse_decode_rust_ass_export_settings(
+      SseDeserializer deserializer);
+
+  @protected
+  RustBackupRestorePlan sse_decode_rust_backup_restore_plan(
+      SseDeserializer deserializer);
+
+  @protected
   RustCpuSample sse_decode_rust_cpu_sample(SseDeserializer deserializer);
+
+  @protected
+  RustDensityPoint sse_decode_rust_density_point(SseDeserializer deserializer);
+
+  @protected
+  RustDensityStats sse_decode_rust_density_stats(SseDeserializer deserializer);
 
   @protected
   RustFileHashEntry sse_decode_rust_file_hash_entry(
@@ -342,6 +572,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   RustGpuSample sse_decode_rust_gpu_sample(SseDeserializer deserializer);
+
+  @protected
+  RustMediaProbeResult sse_decode_rust_media_probe_result(
+      SseDeserializer deserializer);
 
   @protected
   RustNext2DanmakuItem sse_decode_rust_next_2_danmaku_item(
@@ -372,8 +606,36 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       SseDeserializer deserializer);
 
   @protected
+  RustPeakSegment sse_decode_rust_peak_segment(SseDeserializer deserializer);
+
+  @protected
   RustPerformanceSample sse_decode_rust_performance_sample(
       SseDeserializer deserializer);
+
+  @protected
+  RustPreparedDanmakuInput sse_decode_rust_prepared_danmaku_input(
+      SseDeserializer deserializer);
+
+  @protected
+  RustSyncBlob sse_decode_rust_sync_blob(SseDeserializer deserializer);
+
+  @protected
+  RustSyncDecodedSnapshot sse_decode_rust_sync_decoded_snapshot(
+      SseDeserializer deserializer);
+
+  @protected
+  RustSyncPatchChainResult sse_decode_rust_sync_patch_chain_result(
+      SseDeserializer deserializer);
+
+  @protected
+  RustSyncPatchInput sse_decode_rust_sync_patch_input(
+      SseDeserializer deserializer);
+
+  @protected
+  RustWebDavEntry sse_decode_rust_web_dav_entry(SseDeserializer deserializer);
+
+  @protected
+  StartupCommand sse_decode_startup_command(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
@@ -388,10 +650,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_decode_unit(SseDeserializer deserializer);
 
   @protected
+  void sse_encode_AnyhowException(
+      AnyhowException self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_StreamSink_client_notification_Sse(
+      RustStreamSink<ClientNotification> self, SseSerializer serializer);
+
+  @protected
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_client_notification(
+      ClientNotification self, SseSerializer serializer);
 
   @protected
   void sse_encode_box_autoadd_dfm_plus_frame_request(
@@ -405,6 +679,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_box_autoadd_f_64(double self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_i_32(int self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_i_64(
+      PlatformInt64 self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_rust_ass_export_settings(
+      RustAssExportSettings self, SseSerializer serializer);
+
+  @protected
   void sse_encode_box_autoadd_rust_next_2_frame_request(
       RustNext2FrameRequest self, SseSerializer serializer);
 
@@ -414,6 +699,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_box_autoadd_u_32(int self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_client_notification(
+      ClientNotification self, SseSerializer serializer);
 
   @protected
   void sse_encode_dfm_plus_danmaku_item(
@@ -464,6 +753,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_list_String(List<String> self, SseSerializer serializer);
 
   @protected
+  void sse_encode_list_bool(List<bool> self, SseSerializer serializer);
+
+  @protected
   void sse_encode_list_dfm_plus_danmaku_item(
       List<DfmPlusDanmakuItem> self, SseSerializer serializer);
 
@@ -480,12 +772,43 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       List<DfmPlusRawDanmakuItem> self, SseSerializer serializer);
 
   @protected
+  void sse_encode_list_list_prim_u_8_strict(
+      List<Uint8List> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_prim_f_64_loose(
+      List<double> self, SseSerializer serializer);
+
+  @protected
   void sse_encode_list_prim_f_64_strict(
       Float64List self, SseSerializer serializer);
 
   @protected
+  void sse_encode_list_prim_i_64_strict(
+      Int64List self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_prim_u_32_strict(
+      Uint32List self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_prim_u_8_loose(List<int> self, SseSerializer serializer);
+
+  @protected
   void sse_encode_list_prim_u_8_strict(
       Uint8List self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_rust_ass_danmaku_input(
+      List<RustAssDanmakuInput> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_rust_ass_event(
+      List<RustAssEvent> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_rust_density_point(
+      List<RustDensityPoint> self, SseSerializer serializer);
 
   @protected
   void sse_encode_list_rust_file_hash_entry(
@@ -508,10 +831,33 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       List<RustNext2PreparedItem> self, SseSerializer serializer);
 
   @protected
+  void sse_encode_list_rust_peak_segment(
+      List<RustPeakSegment> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_rust_prepared_danmaku_input(
+      List<RustPreparedDanmakuInput> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_rust_sync_patch_input(
+      List<RustSyncPatchInput> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_rust_web_dav_entry(
+      List<RustWebDavEntry> self, SseSerializer serializer);
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_box_autoadd_f_64(double? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_i_32(int? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_i_64(
+      PlatformInt64? self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_box_autoadd_u_32(int? self, SseSerializer serializer);
@@ -521,7 +867,34 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       Uint8List? self, SseSerializer serializer);
 
   @protected
+  void sse_encode_rust_ass_conversion_result(
+      RustAssConversionResult self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_ass_danmaku_input(
+      RustAssDanmakuInput self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_ass_event(RustAssEvent self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_ass_export_settings(
+      RustAssExportSettings self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_backup_restore_plan(
+      RustBackupRestorePlan self, SseSerializer serializer);
+
+  @protected
   void sse_encode_rust_cpu_sample(RustCpuSample self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_density_point(
+      RustDensityPoint self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_density_stats(
+      RustDensityStats self, SseSerializer serializer);
 
   @protected
   void sse_encode_rust_file_hash_entry(
@@ -541,6 +914,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_rust_gpu_sample(RustGpuSample self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_media_probe_result(
+      RustMediaProbeResult self, SseSerializer serializer);
 
   @protected
   void sse_encode_rust_next_2_danmaku_item(
@@ -571,8 +948,39 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       RustNext2PreparedLayout self, SseSerializer serializer);
 
   @protected
+  void sse_encode_rust_peak_segment(
+      RustPeakSegment self, SseSerializer serializer);
+
+  @protected
   void sse_encode_rust_performance_sample(
       RustPerformanceSample self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_prepared_danmaku_input(
+      RustPreparedDanmakuInput self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_sync_blob(RustSyncBlob self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_sync_decoded_snapshot(
+      RustSyncDecodedSnapshot self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_sync_patch_chain_result(
+      RustSyncPatchChainResult self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_sync_patch_input(
+      RustSyncPatchInput self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rust_web_dav_entry(
+      RustWebDavEntry self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_startup_command(
+      StartupCommand self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_32(int self, SseSerializer serializer);

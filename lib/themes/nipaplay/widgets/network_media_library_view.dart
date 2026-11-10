@@ -1,6 +1,10 @@
+import 'package:nipaplay/widgets/page_activity_mixin.dart';
 import 'dart:async';
+import 'package:flutter/cupertino.dart' as cupertino;
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:nipaplay/models/jellyfin_model.dart';
 import 'package:nipaplay/models/emby_model.dart';
 import 'package:nipaplay/models/watch_history_model.dart';
@@ -12,14 +16,22 @@ import 'package:nipaplay/services/jellyfin_service.dart';
 import 'package:nipaplay/services/emby_service.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/horizontal_anime_card.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/blur_dropdown.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/cached_network_image_widget.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_focusable_action.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_mode_scope.dart';
+import 'package:nipaplay/themes/nipaplay/widgets/large_screen_page_scaffold.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/local_library_control_bar.dart';
-import 'package:nipaplay/themes/nipaplay/widgets/search_bar_action_button.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/network_media_server_dialog.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/media_library_sort_dialog.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/jellyfin_library_card.dart';
 import 'package:nipaplay/themes/nipaplay/widgets/emby_library_card.dart';
 import 'package:kmbal_ionicons/kmbal_ionicons.dart';
 import 'package:nipaplay/utils/app_accent_color.dart';
+import 'package:nipaplay/media_library/adaptive_media_library_primitives.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
+import 'package:nipaplay/widgets/in_view_dialog.dart';
 
 enum NetworkMediaServerType { jellyfin, emby }
 
@@ -34,6 +46,7 @@ abstract class NetworkMediaItem {
   double? get userRating;
   bool get isFolder;
   String? get progress; // 新增
+  bool get isPlayed; // 服务器端记录的已观看状态
 }
 
 // 通用媒体库接口
@@ -72,6 +85,9 @@ class JellyfinMediaItemAdapter implements NetworkMediaItem {
     // Jellyfin 列表接口可能不返回具体的播放进度集数，如果需要更详细的可以后续扩展
     return null;
   }
+
+  @override
+  bool get isPlayed => _item.userData?.played == true;
 
   JellyfinMediaItem get originalItem => _item;
 }
@@ -118,6 +134,9 @@ class EmbyMediaItemAdapter implements NetworkMediaItem {
     return null;
   }
 
+  @override
+  bool get isPlayed => _item.userData?.played == true;
+
   EmbyMediaItem get originalItem => _item;
 }
 
@@ -151,14 +170,17 @@ class NetworkMediaLibraryView extends StatefulWidget {
 }
 
 class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
-    with AutomaticKeepAliveClientMixin {
+    with AutomaticKeepAliveClientMixin, PageActivityMixin {
   static Color get _accentColor => AppAccentColors.current;
+
+  // “只看未观看”状态的持久化 Key（按服务器类型区分）
+  String get _unwatchedFilterPrefsKey =>
+      'network_media_unwatched_only_${widget.serverType.name}';
 
   List<NetworkMediaItem> _mediaItems = [];
   String? _error;
   Timer? _refreshTimer;
   final ScrollController _gridScrollController = ScrollController();
-  final GlobalKey _remoteSortDropdownKey = GlobalKey();
 
   // 库视图状态
   String? _selectedLibraryId;
@@ -166,6 +188,7 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
   bool _isLoadingLibraryContent = false;
   bool _isFolderNavigation = false;
   final List<_FolderNode> _folderStack = [];
+  int _contentLoadRevision = 0;
 
   // 搜索状态
   final TextEditingController _searchController = TextEditingController();
@@ -175,28 +198,7 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
   List<NetworkMediaItem> _searchResults = [];
   List<NetworkMediaItem> _filteredMediaItems = [];
   Timer? _searchDebounceTimer;
-
-  ButtonStyle _plainButtonStyle({Color? baseColor}) {
-    final textColor = Theme.of(context).colorScheme.onSurface;
-    final mutedColor = textColor.withOpacity(0.5);
-    final resolvedBase = baseColor ?? textColor;
-    return ButtonStyle(
-      foregroundColor: MaterialStateProperty.resolveWith((states) {
-        if (states.contains(MaterialState.disabled)) {
-          return mutedColor;
-        }
-        if (states.contains(MaterialState.hovered)) {
-          return _accentColor;
-        }
-        return resolvedBase;
-      }),
-      overlayColor: MaterialStateProperty.all(Colors.transparent),
-      splashFactory: NoSplash.splashFactory,
-      padding: MaterialStateProperty.all(
-        const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-      ),
-    );
-  }
+  bool _showOnlyUnwatched = false;
 
   Widget _buildPlainActionButton({
     required IconData icon,
@@ -204,11 +206,19 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
     required VoidCallback? onPressed,
     Color? baseColor,
   }) {
-    return TextButton.icon(
+    return AdaptiveMediaActionButton(
       onPressed: onPressed,
-      style: _plainButtonStyle(baseColor: baseColor),
-      icon: Icon(icon, size: 18),
-      label: Text(text),
+      desktopIcon: icon,
+      phoneIcon: switch (icon) {
+        Icons.cloud => cupertino.CupertinoIcons.cloud,
+        Icons.refresh => cupertino.CupertinoIcons.refresh,
+        Icons.arrow_back => cupertino.CupertinoIcons.back,
+        _ => cupertino.CupertinoIcons.ellipsis,
+      },
+      label: text,
+      emphasis: baseColor == Colors.red
+          ? AdaptiveMediaActionEmphasis.destructive
+          : AdaptiveMediaActionEmphasis.plain,
     );
   }
 
@@ -225,6 +235,11 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
             .toList();
       }
 
+      // 只看未观看过滤
+      if (_showOnlyUnwatched) {
+        source = source.where((item) => !item.isPlayed).toList();
+      }
+
       if (_showRemoteSortDropdown) {
         _filteredMediaItems = source;
         return;
@@ -238,11 +253,48 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
         case LocalLibrarySortType.dateAdded:
           // 远程服务目前没有统一的添加日期，这里暂不做变动或使用原始顺序
           break;
+        case LocalLibrarySortType.comprehensive:
+          // 远程媒体库不支持新内容基线，综合排序退化为原始顺序
+          break;
         case LocalLibrarySortType.rating:
           break;
       }
       _filteredMediaItems = source;
     });
+  }
+
+  // 切换“只看未观看”过滤（排序弹层开关会调用）
+  void _toggleShowOnlyUnwatched() {
+    setState(() {
+      _showOnlyUnwatched = !_showOnlyUnwatched;
+    });
+    _applySortAndFilter();
+    _persistUnwatchedFilterState();
+  }
+
+  // 手动刷新当前视图（媒体库列表 / 媒体库内容 / 文件夹）
+  Future<void> _manualRefresh() async {
+    if (!mounted) return;
+    if (_isShowingLibraryContent) {
+      if (_isFolderNavigation) {
+        final folderId = _currentFolderId ?? _selectedLibraryId;
+        if (folderId != null) {
+          setState(() {
+            _isLoadingLibraryContent = true;
+            _error = null;
+          });
+          await _loadFolderItems(folderId);
+        }
+      } else if (_selectedLibraryId != null) {
+        setState(() {
+          _isLoadingLibraryContent = true;
+          _error = null;
+        });
+        await _loadLibraryContent(_selectedLibraryId!);
+      }
+    } else {
+      await _loadData();
+    }
   }
 
   @override
@@ -255,9 +307,35 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
       if (mounted) {
         final provider = _provider;
         provider.addListener(_onProviderChanged);
+        _restoreUnwatchedFilterState();
         _loadData(); // Initial load based on current provider state
       }
     });
+  }
+
+  // 从本地存储恢复“只看未观看”开关状态（重开应用后保持上一次的状态）
+  Future<void> _restoreUnwatchedFilterState() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getBool(_unwatchedFilterPrefsKey);
+      if (saved == null || !mounted) return;
+      setState(() {
+        _showOnlyUnwatched = saved;
+      });
+      _applySortAndFilter();
+    } catch (e) {
+      debugPrint('[$_serverName] 恢复未观看过滤状态失败: $e');
+    }
+  }
+
+  // 将“只看未观看”开关状态写入本地存储
+  Future<void> _persistUnwatchedFilterState() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_unwatchedFilterPrefsKey, _showOnlyUnwatched);
+    } catch (e) {
+      debugPrint('[$_serverName] 保存未观看过滤状态失败: $e');
+    }
   }
 
   @override
@@ -335,8 +413,21 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
 
     final provider = _provider;
     final service = _service;
+    final isLargeScreen = NipaplayLargeScreenModeScope.isActiveOf(context);
 
     if (!provider.isConnected || provider.selectedLibraryIds.isEmpty) {
+      if (isLargeScreen) {
+        return NipaplayLargeScreenEmptyState(
+          icon: Icons.dns_outlined,
+          title: '还没有连接 $_serverName',
+          subtitle: '添加服务器后可以在大屏模式中浏览、搜索并播放媒体库内容',
+          action: NipaplayLargeScreenActionButton(
+            icon: Icons.cloud_outlined,
+            label: '添加媒体服务器',
+            onPressed: _showServerDialog,
+          ),
+        );
+      }
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(16.0),
@@ -362,11 +453,741 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
     }
 
     // 根据当前状态决定显示内容
+    if (isLargeScreen) {
+      if (_isShowingLibraryContent) {
+        return _buildLargeScreenLibraryContentView(provider, service);
+      }
+      return _buildLargeScreenLibrariesView(provider, service);
+    }
+
     if (_isShowingLibraryContent) {
       return _buildLibraryContentView(provider, service);
     } else {
       return _buildLibrariesView(provider, service);
     }
+  }
+
+  Widget _buildLargeScreenLibrariesView(dynamic provider, dynamic service) {
+    final selectedLibraries = _getSelectedLibraries(provider);
+
+    if (selectedLibraries.isEmpty) {
+      return NipaplayLargeScreenEmptyState(
+        icon: Icons.video_library_outlined,
+        title: '没有可用的媒体库',
+        subtitle: '刷新服务器媒体库，或在服务器设置中选择要显示的库',
+        action: NipaplayLargeScreenActionButton(
+          icon: Icons.refresh_rounded,
+          label: '刷新媒体库',
+          onPressed: _loadData,
+        ),
+      );
+    }
+
+    return Column(
+      children: [
+        _buildLargeScreenRemoteTopBar(
+          title: '$_serverName 媒体库',
+          onSearchChanged: _onMainSearchChanged,
+          showBack: false,
+          showRemoteSort: false,
+        ),
+        if (_isSearching) ...[
+          const SizedBox(height: 14),
+          _buildLargeScreenLocalSortRow(),
+        ],
+        const SizedBox(height: 18),
+        Expanded(
+          child: _isSearching
+              ? _buildLargeScreenMediaGrid(_searchResults)
+              : GridView.builder(
+                  controller: _gridScrollController,
+                  padding: const EdgeInsets.only(bottom: 96),
+                  physics: const AlwaysScrollableScrollPhysics(
+                    parent: BouncingScrollPhysics(),
+                  ),
+                  gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                    maxCrossAxisExtent: 420,
+                    mainAxisExtent: 210,
+                    crossAxisSpacing: 18,
+                    mainAxisSpacing: 18,
+                  ),
+                  itemCount: selectedLibraries.length,
+                  itemBuilder: (context, index) {
+                    return _buildLargeScreenLibraryCard(
+                      selectedLibraries[index],
+                      autofocus: index == 0,
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLargeScreenLibraryContentView(
+      dynamic provider, dynamic service) {
+    if (_isLoadingLibraryContent) {
+      return const Center(
+        child: AdaptiveMediaActivityIndicator(),
+      );
+    }
+
+    if (_error != null) {
+      return NipaplayLargeScreenEmptyState(
+        icon: Icons.error_outline_rounded,
+        title: '加载媒体库失败',
+        subtitle: _error!,
+        action: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            NipaplayLargeScreenActionButton(
+              icon: Icons.refresh_rounded,
+              label: '重试',
+              onPressed: _retryCurrentView,
+            ),
+            const SizedBox(width: 12),
+            NipaplayLargeScreenActionButton(
+              icon: Icons.arrow_back_rounded,
+              label: '返回',
+              onPressed: _handleBackNavigation,
+            ),
+          ],
+        ),
+      );
+    }
+
+    final items = _isSearching ? _searchResults : _filteredMediaItems;
+    final title = _getCurrentViewTitle(provider);
+
+    return Column(
+      children: [
+        _buildLargeScreenRemoteTopBar(
+          title: title,
+          onSearchChanged: _onSearchChanged,
+          showBack: true,
+          showRemoteSort: _showRemoteSortDropdown,
+        ),
+        if (!_showRemoteSortDropdown) ...[
+          const SizedBox(height: 14),
+          _buildLargeScreenLocalSortRow(),
+        ],
+        const SizedBox(height: 18),
+        Expanded(
+          child: _mediaItems.isEmpty
+              ? NipaplayLargeScreenEmptyState(
+                  icon: _isFolderNavigation
+                      ? Icons.folder_off_outlined
+                      : Icons.video_library_outlined,
+                  title: _isFolderNavigation ? '该文件夹为空' : '该媒体库为空',
+                  subtitle: '返回上一级或刷新服务器内容后再试',
+                  action: NipaplayLargeScreenActionButton(
+                    icon: Icons.arrow_back_rounded,
+                    label: _isFolderNavigation && !_isAtFolderRoot
+                        ? '返回上级文件夹'
+                        : '返回媒体库列表',
+                    onPressed: _handleBackNavigation,
+                  ),
+                )
+              : _buildLargeScreenMediaGrid(items),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLargeScreenRemoteTopBar({
+    required String title,
+    required ValueChanged<String> onSearchChanged,
+    required bool showBack,
+    required bool showRemoteSort,
+  }) {
+    final textColor = Theme.of(context).brightness == Brightness.dark
+        ? Colors.white
+        : const Color(0xFF151820);
+    return Row(
+      children: [
+        if (showBack) ...[
+          NipaplayLargeScreenIconButton(
+            icon: Icons.arrow_back_rounded,
+            tooltip: '返回',
+            onPressed: _handleBackNavigation,
+            autofocus: true,
+          ),
+          const SizedBox(width: 12),
+        ],
+        Expanded(
+          child: NipaplayLargeScreenTextInput(
+            controller: _searchController,
+            hintText: '搜索 $title',
+            onChanged: onSearchChanged,
+            suffix: _searchController.text.isEmpty
+                ? null
+                : AdaptiveMediaIconButton(
+                    tooltip: '清空搜索',
+                    onPressed: _clearSearch,
+                    desktopIcon: Icons.close_rounded,
+                    phoneIcon: cupertino.CupertinoIcons.clear,
+                  ),
+          ),
+        ),
+        const SizedBox(width: 14),
+        if (showRemoteSort) ...[
+          NipaplayLargeScreenActionButton(
+            icon: Icons.sort_rounded,
+            label: _showOnlyUnwatched ? '排序·未看' : '排序',
+            onPressed: _showLargeScreenRemoteSortDialog,
+          ),
+          const SizedBox(width: 10),
+        ],
+        NipaplayLargeScreenActionButton(
+          icon: Icons.refresh_rounded,
+          label: '刷新',
+          onPressed: _manualRefresh,
+        ),
+        const SizedBox(width: 10),
+        NipaplayLargeScreenActionButton(
+          icon: Ionicons.settings_outline,
+          label: '服务器',
+          onPressed: _showServerDialog,
+        ),
+        const SizedBox(width: 14),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 260),
+          child: Text(
+            title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.right,
+            style: TextStyle(
+              color: textColor.withValues(alpha: 0.68),
+              fontSize: 14,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLargeScreenLocalSortRow() {
+    return Row(
+      children: [
+        _buildLargeScreenSortChip(
+          label: '最近更新',
+          icon: Icons.schedule_rounded,
+          type: LocalLibrarySortType.dateAdded,
+        ),
+        const SizedBox(width: 10),
+        _buildLargeScreenSortChip(
+          label: '名称',
+          icon: Icons.sort_by_alpha_rounded,
+          type: LocalLibrarySortType.name,
+        ),
+        const SizedBox(width: 10),
+        _buildLargeScreenSortChip(
+          label: '评分',
+          icon: Icons.star_rounded,
+          type: LocalLibrarySortType.rating,
+        ),
+        const Spacer(),
+        if (_isSearchLoading)
+          SizedBox(
+            width: 20,
+            height: 20,
+            child: AdaptiveMediaActivityIndicator(
+              color: _accentColor,
+              size: 20,
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildLargeScreenSortChip({
+    required String label,
+    required IconData icon,
+    required LocalLibrarySortType type,
+  }) {
+    final selected = _currentSort == type;
+    return NipaplayLargeScreenFocusableAction(
+      onActivate: () {
+        if (_currentSort == type) return;
+        setState(() => _currentSort = type);
+        _applySortAndFilter();
+      },
+      borderRadius: BorderRadius.circular(8),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+      focusScale: 1.04,
+      style: NipaplayLargeScreenFocusableStyle(
+        idleBackgroundDark: selected
+            ? _accentColor.withValues(alpha: 0.26)
+            : Colors.white.withValues(alpha: 0.09),
+        idleBackgroundLight: selected
+            ? _accentColor.withValues(alpha: 0.18)
+            : Colors.white.withValues(alpha: 0.82),
+        focusStrokeColor: selected ? _accentColor : null,
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 18),
+          const SizedBox(width: 8),
+          Text(
+            label,
+            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenLibraryCard(
+    NetworkMediaLibrary library, {
+    required bool autofocus,
+  }) {
+    final textColor = Theme.of(context).brightness == Brightness.dark
+        ? Colors.white
+        : const Color(0xFF151820);
+    final typeLabel = library.type.isEmpty ? '媒体库' : library.type;
+
+    return NipaplayLargeScreenFocusableAction(
+      autofocus: autofocus,
+      onActivate: () => _selectLibrary(library),
+      borderRadius: BorderRadius.circular(8),
+      padding: const EdgeInsets.all(18),
+      focusScale: 1.025,
+      style: NipaplayLargeScreenFocusableStyle(
+        idleBackgroundDark: Colors.white.withValues(alpha: 0.08),
+        idleBackgroundLight: Colors.white.withValues(alpha: 0.82),
+        focusStrokeWidth: 2.4,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.video_library_outlined, color: _accentColor, size: 34),
+              const Spacer(),
+              _buildLargeScreenTinyBadge(typeLabel),
+            ],
+          ),
+          const Spacer(),
+          Text(
+            library.name,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: textColor,
+              fontSize: 24,
+              fontWeight: FontWeight.w900,
+              height: 1.05,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            '浏览 $_serverName 中的内容',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: textColor.withValues(alpha: 0.58),
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenMediaGrid(List<NetworkMediaItem> items) {
+    if (items.isEmpty) {
+      final filteredEmpty = !_isSearching && _showOnlyUnwatched;
+      return NipaplayLargeScreenEmptyState(
+        icon:
+            filteredEmpty ? Ionicons.eye_off_outline : Icons.search_off_rounded,
+        title: filteredEmpty ? '没有未观看的条目' : '没有匹配结果',
+        subtitle: filteredEmpty ? '关闭“只看未观看”或刷新后再试' : '换个关键词再试试',
+      );
+    }
+
+    return GridView.builder(
+      controller: _gridScrollController,
+      padding: const EdgeInsets.only(bottom: 96),
+      physics: const AlwaysScrollableScrollPhysics(
+        parent: BouncingScrollPhysics(),
+      ),
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 242,
+        mainAxisExtent: 466,
+        crossAxisSpacing: 18,
+        mainAxisSpacing: 18,
+      ),
+      itemCount: items.length,
+      itemBuilder: (context, index) {
+        return _buildLargeScreenMediaCard(
+          items[index],
+          autofocus: index == 0,
+        );
+      },
+    );
+  }
+
+  Widget _buildLargeScreenMediaCard(
+    NetworkMediaItem item, {
+    required bool autofocus,
+  }) {
+    final textColor = Theme.of(context).brightness == Brightness.dark
+        ? Colors.white
+        : const Color(0xFF151820);
+    final imageUrl = _getNetworkMediaImageUrl(item, width: 460);
+    final fallbackPoster = item.isFolder
+        ? _buildLargeScreenFolderPoster(textColor)
+        : _buildLargeScreenFallbackPoster(textColor);
+
+    return NipaplayLargeScreenFocusableAction(
+      autofocus: autofocus,
+      onActivate: () => _openMediaDetail(item),
+      borderRadius: BorderRadius.circular(8),
+      padding: EdgeInsets.zero,
+      focusScale: 1,
+      style: NipaplayLargeScreenFocusableStyle(
+        idleBackgroundDark: Colors.white.withValues(alpha: 0.07),
+        idleBackgroundLight: Colors.white.withValues(alpha: 0.82),
+        focusStrokeWidth: 2.4,
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            AspectRatio(
+              aspectRatio: 2 / 3,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  if (imageUrl.isNotEmpty)
+                    CachedNetworkImageWidget(
+                      imageUrl: imageUrl,
+                      fit: BoxFit.cover,
+                      // 封面 URL 本身就是 460 宽的缩放版本；不限制解码尺寸时
+                      // 会按原始分辨率整图解码（每张可达数 MB），在 32MB 的
+                      // 电视字节预算下反复淘汰重解码，封面墙会加载到一半停住。
+                      memCacheWidth: 460,
+                      memCacheHeight: 690,
+                      errorBuilder: (_, __) => fallbackPoster,
+                    )
+                  else
+                    fallbackPoster,
+                  Positioned.fill(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [
+                            Colors.transparent,
+                            Colors.black.withValues(alpha: 0.74),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  Positioned(
+                    top: 10,
+                    left: 10,
+                    child: _buildLargeScreenTinyBadge(
+                      item.isFolder ? '文件夹' : _serverName,
+                    ),
+                  ),
+                  if (item.progress != null)
+                    Positioned(
+                      left: 10,
+                      right: 10,
+                      bottom: 10,
+                      child: Text(
+                        item.progress!,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    item.title,
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: textColor,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w900,
+                      height: 1.15,
+                    ),
+                  ),
+                  if (item.overview != null &&
+                      item.overview!.trim().isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      item.overview!,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: textColor.withValues(alpha: 0.52),
+                        fontSize: 12,
+                        height: 1.26,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenFolderPoster(Color textColor) {
+    return Container(
+      color: Colors.white.withValues(alpha: 0.08),
+      child: Center(
+        child: Icon(
+          Icons.folder_open_rounded,
+          color: textColor.withValues(alpha: 0.56),
+          size: 74,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenFallbackPoster(Color textColor) {
+    return Container(
+      color: Colors.white.withValues(alpha: 0.08),
+      child: Center(
+        child: Icon(
+          Icons.movie_creation_outlined,
+          color: textColor.withValues(alpha: 0.46),
+          size: 52,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenTinyBadge(String label) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.58),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+        child: Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 11,
+            fontWeight: FontWeight.w900,
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _getNetworkMediaImageUrl(NetworkMediaItem item, {int width = 300}) {
+    switch (widget.serverType) {
+      case NetworkMediaServerType.jellyfin:
+        final jellyfinItem = (item as JellyfinMediaItemAdapter).originalItem;
+        return jellyfinItem.imagePrimaryTag != null
+            ? JellyfinService.instance
+                .getImageUrl(jellyfinItem.id, width: width)
+            : '';
+      case NetworkMediaServerType.emby:
+        final embyItem = (item as EmbyMediaItemAdapter).originalItem;
+        return embyItem.imagePrimaryTag != null
+            ? EmbyService.instance.getImageUrl(embyItem.id, width: width)
+            : '';
+    }
+  }
+
+  Future<void> _showLargeScreenRemoteSortDialog() async {
+    final provider = _provider;
+    final currentSortSettings = _getCurrentRemoteSortSettings(provider);
+    final items = _buildRemoteSortItems(
+      currentSortSettings['sortBy'] ?? provider.currentSortBy,
+      currentSortSettings['sortOrder'] ?? provider.currentSortOrder,
+    );
+    final selection = await showInViewDialog<_RemoteSortSelection>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: 0.54),
+      builder: (context) {
+        return Dialog(
+          backgroundColor: Colors.transparent,
+          insetPadding:
+              const EdgeInsets.symmetric(horizontal: 240, vertical: 120),
+          child: NipaplayLargeScreenPanel(
+            padding: const EdgeInsets.all(18),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 560, maxWidth: 560),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const NipaplayLargeScreenSectionHeader(
+                    title: '排序',
+                    subtitle: '选择当前媒体库的排序方式',
+                  ),
+                  const SizedBox(height: 14),
+                  Expanded(
+                    child: SingleChildScrollView(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          _buildLargeScreenRemoteUnwatchedTile(context),
+                          const SizedBox(height: 8),
+                          const Padding(
+                            padding: EdgeInsets.only(left: 4, bottom: 8),
+                            child: Text(
+                              '排序方式',
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ),
+                          for (var index = 0;
+                              index < items.length;
+                              index++) ...[
+                            if (index > 0) const SizedBox(height: 8),
+                            _buildLargeScreenRemoteSortItem(
+                              context,
+                              items[index],
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    if (selection != null) {
+      _applyRemoteSortSelection(selection);
+    }
+  }
+
+  Widget _buildLargeScreenRemoteUnwatchedTile(BuildContext dialogContext) {
+    return NipaplayLargeScreenFocusableAction(
+      isSelected: _showOnlyUnwatched,
+      onActivate: () {
+        _toggleShowOnlyUnwatched();
+        Navigator.of(dialogContext).pop();
+      },
+      borderRadius: BorderRadius.circular(8),
+      padding: const EdgeInsets.all(14),
+      child: Row(
+        children: [
+          Icon(
+            _showOnlyUnwatched
+                ? Ionicons.eye_off_outline
+                : Ionicons.eye_outline,
+            size: 18,
+            color: _showOnlyUnwatched ? _accentColor : null,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '只看未观看',
+                  style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '仅显示服务器上还没看完的条目',
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.62),
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (_showOnlyUnwatched)
+            Icon(
+              Icons.check_rounded,
+              size: 18,
+              color: _accentColor,
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLargeScreenRemoteSortItem(
+    BuildContext dialogContext,
+    DropdownMenuItemData<_RemoteSortSelection> item,
+  ) {
+    final value = item.value;
+    final description = value.description;
+    return NipaplayLargeScreenFocusableAction(
+      isSelected: item.isSelected,
+      onActivate: () => Navigator.of(dialogContext).pop(value),
+      borderRadius: BorderRadius.circular(8),
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  item.title,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ),
+              if (item.isSelected)
+                Icon(
+                  Icons.check_rounded,
+                  size: 18,
+                  color: _accentColor,
+                ),
+            ],
+          ),
+          if (description?.isNotEmpty == true) ...[
+            const SizedBox(height: 4),
+            Text(
+              description!,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.62),
+                fontSize: 12,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
   }
 
   Widget _buildLibrariesView(dynamic provider, dynamic service) {
@@ -404,10 +1225,8 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
         // 媒体库网格或搜索结果
         Expanded(
           child: RepaintBoundary(
-            child: Scrollbar(
+            child: AdaptiveMediaScrollbar(
               controller: _gridScrollController,
-              thickness: 4,
-              radius: const Radius.circular(2),
               child: _isSearching
                   ? GridView.builder(
                       controller: _gridScrollController,
@@ -467,8 +1286,9 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
     final showSummary =
         context.watch<AppearanceSettingsProvider>().showAnimeCardSummary;
     if (_isLoadingLibraryContent) {
-      return Center(
-          child: CircularProgressIndicator(color: _accentColor));
+      return const Center(
+        child: AdaptiveMediaActivityIndicator(),
+      );
     }
 
     if (_error != null) {
@@ -545,45 +1365,76 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
         // 媒体内容网格/文件夹列表
         Expanded(
           child: RepaintBoundary(
-            child: Scrollbar(
+            child: AdaptiveMediaScrollbar(
               controller: _gridScrollController,
-              thickness: 4,
-              radius: const Radius.circular(2),
               child: _isFolderNavigation
                   ? _buildFolderListView()
-                  : GridView.builder(
-                      controller: _gridScrollController,
-                      gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
-                        maxCrossAxisExtent: showSummary
-                            ? HorizontalAnimeCard.detailedGridMaxCrossAxisExtent
-                            : HorizontalAnimeCard.compactGridMaxCrossAxisExtent,
-                        mainAxisExtent: showSummary
-                            ? HorizontalAnimeCard.detailedCardHeight
-                            : HorizontalAnimeCard.compactCardHeight,
-                        crossAxisSpacing: 16,
-                        mainAxisSpacing: 16,
-                      ),
-                      padding: const EdgeInsets.all(16),
-                      cacheExtent: 800,
-                      clipBehavior: Clip.hardEdge,
-                      physics: const AlwaysScrollableScrollPhysics(
-                          parent: BouncingScrollPhysics()),
-                      addAutomaticKeepAlives: false,
-                      addRepaintBoundaries: true,
-                      itemCount: _isSearching
-                          ? _searchResults.length
-                          : _filteredMediaItems.length,
-                      itemBuilder: (context, index) {
-                        final item = _isSearching
-                            ? _searchResults[index]
-                            : _filteredMediaItems[index];
-                        return _buildMediaCard(item);
-                      },
-                    ),
+                  : (_isSearching ? _searchResults : _filteredMediaItems)
+                          .isEmpty
+                      ? _buildEmptyResultsPlaceholder()
+                      : GridView.builder(
+                          controller: _gridScrollController,
+                          gridDelegate:
+                              SliverGridDelegateWithMaxCrossAxisExtent(
+                            maxCrossAxisExtent: showSummary
+                                ? HorizontalAnimeCard
+                                    .detailedGridMaxCrossAxisExtent
+                                : HorizontalAnimeCard
+                                    .compactGridMaxCrossAxisExtent,
+                            mainAxisExtent: showSummary
+                                ? HorizontalAnimeCard.detailedCardHeight
+                                : HorizontalAnimeCard.compactCardHeight,
+                            crossAxisSpacing: 16,
+                            mainAxisSpacing: 16,
+                          ),
+                          padding: const EdgeInsets.all(16),
+                          cacheExtent: 800,
+                          clipBehavior: Clip.hardEdge,
+                          physics: const AlwaysScrollableScrollPhysics(
+                              parent: BouncingScrollPhysics()),
+                          addAutomaticKeepAlives: false,
+                          addRepaintBoundaries: true,
+                          itemCount: _isSearching
+                              ? _searchResults.length
+                              : _filteredMediaItems.length,
+                          itemBuilder: (context, index) {
+                            final item = _isSearching
+                                ? _searchResults[index]
+                                : _filteredMediaItems[index];
+                            return _buildMediaCard(item);
+                          },
+                        ),
             ),
           ),
         ),
       ],
+    );
+  }
+
+  Widget _buildEmptyResultsPlaceholder() {
+    final filteredEmpty = !_isSearching && _showOnlyUnwatched;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              filteredEmpty
+                  ? Ionicons.eye_off_outline
+                  : Icons.search_off_rounded,
+              color: Colors.grey,
+              size: 48,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              filteredEmpty ? '没有未观看的条目' : '没有匹配结果',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.grey, fontSize: 16),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -607,10 +1458,11 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
     }
   }
 
-  Widget _buildServerSettingsAction() {
-    return SearchBarActionButton(
-      icon: Ionicons.settings_outline,
-      tooltip: '$_serverName服务器设置',
+  LocalLibraryActionControl _buildServerSettingsAction() {
+    return LocalLibraryActionControl(
+      label: '$_serverName服务器设置',
+      desktopIcon: Ionicons.settings_outline,
+      phoneIcon: cupertino.CupertinoIcons.settings,
       onPressed: _showServerDialog,
     );
   }
@@ -686,8 +1538,7 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
             ? Ionicons.folder_outline
             : Ionicons.play_circle_outline;
 
-        return ListTile(
-          dense: true,
+        return AdaptiveMediaListTile(
           leading: Icon(icon, color: Colors.white70, size: 20),
           title: Text(
             item.title,
@@ -752,7 +1603,14 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
       return;
     }
 
-    if (mounted) {
+    final revision = ++_contentLoadRevision;
+    final server = (_provider.serverUrl, _provider.username);
+    bool current() =>
+        mounted &&
+        revision == _contentLoadRevision &&
+        server == (_provider.serverUrl, _provider.username) &&
+        !_isShowingLibraryContent;
+    if (current()) {
       setState(() {
         _error = null;
       });
@@ -766,6 +1624,7 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
         case NetworkMediaServerType.jellyfin:
           items = await (service as JellyfinService).getLatestMediaItems(
             limit: 99999,
+            isCurrent: current,
             sortBy: provider.currentSortBy,
             sortOrder: provider.currentSortOrder,
           );
@@ -774,21 +1633,22 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
           items = await (service as EmbyService).getLatestMediaItems(
             limitPerLibrary: 99999,
             totalLimit: 99999,
+            isCurrent: current,
             sortBy: provider.currentSortBy,
             sortOrder: provider.currentSortOrder,
           );
           break;
       }
 
-      if (mounted && !_isShowingLibraryContent) {
+      if (current()) {
         setState(() {
           _mediaItems = _convertToNetworkMediaItems(items);
           _applySortAndFilter();
         });
       }
-      _setupRefreshTimer();
+      if (current()) _setupRefreshTimer();
     } catch (e) {
-      if (mounted) {
+      if (current()) {
         setState(() {
           _error = e.toString();
         });
@@ -805,6 +1665,7 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
 
     final showLocalSort = !_showRemoteSortDropdown;
     final trailingActions = [
+      _buildRefreshAction(),
       _buildServerSettingsAction(),
       if (_showRemoteSortDropdown) _buildRemoteSortDropdown(),
     ];
@@ -838,6 +1699,7 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
         _applySortAndFilter();
       },
       trailingActions: [
+        _buildRefreshAction(),
         _buildServerSettingsAction(),
       ],
     );
@@ -858,15 +1720,27 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
         return;
       }
 
-      final keyword = query.trim().toLowerCase();
-      final results = _mediaItems
-          .where((item) => item.title.toLowerCase().contains(keyword))
-          .toList();
-
-      setState(() {
-        _isSearching = true;
-        _searchResults = results;
-        _isSearchLoading = false;
+      final items = _mediaItems;
+      final folderId = _currentFolderId;
+      final libraryId = _selectedLibraryId;
+      _searchDebounceTimer = Timer(const Duration(milliseconds: 150), () {
+        if (!mounted ||
+            !_isFolderNavigation ||
+            !identical(items, _mediaItems) ||
+            folderId != _currentFolderId ||
+            libraryId != _selectedLibraryId ||
+            _searchController.text != query) {
+          return;
+        }
+        final keyword = query.trim().toLowerCase();
+        final results = items
+            .where((item) => item.title.toLowerCase().contains(keyword))
+            .toList();
+        setState(() {
+          _isSearching = true;
+          _searchResults = results;
+          _isSearchLoading = false;
+        });
       });
       return;
     }
@@ -1146,6 +2020,13 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
   // 加载媒体库内容
   Future<void> _loadLibraryContent(String libraryId) async {
     if (!mounted) return;
+    final revision = ++_contentLoadRevision;
+    final server = (_provider.serverUrl, _provider.username);
+    bool current() =>
+        mounted &&
+        revision == _contentLoadRevision &&
+        server == (_provider.serverUrl, _provider.username) &&
+        _selectedLibraryId == libraryId;
 
     if (_isFolderNavigation) {
       await _loadFolderItems(libraryId);
@@ -1166,21 +2047,23 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
               await (service as JellyfinService).getLatestMediaItemsByLibrary(
             libraryId,
             limit: 99999,
-            sortBy: sortSettings['sortBy']!,
-            sortOrder: sortSettings['sortOrder']!,
+            isCurrent: current,
+            sortBy: sortSettings['sortBy'] ?? provider.currentSortBy,
+            sortOrder: sortSettings['sortOrder'] ?? provider.currentSortOrder,
           );
           break;
         case NetworkMediaServerType.emby:
           items = await (service as EmbyService).getLatestMediaItemsByLibrary(
             libraryId,
             limit: 99999,
-            sortBy: sortSettings['sortBy']!,
-            sortOrder: sortSettings['sortOrder']!,
+            isCurrent: current,
+            sortBy: sortSettings['sortBy'] ?? provider.currentSortBy,
+            sortOrder: sortSettings['sortOrder'] ?? provider.currentSortOrder,
           );
           break;
       }
 
-      if (mounted) {
+      if (current()) {
         setState(() {
           _mediaItems = _convertToNetworkMediaItems(items);
           _applySortAndFilter();
@@ -1188,9 +2071,9 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
           _error = null;
         });
       }
-      _setupRefreshTimer();
+      if (current()) _setupRefreshTimer();
     } catch (e) {
-      if (mounted) {
+      if (current()) {
         setState(() {
           _error = e.toString();
           _isLoadingLibraryContent = false;
@@ -1201,8 +2084,16 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
 
   Future<void> _loadFolderItems(String parentId) async {
     if (!mounted) return;
+    final revision = ++_contentLoadRevision;
+    final server = (_provider.serverUrl, _provider.username);
+    bool current() =>
+        mounted &&
+        revision == _contentLoadRevision &&
+        server == (_provider.serverUrl, _provider.username) &&
+        _folderStack.isNotEmpty &&
+        _folderStack.last.id == parentId;
 
-    if (mounted) {
+    if (current()) {
       setState(() {
         _isLoadingLibraryContent = true;
         _error = null;
@@ -1218,17 +2109,19 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
           items = await (service as JellyfinService).getFolderItems(
             parentId,
             limit: 99999,
+            isCurrent: current,
           );
           break;
         case NetworkMediaServerType.emby:
           items = await (service as EmbyService).getFolderItems(
             parentId,
             limit: 99999,
+            isCurrent: current,
           );
           break;
       }
 
-      if (mounted) {
+      if (current()) {
         setState(() {
           _mediaItems = _convertToNetworkMediaItems(items);
           _applySortAndFilter();
@@ -1236,9 +2129,9 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
           _error = null;
         });
       }
-      _setupRefreshTimer();
+      if (current()) _setupRefreshTimer();
     } catch (e) {
-      if (mounted) {
+      if (current()) {
         setState(() {
           _error = e.toString();
           _isLoadingLibraryContent = false;
@@ -1247,9 +2140,24 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
     }
   }
 
+  bool _hasBeenActive = false;
+  @override
+  void onPageActivityChanged(bool active) {
+    if (active) {
+      _setupRefreshTimer();
+      if (_hasBeenActive && !_isLoadingLibraryContent) {
+        unawaited(_manualRefresh());
+      }
+      _hasBeenActive = true;
+    } else {
+      _refreshTimer?.cancel();
+    }
+  }
+
   // 设置刷新定时器
   void _setupRefreshTimer() {
     _refreshTimer?.cancel();
+    if (!mounted || !isPageActive) return;
     _refreshTimer = Timer.periodic(const Duration(minutes: 60), (timer) {
       if (_isShowingLibraryContent) {
         if (_isFolderNavigation) {
@@ -1335,19 +2243,101 @@ class _NetworkMediaLibraryViewState extends State<NetworkMediaLibraryView>
     }
   }
 
-  Widget _buildRemoteSortDropdown() {
+  LocalLibraryActionControl _buildRemoteSortDropdown() {
+    return LocalLibraryActionControl(
+      label: _showOnlyUnwatched ? '排序（只看未观看）' : '排序',
+      desktopIcon: Icons.sort_rounded,
+      phoneIcon: cupertino.CupertinoIcons.arrow_up_arrow_down,
+      onPressed: _showAdaptiveRemoteSortDialog,
+    );
+  }
+
+  LocalLibraryActionControl _buildRefreshAction() {
+    return LocalLibraryActionControl(
+      label: '刷新',
+      desktopIcon: Icons.refresh,
+      phoneIcon: cupertino.CupertinoIcons.refresh,
+      onPressed: _manualRefresh,
+    );
+  }
+
+  Future<void> _showAdaptiveRemoteSortDialog() async {
+    if (AppDisplaySurfaceScope.of(context) != AppDisplaySurface.phone) {
+      await _showLargeScreenRemoteSortDialog();
+      return;
+    }
     final provider = _provider;
     final currentSortSettings = _getCurrentRemoteSortSettings(provider);
     final items = _buildRemoteSortItems(
-      currentSortSettings['sortBy']!,
-      currentSortSettings['sortOrder']!,
+      currentSortSettings['sortBy'] ?? provider.currentSortBy,
+      currentSortSettings['sortOrder'] ?? provider.currentSortOrder,
     );
 
-    return BlurDropdown<_RemoteSortSelection>(
-      dropdownKey: _remoteSortDropdownKey,
-      items: items,
-      onItemSelected: _applyRemoteSortSelection,
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final contentHeight = 112.0 + (items.length + 1) * 52.0;
+    final effectiveHeightRatio =
+        (contentHeight / screenHeight).clamp(0.3, 0.82).toDouble();
+
+    final selection = await CupertinoBottomSheet.show<_RemoteSortSelection>(
+      context: context,
+      title: '排序',
+      heightRatio: effectiveHeightRatio,
+      child: CupertinoBottomSheetContentLayout(
+        sliversBuilder: (sheetContext, topSpacing) => [
+          SliverPadding(
+            padding: EdgeInsets.fromLTRB(12, topSpacing + 4, 12, 24),
+            sliver: SliverToBoxAdapter(
+              child: cupertino.CupertinoListSection.insetGrouped(
+                margin: EdgeInsets.zero,
+                children: [
+                  cupertino.CupertinoListTile(
+                    leading: Icon(
+                      _showOnlyUnwatched
+                          ? cupertino.CupertinoIcons.eye_slash
+                          : cupertino.CupertinoIcons.eye,
+                      size: 20,
+                    ),
+                    title: const Text('只看未观看'),
+                    trailing: _showOnlyUnwatched
+                        ? Icon(
+                            cupertino.CupertinoIcons.check_mark,
+                            size: 18,
+                            color: cupertino.CupertinoTheme.of(sheetContext)
+                                .primaryColor,
+                          )
+                        : null,
+                    onTap: () {
+                      _toggleShowOnlyUnwatched();
+                      Navigator.of(sheetContext).pop();
+                    },
+                  ),
+                  for (final item in items)
+                    cupertino.CupertinoListTile(
+                      title: Text(item.title),
+                      subtitle: item.description == null
+                          ? null
+                          : Text(item.description!),
+                      trailing: item.isSelected
+                          ? Icon(
+                              cupertino.CupertinoIcons.check_mark,
+                              size: 18,
+                              color: cupertino.CupertinoTheme.of(sheetContext)
+                                  .primaryColor,
+                            )
+                          : null,
+                      onTap: () =>
+                          Navigator.of(sheetContext).pop<_RemoteSortSelection>(
+                        item.value,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
     );
+    if (selection != null) _applyRemoteSortSelection(selection);
   }
 
   Map<String, String> _getCurrentRemoteSortSettings(dynamic provider) {

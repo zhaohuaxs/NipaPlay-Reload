@@ -821,8 +821,18 @@ class VideoPlayerAdapter implements AbstractPlayer, TickerProvider {
   }
 
   @override
+  void setUserAgent(String ua) {
+    // video_player 插件无设置 HTTP User-Agent 的能力，留空实现。
+  }
+
+  @override
   Future<void> setVideoSurfaceSize({int? width, int? height}) async {
     // video_player 插件使用 Flutter 纹理，由外层控制，保持空实现。
+  }
+
+  @override
+  Future<void> setChapter(int index) async {
+    // video_player 适配器不支持 MKV 章节。
   }
 
   /// 尝试创建或重建控制器
@@ -1141,6 +1151,21 @@ class VideoPlayerAdapter implements AbstractPlayer, TickerProvider {
   @override
   void setPlaybackRate(double rate) {
     playbackRate = rate; // 这将调用setter
+  }
+
+  @override
+  void stepForward() {
+    // video_player 不支持逐帧，使用 seek 模拟
+    final frameDuration = 42; // ~24fps
+    final currentPos = position;
+    seek(position: currentPos + frameDuration);
+  }
+
+  @override
+  void stepBackward() {
+    final frameDuration = 42; // ~24fps
+    final currentPos = position;
+    seek(position: (currentPos - frameDuration).clamp(0, currentPos));
   }
 
   // 提供详细播放技术信息（video_player能力有限，返回基础信息）

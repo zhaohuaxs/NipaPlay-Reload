@@ -10,4 +10,10 @@ const List<String> kAcknowledgementNames = [
   '博易伯伯',
   '千葉あおい',
   'Kean',
+  'SKYWOW',
+  '爱跑步的男孩',
+  'Bassman',
+  '银蓝_Yl',
+  '小石絹代',
+  '泉こなた',
 ];

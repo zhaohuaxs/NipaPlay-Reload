@@ -14,6 +14,102 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Precache Flutter Windows artifacts
+      shell: pwsh
+      run: flutter precache --windows
+
+    - name: Setup Rust for Erika native core
+      if: env.ERIKA_PREBUILT != '1' || env.ERIKA_FORCE_SOURCE_BUILD == '1'
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-pc-windows-msvc
+
+    - name: Setup MSYS2 tools for Erika native dependencies
+      if: env.ERIKA_PREBUILT != '1' || env.ERIKA_FORCE_SOURCE_BUILD == '1'
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        # Operate on the runner's pre-installed C:\msys64 (the path Erika's xtask
+        # and the check below hard-code) instead of a fresh MSYS2 under RUNNER_TEMP,
+        # so the installed packages land in C:\msys64\usr\bin.
+        release: false
+        update: false
+        path-type: inherit
+        install: >-
+          make
+          tar
+          diffutils
+          coreutils
+          pkgconf
+          perl
+
+    - name: Configure Erika Windows native build
+      if: env.ERIKA_PREBUILT != '1' || env.ERIKA_FORCE_SOURCE_BUILD == '1'
+      shell: pwsh
+      run: |
+        git config --global core.longpaths true
+        "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+        $llvmBin = "C:\Program Files\LLVM\bin"
+        $msysLlvmBin = "C:\msys64\mingw64\bin"
+        if (-not (Test-Path (Join-Path $llvmBin "libclang.dll")) -and
+            -not (Test-Path (Join-Path $msysLlvmBin "libclang.dll"))) {
+          choco install llvm -y --no-progress
+        }
+
+        if (Test-Path (Join-Path $llvmBin "libclang.dll")) {
+          "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
+        } elseif (Test-Path (Join-Path $msysLlvmBin "libclang.dll")) {
+          "LIBCLANG_PATH=$msysLlvmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Add-Content -Path $env:GITHUB_PATH -Value $msysLlvmBin
+        } else {
+          throw "libclang.dll was not found after installing LLVM"
+        }
+
+        rustc --version
+        cargo --version
+        if (-not (Test-Path "C:\msys64\usr\bin\sh.exe")) {
+          throw "MSYS2 sh.exe was not found"
+        }
+        if (-not (Test-Path "C:\msys64\usr\bin\make.exe")) {
+          throw "MSYS2 make.exe was not found"
+        }
+        if (-not (Test-Path "C:\msys64\usr\bin\false.exe")) {
+          throw "MSYS2 false.exe was not found"
+        }
+
+    - name: Cache Erika Cargo dependencies
+      if: env.ERIKA_PREBUILT != '1' || env.ERIKA_FORCE_SOURCE_BUILD == '1'
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: windows-erika-cargo-${{ env.ERIKA_SHA || hashFiles('pubspec.lock') }}-v1
+        restore-keys: |
+          windows-erika-cargo-${{ env.ERIKA_SHA }}-
+          windows-erika-cargo-
+
+    - name: Restore Erika native dependency bundle
+      if: env.ERIKA_PREBUILT != '1' || env.ERIKA_FORCE_SOURCE_BUILD == '1'
+      id: restore-erika-native-deps
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.pub-cache/git/Erika-*/third_party/dist/x86_64-pc-windows-msvc/lgpl
+        key: windows-erika-native-x86_64-pc-windows-msvc-lgpl-${{ env.ERIKA_SHA || hashFiles('pubspec.lock') }}-v1
+        restore-keys: |
+          windows-erika-native-x86_64-pc-windows-msvc-lgpl-
+
+    - name: Restore Erika native source archives
+      if: env.ERIKA_PREBUILT != '1' || env.ERIKA_FORCE_SOURCE_BUILD == '1'
+      id: restore-erika-native-sources
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.pub-cache/git/Erika-*/third_party/cache
+        key: windows-erika-native-sources-v1
+
     - name: Setup Chinese Font for Windows
       shell: pwsh
       run: |
@@ -32,13 +128,164 @@ runs:
         }
         cd ..
     
+    - name: Pre-download FVP mdk-sdk (workaround symlink extraction issue)
+      shell: pwsh
+      run: |
+        # FVP's deps.cmake extracts mdk-sdk into CMAKE_CURRENT_SOURCE_DIR, which
+        # resolves through Flutter's .plugin_symlinks to a UNC path (\\?\D:\...).
+        # CMake's "cmake -E tar" cannot extract 7z archives through such paths.
+        # Workaround: pre-download and extract mdk-sdk into the real FVP package
+        # directory so that deps.cmake detects it and skips extraction.
+        $fvpDirs = Get-ChildItem -Path "$env:LOCALAPPDATA\Pub\Cache\hosted\pub.dev\fvp-*" -Directory -ErrorAction SilentlyContinue
+        if (-not $fvpDirs) {
+          # Fallback: try .pub-cache (older Flutter)
+          $fvpDirs = Get-ChildItem -Path "$env:USERPROFILE\.pub-cache\hosted\pub.dev\fvp-*" -Directory -ErrorAction SilentlyContinue
+        }
+        if (-not $fvpDirs) {
+          Write-Host "FVP package not found in pub cache; will rely on CMake extraction."
+          return
+        }
+        $fvpDir = $fvpDirs[0].FullName
+        $mdkSdkDir = Join-Path $fvpDir "windows\mdk-sdk"
+        $findMdk = Join-Path $mdkSdkDir "lib\cmake\FindMDK.cmake"
+        if (Test-Path $findMdk) {
+          Write-Host "mdk-sdk already exists at $mdkSdkDir; skipping pre-download."
+          return
+        }
+
+        $mdkSdkPkg = "mdk-sdk-windows-desktop-vs2022-x64.7z"
+        $archivePath = Join-Path $fvpDir "windows\$mdkSdkPkg"
+
+        # SourceForge intermittently serves an HTML interstitial/anti-bot page
+        # to CI runners instead of the 7z archive, which makes 7-Zip fail with
+        # "Is not archive". Download from several mirrors and validate the 7z
+        # magic bytes (37 7A BC AF 27 1C) before extracting; fall back to the
+        # GitHub release asset (which fvp's deps.cmake cannot use directly
+        # because it hardcodes the vs2022-x64 filename that only SourceForge has).
+        $sig = [byte[]](0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c)
+        $ua = @{ "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+
+        function Test-SevenZip {
+          param([string]$Path)
+          if (-not (Test-Path $Path)) { return $false }
+          $bytes = [System.IO.File]::ReadAllBytes($Path)
+          if ($bytes.Length -lt 6) { return $false }
+          for ($i = 0; $i -lt 6; $i++) { if ($bytes[$i] -ne $sig[$i]) { return $false } }
+          return $true
+        }
+
+        function Get-MdkSdkReleaseAsset {
+          param(
+            [object]$Release,
+            [string[]]$Patterns
+          )
+          foreach ($pattern in $Patterns) {
+            $asset = $Release.assets | Where-Object { $_.name -match $pattern } | Select-Object -First 1
+            if ($asset) { return $asset }
+          }
+          return $null
+        }
+
+        $candidates = @(
+          "https://sourceforge.net/projects/mdk-sdk/files/nightly/$mdkSdkPkg/download",
+          "https://downloads.sourceforge.net/project/mdk-sdk/nightly/$mdkSdkPkg",
+          "https://master.dl.sourceforge.net/project/mdk-sdk/nightly/$mdkSdkPkg"
+        )
+
+        $downloaded = $false
+        foreach ($url in $candidates) {
+          foreach ($attempt in 1..3) {
+            Write-Host "Downloading mdk-sdk from $url (attempt $attempt) ..."
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $archivePath -UseBasicParsing -TimeoutSec 180 -Headers $ua
+            } catch {
+              Write-Warning "Download error from $url : $($_.Exception.Message)"
+              continue
+            }
+            if (Test-SevenZip $archivePath) {
+              Write-Host "Got valid 7z archive from $url"
+              $downloaded = $true
+              break
+            }
+            $len = (Get-Item $archivePath).Length
+            Write-Warning "Response from $url was not a 7z archive (size=$len bytes, likely HTML interstitial); retrying."
+            Remove-Item $archivePath -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+          }
+          if ($downloaded) { break }
+        }
+
+        if (-not $downloaded) {
+          $releaseApi = "https://api.github.com/repos/wang-bin/mdk-sdk/releases/latest"
+          $headers = @{
+            "User-Agent" = "NipaPlay-Build"
+            "Accept" = "application/vnd.github+json"
+          }
+          if ($env:GITHUB_TOKEN) {
+            $headers["Authorization"] = "Bearer $($env:GITHUB_TOKEN)"
+          }
+          try {
+            $release = Invoke-RestMethod -Uri $releaseApi -Headers $headers -UseBasicParsing -TimeoutSec 60
+          } catch {
+            throw "Unable to query mdk-sdk latest release: $($_.Exception.Message)"
+          }
+          $assetPatterns = @(
+            "^mdk-sdk-windows-x64-vs[0-9]+\.7z$",
+            "^mdk-sdk-windows-vs[0-9]+\.7z$",
+            "^mdk-sdk-windows-x64\.7z$",
+            "^mdk-sdk-windows\.7z$",
+            "^mdk-sdk-windows-vs[0-9]+-ltl\.7z$"
+          )
+          $asset = Get-MdkSdkReleaseAsset -Release $release -Patterns $assetPatterns
+          if (-not $asset) {
+            $available = ($release.assets | ForEach-Object { $_.name }) -join ", "
+            throw "No compatible Windows mdk-sdk asset found in $($release.tag_name). Available assets: $available"
+          }
+          $ghPkg = $asset.name
+          $ghUrl = $asset.browser_download_url
+          $archivePath = Join-Path $fvpDir "windows\$ghPkg"
+          Write-Host "SourceForge mirrors unavailable; falling back to GitHub release $($release.tag_name) asset $ghPkg ..."
+          Invoke-WebRequest -Uri $ghUrl -OutFile $archivePath -UseBasicParsing -TimeoutSec 180 -Headers $ua
+          if (-not (Test-SevenZip $archivePath)) {
+            throw "GitHub fallback download was not a valid 7z archive: $archivePath"
+          }
+        }
+
+        # Extract using 7-Zip (CMake's tar can't handle 7z on Windows reliably)
+        $sevenZip = Join-Path ${env:ProgramFiles} "7-Zip\7z.exe"
+        if (-not (Test-Path $sevenZip)) {
+          choco install 7zip -y --no-progress
+        }
+        $windowsDir = Join-Path $fvpDir "windows"
+        Write-Host "Extracting mdk-sdk to $windowsDir ..."
+        & $sevenZip x $archivePath "-o$windowsDir" -y | Out-Null
+
+        if (Test-Path $findMdk) {
+          Write-Host "mdk-sdk pre-downloaded and extracted successfully."
+        } else {
+          throw "mdk-sdk extraction failed; FindMDK.cmake not found at $findMdk"
+        }
+
     - name: Build Web and copy assets
       shell: bash
       run: |
         chmod +x build_and_copy_web.sh
         ./build_and_copy_web.sh
 
+    - name: Refresh Pub dependencies (post-web build)
+      shell: bash
+      run: |
+        if [ ! -f "pubspec.lock" ]; then
+          echo "❌ pubspec.lock 不存在，无法使用 --enforce-lockfile。"
+          echo "当前目录: $(pwd)"
+          ls -la
+          exit 1
+        fi
+        flutter pub get --enforce-lockfile
+
     - name: Download full libmpv package
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
       shell: pwsh
       run: |
         $customUrl = $env:LIBMPV_DOWNLOAD_URL
@@ -114,7 +361,85 @@ runs:
       id: build
       shell: pwsh
       run: |
-        flutter build windows --release
+        function Show-ErikaNativeDiagnostics {
+          Write-Host "::group::Erika native diagnostics"
+          try {
+            $patterns = @()
+            if ($env:LOCALAPPDATA) {
+              $patterns += Join-Path $env:LOCALAPPDATA "Pub\Cache\git\Erika-*"
+            }
+            if ($env:USERPROFILE) {
+              $patterns += Join-Path $env:USERPROFILE ".pub-cache\git\Erika-*"
+            }
+            $patterns += "windows\flutter\ephemeral\.plugin_symlinks\erika_flutter"
+
+            $roots = @()
+            foreach ($pattern in $patterns) {
+              $roots += Get-ChildItem -Path $pattern -Directory -ErrorAction SilentlyContinue
+            }
+            if (-not $roots) {
+              Write-Host "No Erika checkout found in Pub cache or plugin symlinks."
+              return
+            }
+
+            $roots = $roots | Sort-Object FullName -Unique
+            foreach ($root in $roots) {
+              Write-Host "Erika root: $($root.FullName)"
+              $thirdParty = Join-Path $root.FullName "third_party"
+              if (-not (Test-Path $thirdParty)) {
+                Write-Host "third_party directory is missing."
+                continue
+              }
+
+              Write-Host "third_party top-level directories:"
+              Get-ChildItem -Path $thirdParty -Directory -ErrorAction SilentlyContinue |
+                Select-Object -First 20 |
+                ForEach-Object { Write-Host "  $($_.FullName)" }
+
+              $metadataFiles = Get-ChildItem -Path $thirdParty -Recurse -File -Filter "erika-native-deps.txt" -ErrorAction SilentlyContinue
+              foreach ($file in $metadataFiles) {
+                Write-Host "--- $($file.FullName) ---"
+                Get-Content -Path $file.FullName -Tail 200 -ErrorAction SilentlyContinue
+              }
+
+              $logFiles = Get-ChildItem -Path $thirdParty -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object {
+                  $_.FullName -match "[\\/]ffbuild[\\/]config\.log$" -or
+                  $_.Name -in @("config.log", "build.log")
+                } |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 8
+              foreach ($file in $logFiles) {
+                Write-Host "--- tail $($file.FullName) ---"
+                Get-Content -Path $file.FullName -Tail 300 -ErrorAction SilentlyContinue
+              }
+            }
+          } finally {
+            Write-Host "::endgroup::"
+          }
+        }
+
+        # --obfuscate + --split-debug-info：Dart 代码混淆 + 分离调试符号（体积↓ + 反逆向）
+        # symbol map 由 workflow 的 dart-symbols-* artifact 上传，用于 crash stack 反混淆
+        $flutterArgs = @(
+          "build",
+          "windows",
+          "--release",
+          "--no-pub",
+          "--obfuscate",
+          "--split-debug-info=build/symbols-windows"
+        )
+        if ($env:NIPAPLAY_VERBOSE_WINDOWS_BUILD -ne "0") {
+          $flutterArgs += "--verbose"
+        }
+        Write-Host "Running: flutter $($flutterArgs -join ' ')"
+        & flutter @flutterArgs
+        $flutterExitCode = $LASTEXITCODE
+        if ($flutterExitCode -ne 0) {
+          Show-ErikaNativeDiagnostics
+          throw "flutter build windows failed with exit code $flutterExitCode"
+        }
+
         $arch = "x64"
         $version = "${{ inputs.app-version }}"
         $DestDir = "build\windows\NipaPlay_${version}_Windows_x64"
@@ -134,6 +459,21 @@ runs:
         $zipPath = "build\windows\NipaPlay_${version}_Windows_x64.zip"
         Compress-Archive -Path $DestDir -DestinationPath $zipPath -Force
         echo "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
+
+    - name: Save Erika native dependency bundle
+      if: (env.ERIKA_PREBUILT != '1' || env.ERIKA_FORCE_SOURCE_BUILD == '1') && steps.restore-erika-native-deps.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.pub-cache/git/Erika-*/third_party/dist/x86_64-pc-windows-msvc/lgpl
+        key: ${{ steps.restore-erika-native-deps.outputs.cache-primary-key }}
+
+    - name: Save Erika native source archives
+      if: always() && (env.ERIKA_PREBUILT != '1' || env.ERIKA_FORCE_SOURCE_BUILD == '1') && steps.restore-erika-native-sources.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.pub-cache/git/Erika-*/third_party/cache
+        key: ${{ steps.restore-erika-native-sources.outputs.cache-primary-key }}
 
     - name: Install Inno Setup
       shell: pwsh

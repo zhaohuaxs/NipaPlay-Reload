@@ -29,6 +29,23 @@ class _SpoilerAiRequestConfig {
 }
 
 extension VideoPlayerStateDanmaku on VideoPlayerState {
+  // Only OHOS + MDK bounds the exit screenshot (it can stall after rotation).
+  // Other platforms still take the last-frame thumbnail while resetting.
+  bool get _skipsThumbnailCaptureWhileResetting =>
+      _isResetting &&
+      globals.isHarmonyOS &&
+      player.getPlayerKernelName() == 'MDK';
+
+  double get effectiveNativeDanmakuFontSize =>
+      actualDanmakuFontSize * _danmakuPresentationScale;
+
+  void setDanmakuPresentationScale(double scale) {
+    final normalized = scale.isFinite && scale > 0 ? scale : 1.0;
+    if ((_danmakuPresentationScale - normalized).abs() < 0.0001) return;
+    _danmakuPresentationScale = normalized;
+    _syncErikaDanmakuFontSize();
+  }
+
   // Whether the active player kernel renders danmaku natively (Erika).
   // When true, NipaPlay feeds its merged/filtered danmaku list to the kernel
   // and keeps its own Flutter danmaku overlay empty to avoid drawing twice.
@@ -45,6 +62,22 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
   // Public so the kernel hot-swap path can keep the Flutter overlay disabled.
   bool get isNativeDanmakuActive => _erikaNativeDanmaku;
 
+  /// Reconciles danmaku after the persisted plugin renderer changes. A player
+  /// kernel with native danmaku always keeps ownership; plugin selection only
+  /// becomes effective on playback kernels without native danmaku.
+  void handleDanmakuRendererChanged() {
+    try {
+      if (!player.supportsNativeDanmaku) {
+        _notifyListeners();
+        return;
+      }
+      _syncErikaDanmakuConfig();
+      unawaited(player.loadNativeDanmaku(_danmakuList));
+      danmakuController?.clearDanmaku();
+    } catch (_) {}
+    _notifyListeners();
+  }
+
   // Push the current danmaku display settings down to the native kernel.
   // NipaPlay only does spoiler/block pre-filtering before feeding the list;
   // Erika's DFM+ owns merge, density, stacking and track layout, so the
@@ -54,13 +87,15 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
     final fontFamily = danmakuFontFamily.isNotEmpty ? danmakuFontFamily : null;
     final fontPath =
         danmakuFontFilePath.isNotEmpty ? danmakuFontFilePath : null;
+    // Keep visibility out of the coalesced style patch. A queued, older
+    // visibility value could otherwise overwrite a newer direct toggle.
+    unawaited(player.setNativeDanmakuEnabled(_danmakuVisible));
     unawaited(player.setNativeDanmakuConfig(
-      enabled: _danmakuVisible,
       opacity: _danmakuOpacity,
       // actualDanmakuFontSize resolves the "0 = default" sentinel to the same
-      // logical font size used by NipaPlay's DFM+ path; Erika uses the same
-      // default danmaku font and applies surface scale internally.
-      fontSize: actualDanmakuFontSize,
+      // logical font size used by NipaPlay's DFM+ path. The presentation scale
+      // additionally follows compact portrait playback without changing prefs.
+      fontSize: effectiveNativeDanmakuFontSize,
       displayArea: _danmakuDisplayArea,
       mergeDuplicates: _mergeDanmaku,
       allowStacking: _danmakuStacking,
@@ -69,37 +104,76 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
       scrollDurationSeconds: danmakuScrollDurationSeconds,
       trackGapRatio: _danmakuDfmPlusTrackGap,
       outlineWidth: _next2DanmakuOutlineWidth,
+      shadowStyle: _danmakuShadowStyle.index,
       customFontFamily: fontFamily,
       customFontFilePath: fontPath,
     ));
     _syncNativeDanmakuGlobalOffset();
   }
 
-  Future<void> _autoDetectAndLoadLocalDanmakuFromVideoDirectory(
+  // Slider changes should not resend unrelated layout fields. Besides reducing
+  // native work, this prevents a first opacity update from accidentally
+  // becoming a full layout revision when the adapter has no applied snapshot.
+  void _syncErikaDanmakuOpacity() {
+    if (!_erikaNativeDanmaku) return;
+    unawaited(player.setNativeDanmakuConfig(opacity: _danmakuOpacity));
+  }
+
+  void _syncErikaDanmakuFontSize() {
+    if (!_erikaNativeDanmaku) return;
+    unawaited(
+      player.setNativeDanmakuConfig(fontSize: effectiveNativeDanmakuFontSize),
+    );
+  }
+
+  Future<DanmakuAutoLoadSettings> _resolveDanmakuAutoLoadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    return resolveDanmakuAutoLoadSettings(
+      persistedStrategy: prefs.getString(SettingsKeys.danmakuAutoLoadStrategy),
+      persistedSkipMatching: prefs.getBool(SettingsKeys.skipDanmakuMatching),
+      legacyAutoMatchOnPlay: prefs.getBool(SettingsKeys.autoMatchDanmakuOnPlay),
+    );
+  }
+
+  void _clearDanmakuAutoLoadState() {
+    _danmakuList = [];
+    _danmakuListVersion++;
+    _danmakuTracks.clear();
+    _danmakuTrackEnabled.clear();
+    danmakuController?.clearDanmaku();
+    _updateMergedDanmakuList();
+  }
+
+  Future<bool> _autoDetectAndLoadLocalDanmakuFromVideoDirectory(
       String videoPath) async {
-    if (_isDisposed || kIsWeb) return;
+    if (_isDisposed || kIsWeb) return false;
 
     if (videoPath.startsWith('http://') ||
         videoPath.startsWith('https://') ||
+        MediaSourceUtils.isContentUri(videoPath) ||
         videoPath.startsWith('jellyfin://') ||
         videoPath.startsWith('emby://') ||
         SharedRemoteHistoryHelper.isSharedRemoteStreamPath(videoPath)) {
-      return;
+      return false;
     }
 
     final targetVideoPath = _currentVideoPath;
-    bool canContinue() => !_isDisposed && _currentVideoPath == targetVideoPath;
+    final targetGeneration = _playbackGeneration;
+    bool canContinue() =>
+        !_isDisposed &&
+        _currentVideoPath == targetVideoPath &&
+        _playbackGeneration == targetGeneration;
 
     try {
       final dirPath = p.dirname(videoPath);
       final dir = Directory(dirPath);
-      if (!await dir.exists()) return;
+      if (!await dir.exists()) return false;
 
       final videoBaseName = p.basenameWithoutExtension(videoPath).toLowerCase();
 
       final candidates = <_LocalDanmakuCandidate>[];
       await for (final entity in dir.list(followLinks: false)) {
-        if (!canContinue()) return;
+        if (!canContinue()) return false;
         if (entity is! File) continue;
 
         final filePath = entity.path;
@@ -128,6 +202,7 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
 
         // 轻微偏好 XML（更常见的B站格式）
         if (ext == '.xml') score += 3;
+        if (score <= 0) continue;
 
         candidates.add(_LocalDanmakuCandidate(
           filePath: filePath,
@@ -136,8 +211,8 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
         ));
       }
 
-      if (!canContinue()) return;
-      if (candidates.isEmpty) return;
+      if (!canContinue()) return false;
+      if (candidates.isEmpty) return false;
 
       candidates.sort((a, b) {
         final scoreCompare = b.score.compareTo(a.score);
@@ -147,7 +222,7 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
 
       const maxTryCount = 8;
       for (final candidate in candidates.take(maxTryCount)) {
-        if (!canContinue()) return;
+        if (!canContinue()) return false;
         final filePath = candidate.filePath;
 
         // 避免同一文件在一次初始化里被重复加载
@@ -177,7 +252,7 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
             setStatusMessage: false,
           );
           debugPrint('自动识别本地弹幕：已加载 $filePath -> $trackName');
-          return; // 只自动加载最匹配的一份，避免重复弹幕
+          return true; // 只自动加载最匹配的一份，避免重复弹幕
         } catch (e) {
           debugPrint('自动识别本地弹幕：加载失败，跳过 $filePath: $e');
           continue;
@@ -187,35 +262,14 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
       // 自动加载不应影响正常播放
       debugPrint('自动识别本地弹幕出错: $e');
     }
+    return false;
   }
 
   Future<Map<String, dynamic>> _readLocalDanmakuFileAsJsonData(
       String filePath) async {
     final file = File(filePath);
     final bytes = await file.readAsBytes();
-    final content = utf8.decode(bytes, allowMalformed: true);
-    final lowerPath = filePath.toLowerCase();
-
-    if (lowerPath.endsWith('.xml')) {
-      return _convertBilibiliXmlDanmakuToJson(content);
-    }
-
-    if (lowerPath.endsWith('.json')) {
-      final decoded = json.decode(content);
-      if (decoded is Map) {
-        return Map<String, dynamic>.from(decoded.cast<String, dynamic>());
-      }
-      if (decoded is List) {
-        return <String, dynamic>{'comments': decoded};
-      }
-      throw Exception('JSON根节点必须是对象或数组');
-    }
-
-    throw Exception('不支持的文件格式: $filePath');
-  }
-
-  Map<String, dynamic> _convertBilibiliXmlDanmakuToJson(String xmlContent) {
-    return convertBilibiliXmlDanmakuToJson(xmlContent);
+    return compute(parseLocalDanmakuBytes, bytes);
   }
 
   int _countLocalDanmakuComments(Map<String, dynamic> jsonData) {
@@ -255,7 +309,11 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
   Future<void> loadDanmaku(String episodeId, String animeIdStr) async {
     if (_isDisposed) return;
     final targetVideoPath = _currentVideoPath;
-    bool canContinue() => !_isDisposed && _currentVideoPath == targetVideoPath;
+    final targetGeneration = _playbackGeneration;
+    bool canContinue() =>
+        !_isDisposed &&
+        _currentVideoPath == targetVideoPath &&
+        _playbackGeneration == targetGeneration;
 
     try {
       debugPrint('尝试为episodeId=$episodeId, animeId=$animeIdStr加载弹幕');
@@ -271,6 +329,7 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
       debugPrint('清除之前的弹幕数据');
       _danmakuList.clear();
       _danmakuListVersion++;
+      clearSkipSegments();
       danmakuController?.clearDanmaku();
       if (canContinue()) {
         _notifyListeners();
@@ -312,9 +371,10 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
         _setStatus(PlayerStatus.playing,
             message: '从缓存加载弹幕完成 (${cachedDanmaku.length}条)');
 
-        // 解析弹幕数据并添加到弹弹play轨道
-        final parsedDanmaku = await compute(
-            parseDanmakuListInBackground, cachedDanmaku as List<dynamic>?);
+        // 解析弹幕数据并添加到弹弹play轨道（优先 C++ 解析器）
+        final parsedDanmaku = await DanmakuParser.parseDanmakuListOptimized(
+            cachedDanmaku as List<dynamic>?,
+            (data) => compute(parseDanmakuListInBackground, data));
         if (!canContinue()) return;
 
         _danmakuTracks['dandanplay'] = {
@@ -343,12 +403,28 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
         if (!canContinue()) return;
         _updateMergedDanmakuList();
 
+        // 弹幕到位后顺带推导片头区间（纯本地计算，失败静默降级）
+        if (canContinue()) {
+          detectIntroSkipFromDanmaku(_danmakuList);
+          // 同时问一路 AniSkip 社区标注（异步、失败静默；rank 高于弹幕，
+          // 若命中会覆盖弹幕推导的结果）
+          unawaited(fetchAniSkipSegments());
+        }
+
         if (canContinue()) {
           _notifyListeners();
         }
         return;
       }
 
+      final canDownload = await DanmakuMatchingService.instance.canAccess();
+      if (!canContinue()) return;
+      if (!canDownload) {
+        debugPrint('[弹幕访问] 未登录弹弹play，跳过在线弹幕下载');
+        _addStatusMessage('未登录弹弹play，已跳过在线弹幕下载');
+        unawaited(_promptDandanplayLogin());
+        return;
+      }
       debugPrint('缓存中没有找到弹幕，从网络加载中...');
       // 从网络加载弹幕
       final animeId = int.tryParse(animeIdStr) ?? 0;
@@ -379,9 +455,10 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
           danmakuController?.loadDanmaku(filteredDanmaku);
         }
 
-        // 解析弹幕数据并添加到弹弹play轨道
-        final parsedDanmaku = await compute(parseDanmakuListInBackground,
-            danmakuData['comments'] as List<dynamic>?);
+        // 解析弹幕数据并添加到弹弹play轨道（优先 C++ 解析器）
+        final parsedDanmaku = await DanmakuParser.parseDanmakuListOptimized(
+            danmakuData['comments'] as List<dynamic>?,
+            (data) => compute(parseDanmakuListInBackground, data));
         if (!canContinue()) return;
 
         _danmakuTracks['dandanplay'] = {
@@ -410,6 +487,12 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
         if (!canContinue()) return;
         _updateMergedDanmakuList();
 
+        // 弹幕到位后顺带推导片头区间（纯本地计算，失败静默降级）
+        if (canContinue()) {
+          detectIntroSkipFromDanmaku(_danmakuList);
+          unawaited(fetchAniSkipSegments());
+        }
+
         // 移除GPU弹幕字符集预构建调用
         if (canContinue()) {
           await _prebuildGPUDanmakuCharsetIfNeeded();
@@ -428,6 +511,11 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
           _setStatus(PlayerStatus.playing, message: '弹幕数据无效，跳过加载');
         }
       }
+    } on DandanplayLoginRequired {
+      if (canContinue()) {
+        _addStatusMessage('未登录弹弹play，已跳过在线弹幕下载');
+        unawaited(_promptDandanplayLogin());
+      }
     } catch (e, st) {
       debugPrint('加载弹幕失败: $e');
       debugPrintStack(stackTrace: st);
@@ -444,7 +532,11 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
       bool setStatusMessage = true}) async {
     if (_isDisposed) return;
     final targetVideoPath = _currentVideoPath;
-    bool canContinue() => !_isDisposed && _currentVideoPath == targetVideoPath;
+    final targetGeneration = _playbackGeneration;
+    bool canContinue() =>
+        !_isDisposed &&
+        _currentVideoPath == targetVideoPath &&
+        _playbackGeneration == targetGeneration;
 
     try {
       debugPrint('开始从本地JSON加载弹幕...');
@@ -484,9 +576,9 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
         throw Exception('弹幕文件中没有弹幕数据');
       }
 
-      // 解析弹幕数据
-      final parsedDanmaku =
-          await compute(parseDanmakuListInBackground, comments);
+      // 解析弹幕数据（优先 C++ 解析器）
+      final parsedDanmaku = await DanmakuParser.parseDanmakuListOptimized(
+          comments, (data) => compute(parseDanmakuListInBackground, data));
       if (!canContinue()) return;
 
       // 生成轨道名称
@@ -504,6 +596,18 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
         'loadTime': DateTime.now(),
       };
       _danmakuTrackEnabled[finalTrackName] = true;
+
+      // 触发弹幕加载完成事件，通知插件（在合并之前，以便插件可以修改数据）
+      if (!canContinue()) return;
+      _notifyPluginDanmakuLoaded(parsedDanmaku);
+
+      // 检查插件是否修改了弹幕数据
+      final pluginModified = _pluginService?.pendingDanmakuData;
+      if (pluginModified != null && pluginModified.isNotEmpty) {
+        _danmakuTracks[finalTrackName]!['danmakuList'] = pluginModified;
+        _danmakuTracks[finalTrackName]!['count'] = pluginModified.length;
+        _pluginService?.updateDanmakuData(null);
+      }
 
       // 重新计算合并后的弹幕列表
       if (!canContinue()) return;
@@ -533,7 +637,11 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
   }
 
   // 更新合并后的弹幕列表
-  void _updateMergedDanmakuList() {
+  void _updateMergedDanmakuList({
+    bool preserveOverlay = false,
+    Map<String, dynamic>? locallySentDanmaku,
+    bool locallySentTrackEnabled = true,
+  }) {
     final List<Map<String, dynamic>> mergedList = [];
 
     // 合并所有启用的轨道
@@ -542,7 +650,10 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
         final trackData = _danmakuTracks[trackId]!;
         final trackDanmaku =
             trackData['danmakuList'] as List<Map<String, dynamic>>;
-        mergedList.addAll(trackDanmaku);
+        final offset = DanmakuTrackTiming.offsetOf(trackData);
+        mergedList.addAll(trackDanmaku.map(
+          (comment) => DanmakuTrackTiming.shift(comment, offset),
+        ));
       }
     }
 
@@ -606,6 +717,16 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
     _danmakuList = filteredList;
     _danmakuListVersion++;
 
+    if (locallySentDanmaku != null) {
+      _locallySentDanmaku = Map<String, dynamic>.unmodifiable(
+        _prepareDanmakuForDisplay(locallySentDanmaku),
+      );
+      _locallySentDanmakuDisplayable =
+          locallySentTrackEnabled && !shouldBlockDanmaku(locallySentDanmaku);
+      _locallySentDanmakuListVersion = _danmakuListVersion;
+      _locallySentDanmakuRevision++;
+    }
+
     if (_erikaNativeDanmaku) {
       // Erika composites danmaku into the video frame natively. Feed it the
       // already merged/filtered list and keep the Flutter overlay empty so
@@ -618,8 +739,13 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
       danmakuController?.loadDanmaku(filteredList);
     }
 
-    // 通过更新key来强制刷新DanmakuOverlay
-    _danmakuOverlayKey = 'danmaku_${DateTime.now().millisecondsSinceEpoch}';
+    // A single locally-sent danmaku is a content hot reload. Preserve the
+    // overlay state so its native surface, current scene, and emoji atlas stay
+    // alive while the layout revision is prepared. Track/source replacement
+    // keeps the legacy forced-rebuild behavior.
+    if (!preserveOverlay) {
+      _danmakuOverlayKey = 'danmaku_${DateTime.now().millisecondsSinceEpoch}';
+    }
 
     debugPrint('弹幕轨道合并及过滤完成，显示${_danmakuList.length}条，总计${mergedList.length}条');
     _notifyListeners(); // 确保通知UI更新
@@ -639,14 +765,19 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
       }
 
       final trackDanmaku = entry.value['danmakuList'];
+      final offset = DanmakuTrackTiming.offsetOf(entry.value);
       if (trackDanmaku is List<Map<String, dynamic>>) {
-        exportList.addAll(trackDanmaku);
+        exportList.addAll(trackDanmaku.map(
+          (comment) => DanmakuTrackTiming.shift(comment, offset),
+        ));
       } else if (trackDanmaku is List) {
         for (final item in trackDanmaku) {
           if (item is Map<String, dynamic>) {
-            exportList.add(item);
+            exportList.add(DanmakuTrackTiming.shift(item, offset));
           } else if (item is Map) {
-            exportList.add(Map<String, dynamic>.from(item));
+            exportList.add(DanmakuTrackTiming.shift(
+              Map<String, dynamic>.from(item), offset,
+            ));
           }
         }
       }
@@ -659,6 +790,126 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
     });
 
     return exportList;
+  }
+
+  /// 为外部播放器弹幕外挂准备过滤后的弹幕列表。
+  ///
+  /// 与 [loadDanmaku] 不同：**不写** [_danmakuTracks]/[_danmakuList]，不影响
+  /// 内置播放器当前状态。流程复用 缓存→网络→解析→插件过滤→屏蔽过滤→随机色，
+  /// 返回与内置显示口径一致的过滤后列表。
+  ///
+  /// 调用方需保证此时内置播放器未在并发加载弹幕（插件过滤用共享 pending 缓冲）。
+  /// 若 [_context]/[_pluginService] 不可用，插件过滤会优雅跳过（屏蔽过滤仍生效）。
+  Future<List<Map<String, dynamic>>> buildFilteredDanmakuForExport({
+    required String episodeId,
+    required String animeId,
+  }) async {
+    debugPrint('[ExtDanmaku] buildFilteredDanmakuForExport 开始: '
+        'episodeId=$episodeId, animeId=$animeId');
+    if (episodeId.isEmpty) {
+      debugPrint('[ExtDanmaku] episodeId 为空，返回空列表');
+      return const [];
+    }
+
+    // 1. 缓存 → 网络
+    List<dynamic>? raw;
+    try {
+      final tCache = DateTime.now();
+      final cached = await DanmakuCacheManager.getDanmakuFromCache(episodeId);
+      debugPrint('[ExtDanmaku] 缓存查询: ${cached?.length ?? 0} 条, '
+          '耗时=${DateTime.now().difference(tCache).inMilliseconds}ms');
+      if (cached != null && cached.isNotEmpty) {
+        final hasSenderMetadata = cached.any((comment) =>
+            comment is Map && comment['source']?.toString() == 'dandanplay');
+        if (hasSenderMetadata) {
+          raw = cached;
+        } else {
+          debugPrint('[ExtDanmaku] 缓存不含发送者元数据，重新请求网络');
+        }
+      }
+      if (raw == null) {
+        debugPrint('[ExtDanmaku] 缓存未命中，发起网络请求…');
+        final animeIdInt = int.tryParse(animeId) ?? 0;
+        final tNet = DateTime.now();
+        final data = await DandanplayService.getDanmaku(episodeId, animeIdInt)
+            .timeout(const Duration(seconds: 32), onTimeout: () {
+          throw TimeoutException('加载弹幕超时');
+        });
+        debugPrint('[ExtDanmaku] 网络返回: count=${data['count']}, '
+            '耗时=${DateTime.now().difference(tNet).inMilliseconds}ms');
+        final comments = data['comments'];
+        if (comments is List && comments.isNotEmpty) {
+          raw = comments;
+        }
+      }
+    } catch (e, st) {
+      debugPrint('[ExtDanmaku] 取弹幕失败: $e');
+      debugPrintStack(stackTrace: st);
+      return const [];
+    }
+    if (raw == null || raw.isEmpty) {
+      debugPrint('[ExtDanmaku] raw 为空，返回空列表');
+      return const [];
+    }
+
+    // 2. 解析（优先 C++ 解析器，回退 Dart isolate）
+    List<Map<String, dynamic>> parsed;
+    try {
+      final tParse = DateTime.now();
+      parsed = await DanmakuParser.parseDanmakuListOptimized(
+        raw,
+        (data) => compute(parseDanmakuListInBackground, data),
+      );
+      debugPrint('[ExtDanmaku] 解析完成: ${parsed.length} 条, '
+          '耗时=${DateTime.now().difference(tParse).inMilliseconds}ms');
+    } catch (e, st) {
+      debugPrint('[ExtDanmaku] 解析弹幕失败: $e');
+      debugPrintStack(stackTrace: st);
+      return const [];
+    }
+    if (parsed.isEmpty) {
+      debugPrint('[ExtDanmaku] 解析后为空，返回空列表');
+      return const [];
+    }
+
+    // 3. 插件过滤（复用 loadDanmaku 同款管线）
+    final beforePlugin = parsed.length;
+    _notifyPluginDanmakuLoaded(parsed);
+    final pluginModified = _pluginService?.pendingDanmakuData;
+    if (pluginModified != null && pluginModified.isNotEmpty) {
+      parsed = pluginModified;
+      _pluginService?.updateDanmakuData(null);
+      debugPrint('[ExtDanmaku] 插件过滤: $beforePlugin  ${parsed.length} 条');
+    } else {
+      debugPrint(
+          '[ExtDanmaku] 插件未修改 (pluginService=${_pluginService != null})');
+    }
+    parsed = parsed.map((item) {
+      final source = item['source']?.toString().trim();
+      if (source != null && source.isNotEmpty) return item;
+      return <String, dynamic>{
+        ...item,
+        'source': 'dandanplay',
+      };
+    }).toList();
+
+    // 4. 屏蔽过滤 + 随机色（复用 _updateMergedDanmakuList 同款谓词）
+    final beforeBlock = parsed.length;
+    final filtered = parsed
+        .where((d) => !shouldBlockDanmaku(d))
+        .map(_prepareDanmakuForDisplay)
+        .toList();
+    debugPrint('[ExtDanmaku] 屏蔽过滤: $beforeBlock  ${filtered.length} 条');
+
+    // 5. 按时间排序
+    filtered.sort((a, b) {
+      final ta = _resolveDanmakuTimeValue(a['time'] ?? a['t']);
+      final tb = _resolveDanmakuTimeValue(b['time'] ?? b['t']);
+      return ta.compareTo(tb);
+    });
+
+    debugPrint('[ExtDanmaku] 完成，返回 ${filtered.length} 条');
+    return filtered;
   }
 
   String buildDanmakuJsonExport(List<Map<String, dynamic>> danmakuList) {
@@ -768,13 +1019,15 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
     final typeText = typeValue?.toString().toLowerCase();
     switch (typeText) {
       case 'top':
-        return 5;
+        return DanmakuMode.top.code;
       case 'bottom':
-        return 4;
+        return DanmakuMode.bottom.code;
       case 'scroll':
+        return DanmakuMode.scroll.code;
       case 'right':
+        return DanmakuMode.scroll.code;
       default:
-        return 1;
+        return DanmakuMode.scroll.code;
     }
   }
 
@@ -1080,6 +1333,17 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
   }
 
   // 切换轨道启用状态
+  double danmakuTrackOffset(String trackId) =>
+      DanmakuTrackTiming.offsetOf(_danmakuTracks[trackId] ?? const {});
+
+  void setDanmakuTrackOffset(String trackId, double offset) {
+    if (_isDisposed || !offset.isFinite || trackId == 'timeline') return;
+    final track = _danmakuTracks[trackId];
+    if (track == null || danmakuTrackOffset(trackId) == offset) return;
+    track['timeOffset'] = offset;
+    _updateMergedDanmakuList();
+  }
+
   void toggleDanmakuTrack(String trackId, bool enabled) {
     if (_danmakuTracks.containsKey(trackId)) {
       _danmakuTrackEnabled[trackId] = enabled;
@@ -1145,12 +1409,17 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
       }
 
       if (existingHistory != null) {
+        // On OHOS + MDK, resetPlayer already waits for a bounded exit
+        // screenshot. Saving its final position must not start another
+        // unbounded render request.
         // 使用当前缩略图路径，如果没有则尝试捕获一个
         String? thumbnailPath = _currentThumbnailPath;
         if (thumbnailPath == null || thumbnailPath.isEmpty) {
           thumbnailPath = existingHistory.thumbnailPath;
           if ((thumbnailPath == null || thumbnailPath.isEmpty) &&
-              player.state == PlaybackState.playing) {
+              !_skipsThumbnailCaptureWhileResetting &&
+              player.state == PlaybackState.playing &&
+              !_usesWindowsPlatformVideoSurface) {
             // 仅在播放时尝试捕获
             // 仅在没有缩略图时才尝试捕获
             try {
@@ -1269,7 +1538,10 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
 
         // 尝试获取缩略图
         String? thumbnailPath = _currentThumbnailPath;
-        if (thumbnailPath == null && player.state == PlaybackState.playing) {
+        if (thumbnailPath == null &&
+            !_skipsThumbnailCaptureWhileResetting &&
+            player.state == PlaybackState.playing &&
+            !_usesWindowsPlatformVideoSurface) {
           // 仅在播放时尝试捕获
           try {
             thumbnailPath = await _captureVideoFrameWithoutPausing();
@@ -1320,6 +1592,14 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
       }
 
       if (historyForRemoteSync != null) {
+        // Provider-backed writes already notify the incremental sync service.
+        // Cover the direct database fallback here without resetting the same
+        // trailing debounce twice for normal playback updates.
+        if (globals.isDesktop && watchHistoryProvider == null) {
+          unawaited(
+            AutoSyncService.instance.scheduleSyncAfterLocalChange(),
+          );
+        }
         await _syncWebRemoteHistoryIfNeeded(
           historyForRemoteSync,
           force: forceRemoteSync,
@@ -1418,13 +1698,23 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
       // 添加弹幕到轨道
       final trackDanmaku =
           _danmakuTracks[trackId]!['danmakuList'] as List<Map<String, dynamic>>;
-      trackDanmaku.add(danmaku);
+      // This entry point is used only after a local send succeeds. Normalize
+      // the marker here as a final guard for callers whose server response
+      // omits `isMe` (for example the remote-controller fallback payload).
+      final localDanmaku = <String, dynamic>{...danmaku, 'isMe': true};
+      trackDanmaku.add(localDanmaku);
       _danmakuTracks[trackId]!['count'] = trackDanmaku.length;
 
       // 重新计算合并后的弹幕列表
-      _updateMergedDanmakuList();
+      _updateMergedDanmakuList(
+        preserveOverlay: true,
+        locallySentDanmaku: DanmakuTrackTiming.shift(
+          localDanmaku, danmakuTrackOffset(trackId),
+        ),
+        locallySentTrackEnabled: _danmakuTrackEnabled[trackId] == true,
+      );
 
-      debugPrint('已将新弹幕添加到轨道 "$trackName": ${danmaku['content']}');
+      debugPrint('已将新弹幕添加到轨道 "$trackName": ${localDanmaku['content']}');
     }
   }
 
@@ -1537,7 +1827,7 @@ extension VideoPlayerStateDanmaku on VideoPlayerState {
 
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_timelineDanmakuEnabledKey, enabled);
+      await prefs.setBool(SettingsKeys.timelineDanmakuEnabled, enabled);
     } catch (e) {
       debugPrint('保存时间轴告知开关失败: $e');
     }

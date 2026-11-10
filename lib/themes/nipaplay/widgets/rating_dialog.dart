@@ -1,8 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:nipaplay/app/app_display_surface.dart';
+import 'package:nipaplay/app/app_display_surface_scope.dart';
 import 'package:glassmorphism/glassmorphism.dart';
 import 'package:kmbal_ionicons/kmbal_ionicons.dart';
 import 'package:nipaplay/providers/appearance_settings_provider.dart';
 import 'package:provider/provider.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_bottom_sheet.dart';
+import 'package:nipaplay/themes/cupertino/widgets/cupertino_rating_sheet.dart';
 
 class RatingDialog extends StatefulWidget {
   final String animeTitle;
@@ -22,6 +26,24 @@ class RatingDialog extends StatefulWidget {
     required int initialRating,
     required Function(int rating) onRatingSubmitted,
   }) {
+    if (AppDisplaySurfaceScope.of(context) == AppDisplaySurface.phone) {
+      return CupertinoBottomSheet.show<void>(
+        context: context,
+        title: '为番剧评分',
+        heightRatio: 0.72,
+        child: CupertinoRatingSheet(
+          animeTitle: animeTitle,
+          initialRating: initialRating,
+          isSubmitting: false,
+          onSubmit: (rating) async {
+            await onRatingSubmitted(rating);
+            return true;
+          },
+          onCancel: () => Navigator.of(context).pop(),
+        ),
+      );
+    }
+
     return showGeneralDialog(
       context: context,
       barrierDismissible: true,
@@ -40,7 +62,7 @@ class RatingDialog extends StatefulWidget {
           parent: animation,
           curve: Curves.easeOutBack,
         );
-        
+
         return ScaleTransition(
           scale: Tween<double>(begin: 0.8, end: 1.0).animate(curvedAnimation),
           child: FadeTransition(
@@ -95,7 +117,11 @@ class _RatingDialogState extends State<RatingDialog> {
               width: double.infinity,
               height: double.infinity,
               borderRadius: 15,
-              blur: context.watch<AppearanceSettingsProvider>().enableWidgetBlurEffect ? 25 : 0,
+              blur: context
+                      .watch<AppearanceSettingsProvider>()
+                      .enableWidgetBlurEffect
+                  ? 25
+                  : 0,
               alignment: Alignment.center,
               border: 1,
               linearGradient: LinearGradient(
@@ -124,18 +150,18 @@ class _RatingDialogState extends State<RatingDialog> {
                     Text(
                       '为番剧评分',
                       style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 18,
-                      ),
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 18,
+                          ),
                     ),
                     const SizedBox(height: 8),
-                    
+
                     // 番剧名称
                     Text(
                       widget.animeTitle,
-                      locale:Locale("zh-Hans","zh"),
-style: TextStyle(
+                      locale: Locale("zh-Hans", "zh"),
+                      style: TextStyle(
                         color: Colors.white.withOpacity(0.8),
                         fontSize: 14,
                         fontWeight: FontWeight.w500,
@@ -144,15 +170,15 @@ style: TextStyle(
                       overflow: TextOverflow.ellipsis,
                     ),
                     const SizedBox(height: 20),
-                    
+
                     // 当前选择的评分显示
                     Center(
                       child: Column(
                         children: [
                           Text(
                             _selectedRating > 0 ? '$_selectedRating 分' : '未评分',
-                            locale:Locale("zh-Hans","zh"),
-style: TextStyle(
+                            locale: Locale("zh-Hans", "zh"),
+                            style: TextStyle(
                               color: Colors.white,
                               fontSize: 24,
                               fontWeight: FontWeight.bold,
@@ -162,8 +188,8 @@ style: TextStyle(
                             const SizedBox(height: 4),
                             Text(
                               _ratingEvaluationMap[_selectedRating] ?? '',
-                              locale:Locale("zh-Hans","zh"),
-style: TextStyle(
+                              locale: Locale("zh-Hans", "zh"),
+                              style: TextStyle(
                                 color: Colors.white.withOpacity(0.7),
                                 fontSize: 14,
                               ),
@@ -173,7 +199,7 @@ style: TextStyle(
                       ),
                     ),
                     const SizedBox(height: 20),
-                    
+
                     // 星星评分选择器
                     Center(
                       child: Wrap(
@@ -182,31 +208,38 @@ style: TextStyle(
                         children: List.generate(10, (index) {
                           final rating = index + 1;
                           final isSelected = rating <= _selectedRating;
-                          
-                          return GestureDetector(
-                            onTap: () => setState(() => _selectedRating = rating),
-                            child: Container(
-                              width: 32,
-                              height: 32,
-                              decoration: BoxDecoration(
-                                color: isSelected 
-                                    ? Colors.yellow[600]?.withOpacity(0.3)
-                                    : Colors.white.withOpacity(0.1),
-                                border: Border.all(
-                                  color: isSelected 
-                                      ? Colors.yellow[600]!
-                                      : Colors.white.withOpacity(0.3),
-                                  width: 1,
+
+                          return Material(
+                            color: Colors.transparent,
+                            child: InkWell(
+                              onTap: () =>
+                                  setState(() => _selectedRating = rating),
+                              borderRadius: BorderRadius.circular(6),
+                              child: Container(
+                                width: 32,
+                                height: 32,
+                                decoration: BoxDecoration(
+                                  color: isSelected
+                                      ? Colors.yellow[600]?.withOpacity(0.3)
+                                      : Colors.white.withOpacity(0.1),
+                                  border: Border.all(
+                                    color: isSelected
+                                        ? Colors.yellow[600]!
+                                        : Colors.white.withOpacity(0.3),
+                                    width: 1,
+                                  ),
+                                  borderRadius: BorderRadius.circular(6),
                                 ),
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                              child: Center(
-                                child: Icon(
-                                  isSelected ? Ionicons.star : Ionicons.star_outline,
-                                  color: isSelected 
-                                      ? Colors.yellow[600]
-                                      : Colors.white.withOpacity(0.6),
-                                  size: 18,
+                                child: Center(
+                                  child: Icon(
+                                    isSelected
+                                        ? Ionicons.star
+                                        : Ionicons.star_outline,
+                                    color: isSelected
+                                        ? Colors.yellow[600]
+                                        : Colors.white.withOpacity(0.6),
+                                    size: 18,
+                                  ),
                                 ),
                               ),
                             ),
@@ -215,43 +248,48 @@ style: TextStyle(
                       ),
                     ),
                     const SizedBox(height: 16),
-                    
+
                     // 数字按钮
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                       children: List.generate(10, (index) {
                         final rating = index + 1;
                         final isSelected = rating == _selectedRating;
-                        
-                        return GestureDetector(
-                          onTap: () => setState(() => _selectedRating = rating),
-                          child: Container(
-                            width: 28,
-                            height: 28,
-                            decoration: BoxDecoration(
-                              color: isSelected 
-                                  ? Colors.blue.withOpacity(0.3)
-                                  : Colors.transparent,
-                              border: Border.all(
-                                color: isSelected 
-                                    ? Colors.blue
-                                    : Colors.white.withOpacity(0.3),
-                                width: 1,
-                              ),
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                            child: Center(
-                              child: Text(
-                                '$rating',
-                                locale:Locale("zh-Hans","zh"),
-style: TextStyle(
-                                  color: isSelected 
+
+                        return Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            onTap: () =>
+                                setState(() => _selectedRating = rating),
+                            borderRadius: BorderRadius.circular(4),
+                            child: Container(
+                              width: 28,
+                              height: 28,
+                              decoration: BoxDecoration(
+                                color: isSelected
+                                    ? Colors.blue.withOpacity(0.3)
+                                    : Colors.transparent,
+                                border: Border.all(
+                                  color: isSelected
                                       ? Colors.blue
-                                      : Colors.white.withOpacity(0.8),
-                                  fontSize: 12,
-                                  fontWeight: isSelected 
-                                      ? FontWeight.bold 
-                                      : FontWeight.normal,
+                                      : Colors.white.withOpacity(0.3),
+                                  width: 1,
+                                ),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Center(
+                                child: Text(
+                                  '$rating',
+                                  locale: Locale("zh-Hans", "zh"),
+                                  style: TextStyle(
+                                    color: isSelected
+                                        ? Colors.blue
+                                        : Colors.white.withOpacity(0.8),
+                                    fontSize: 12,
+                                    fontWeight: isSelected
+                                        ? FontWeight.bold
+                                        : FontWeight.normal,
+                                  ),
                                 ),
                               ),
                             ),
@@ -260,7 +298,7 @@ style: TextStyle(
                       }),
                     ),
                     const SizedBox(height: 24),
-                    
+
                     // 操作按钮
                     Row(
                       children: [
@@ -268,13 +306,13 @@ style: TextStyle(
                         if (_selectedRating > 0)
                           Expanded(
                             child: TextButton(
-                              onPressed: _isSubmitting 
-                                  ? null 
+                              onPressed: _isSubmitting
+                                  ? null
                                   : () => setState(() => _selectedRating = 0),
                               child: Text(
                                 '清除评分',
-                                locale:Locale("zh-Hans","zh"),
-style: TextStyle(
+                                locale: Locale("zh-Hans", "zh"),
+                                style: TextStyle(
                                   color: Colors.white.withOpacity(0.7),
                                   fontSize: 13,
                                 ),
@@ -282,17 +320,17 @@ style: TextStyle(
                             ),
                           ),
                         if (_selectedRating > 0) const SizedBox(width: 8),
-                        
+
                         // 取消按钮
                         Expanded(
                           child: TextButton(
-                            onPressed: _isSubmitting 
-                                ? null 
+                            onPressed: _isSubmitting
+                                ? null
                                 : () => Navigator.of(context).pop(),
                             child: Text(
                               '取消',
-                              locale:Locale("zh-Hans","zh"),
-style: TextStyle(
+                              locale: Locale("zh-Hans", "zh"),
+                              style: TextStyle(
                                 color: Colors.white.withOpacity(0.8),
                                 fontSize: 13,
                               ),
@@ -300,7 +338,7 @@ style: TextStyle(
                           ),
                         ),
                         const SizedBox(width: 8),
-                        
+
                         // 确定按钮
                         Expanded(
                           child: ElevatedButton(
@@ -326,8 +364,8 @@ style: TextStyle(
                                   )
                                 : Text(
                                     '确定',
-                                    locale:Locale("zh-Hans","zh"),
-style: TextStyle(
+                                    locale: Locale("zh-Hans", "zh"),
+                                    style: TextStyle(
                                       fontSize: 13,
                                       fontWeight: FontWeight.w600,
                                     ),
@@ -348,11 +386,11 @@ style: TextStyle(
 
   Future<void> _submitRating() async {
     if (_selectedRating <= 0 || _isSubmitting) return;
-    
+
     setState(() {
       _isSubmitting = true;
     });
-    
+
     try {
       await widget.onRatingSubmitted(_selectedRating);
       if (mounted) {
@@ -367,4 +405,4 @@ style: TextStyle(
       }
     }
   }
-} 
+}
